@@ -2,40 +2,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ops::{Bound, Range, RangeBounds};
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 
-use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Serialize};
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{bucket_latencies, register_histogram_vec, MeasureLatency},
-    prometheus::HistogramVec,
-};
+use linera_base::prometheus_util::MeasureLatency as _;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     batch::Batch,
     common::{from_bytes_option_or_default, HasherOutput},
     context::Context,
     hashable_wrapper::WrappedHashableContainerView,
+    store::ReadableKeyValueStore as _,
     views::{ClonableView, HashableView, Hasher, View, ViewError, MIN_VIEW_TAG},
 };
 
 #[cfg(with_metrics)]
-/// The runtime of hash computation
-static LOG_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "log_view_hash_runtime",
-        "LogView hash runtime",
-        &[],
-        bucket_latencies(5.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
 
-/// Key tags to create the sub-keys of a LogView on top of the base key.
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    /// The runtime of hash computation
+    pub static LOG_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "log_view_hash_runtime",
+            "LogView hash runtime",
+            &[],
+            exponential_bucket_latencies(5.0),
+        )
+    });
+}
+
+/// Key tags to create the sub-keys of a `LogView` on top of the base key.
 #[repr(u8)]
 enum KeyTag {
-    /// Prefix for the storing of the variable stored_count.
+    /// Prefix for the storing of the variable `stored_count`.
     Count = MIN_VIEW_TAG,
     /// Prefix for the indices of the log.
     Index,
@@ -50,7 +52,6 @@ pub struct LogView<C, T> {
     new_values: Vec<T>,
 }
 
-#[async_trait]
 impl<C, T> View<C> for LogView<C, T>
 where
     C: Context + Send + Sync,
@@ -64,7 +65,7 @@ where
     }
 
     fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        Ok(vec![context.base_tag(KeyTag::Count as u8)])
+        Ok(vec![context.base_key().base_tag(KeyTag::Count as u8)])
     }
 
     fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
@@ -80,7 +81,7 @@ where
 
     async fn load(context: C) -> Result<Self, ViewError> {
         let keys = Self::pre_load(&context)?;
-        let values = context.read_multi_values_bytes(keys).await?;
+        let values = context.store().read_multi_values_bytes(keys).await?;
         Self::post_load(context, &values)
     }
 
@@ -99,7 +100,7 @@ where
     fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
         let mut delete_view = false;
         if self.delete_storage_first {
-            batch.delete_key_prefix(self.context.base_key());
+            batch.delete_key_prefix(self.context.base_key().bytes.clone());
             self.stored_count = 0;
             delete_view = true;
         }
@@ -108,11 +109,12 @@ where
             for value in &self.new_values {
                 let key = self
                     .context
+                    .base_key()
                     .derive_tag_key(KeyTag::Index as u8, &self.stored_count)?;
                 batch.put_key_value(key, value)?;
                 self.stored_count += 1;
             }
-            let key = self.context.base_tag(KeyTag::Count as u8);
+            let key = self.context.base_key().base_tag(KeyTag::Count as u8);
             batch.put_key_value(key, &self.stored_count)?;
             self.new_values.clear();
         }
@@ -149,10 +151,10 @@ where
     /// Pushes a value to the end of the log.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::log_view::LogView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut log = LogView::load(context).await.unwrap();
     /// log.push(34);
     /// # })
@@ -164,10 +166,10 @@ where
     /// Reads the size of the log.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::log_view::LogView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut log = LogView::load(context).await.unwrap();
     /// log.push(34);
     /// log.push(42);
@@ -197,10 +199,10 @@ where
     /// Reads the logged value with the given index (including staged ones).
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::log_view::LogView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut log = LogView::load(context).await.unwrap();
     /// log.push(34);
     /// assert_eq!(log.get(0).await.unwrap(), Some(34));
@@ -210,8 +212,11 @@ where
         let value = if self.delete_storage_first {
             self.new_values.get(index).cloned()
         } else if index < self.stored_count {
-            let key = self.context.derive_tag_key(KeyTag::Index as u8, &index)?;
-            self.context.read_value(&key).await?
+            let key = self
+                .context
+                .base_key()
+                .derive_tag_key(KeyTag::Index as u8, &index)?;
+            self.context.store().read_value(&key).await?
         } else {
             self.new_values.get(index - self.stored_count).cloned()
         };
@@ -221,10 +226,10 @@ where
     /// Reads several logged keys (including staged ones)
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::log_view::LogView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut log = LogView::load(context).await.unwrap();
     /// log.push(34);
     /// log.push(42);
@@ -245,7 +250,10 @@ where
             let mut positions = Vec::new();
             for (pos, index) in indices.into_iter().enumerate() {
                 if index < self.stored_count {
-                    let key = self.context.derive_tag_key(KeyTag::Index as u8, &index)?;
+                    let key = self
+                        .context
+                        .base_key()
+                        .derive_tag_key(KeyTag::Index as u8, &index)?;
                     keys.push(key);
                     positions.push(pos);
                     result.push(None);
@@ -253,7 +261,7 @@ where
                     result.push(self.new_values.get(index - self.stored_count).cloned());
                 }
             }
-            let values = self.context.read_multi_values(keys).await?;
+            let values = self.context.store().read_multi_values(keys).await?;
             for (pos, value) in positions.into_iter().zip(values) {
                 *result.get_mut(pos).unwrap() = value;
             }
@@ -265,11 +273,14 @@ where
         let count = range.len();
         let mut keys = Vec::with_capacity(count);
         for index in range {
-            let key = self.context.derive_tag_key(KeyTag::Index as u8, &index)?;
+            let key = self
+                .context
+                .base_key()
+                .derive_tag_key(KeyTag::Index as u8, &index)?;
             keys.push(key);
         }
         let mut values = Vec::with_capacity(count);
-        for entry in self.context.read_multi_values(keys).await? {
+        for entry in self.context.store().read_multi_values(keys).await? {
             match entry {
                 None => {
                     return Err(ViewError::MissingEntries);
@@ -283,10 +294,10 @@ where
     /// Reads the logged values in the given range (including staged ones).
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::log_view::LogView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut log = LogView::load(context).await.unwrap();
     /// log.push(34);
     /// log.push(42);
@@ -338,7 +349,6 @@ where
     }
 }
 
-#[async_trait]
 impl<C, T> HashableView<C> for LogView<C, T>
 where
     C: Context + Send + Sync,
@@ -353,7 +363,7 @@ where
 
     async fn hash(&self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = LOG_VIEW_HASH_RUNTIME.measure_latency();
+        let _hash_latency = metrics::LOG_VIEW_HASH_RUNTIME.measure_latency();
         let elements = self.read(..).await?;
         let mut hasher = sha3::Sha3_256::default();
         hasher.update_with_bcs_bytes(&elements)?;
@@ -364,6 +374,7 @@ where
 /// Type wrapping `LogView` while memoizing the hash.
 pub type HashedLogView<C, T> = WrappedHashableContainerView<C, LogView<C, T>, HasherOutput>;
 
+#[cfg(not(web))]
 mod graphql {
     use std::borrow::Cow;
 

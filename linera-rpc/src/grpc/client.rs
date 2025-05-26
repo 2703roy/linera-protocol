@@ -6,7 +6,7 @@ use std::{fmt, future::Future, iter};
 use futures::{future, stream, StreamExt};
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{Blob, BlobContent},
+    data_types::{BlobContent, NetworkDescription},
     ensure,
     identifiers::{BlobId, ChainId},
     time::Duration,
@@ -19,17 +19,13 @@ use linera_chain::{
     },
 };
 use linera_core::{
+    data_types::ChainInfoResponse,
     node::{CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode},
     worker::Notification,
 };
 use linera_version::VersionInfo;
 use tonic::{Code, IntoRequest, Request, Status};
 use tracing::{debug, error, info, instrument, warn};
-#[cfg(not(web))]
-use {
-    super::GrpcProtoConversionError,
-    crate::{mass_client, RpcMessage},
-};
 
 use super::{
     api::{self, validator_node_client::ValidatorNodeClient, SubscriptionRequest},
@@ -37,7 +33,7 @@ use super::{
 };
 use crate::{
     HandleConfirmedCertificateRequest, HandleLiteCertRequest, HandleTimeoutCertificateRequest,
-    HandleValidatedCertificateRequest, NodeOptions,
+    HandleValidatedCertificateRequest,
 };
 
 #[derive(Clone)]
@@ -64,17 +60,6 @@ impl GrpcClient {
             retry_delay,
             max_retries,
         }
-    }
-
-    pub fn create(address: String, node_options: NodeOptions) -> Self {
-        let options = (&node_options).into();
-        let channel = transport::create_channel(address.clone(), &options).unwrap();
-        Self::new(
-            address,
-            channel,
-            node_options.retry_delay,
-            node_options.max_retries,
-        )
     }
 
     /// Returns whether this gRPC status means the server stream should be reconnected to, or not.
@@ -116,7 +101,6 @@ impl GrpcClient {
         Fut: Future<Output = Result<tonic::Response<S>, Status>>,
         R: IntoRequest<R> + Clone,
     {
-        debug!(request = ?request, "sending gRPC request");
         let mut retry_count = 0;
         let request_inner = request.try_into().map_err(|_| NodeError::GrpcError {
             error: "could not convert request to proto".to_string(),
@@ -131,7 +115,7 @@ impl GrpcClient {
                 }
                 Err(s) => {
                     return Err(NodeError::GrpcError {
-                        error: format!("remote request [{handler}] failed with status: {s:?}",),
+                        error: format!("remote request [{handler}] failed with status: {s:?}"),
                     });
                 }
                 Ok(result) => return Ok(result.into_inner()),
@@ -139,7 +123,6 @@ impl GrpcClient {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn try_into_chain_info(
         result: api::ChainInfoResult,
     ) -> Result<linera_core::data_types::ChainInfoResponse, NodeError> {
@@ -183,6 +166,11 @@ impl TryFrom<api::PendingBlobResult> for BlobContent {
 
 macro_rules! client_delegate {
     ($self:ident, $handler:ident, $req:ident) => {{
+        debug!(
+            handler = stringify!($handler),
+            request = ?$req,
+            "sending gRPC request"
+        );
         $self
             .delegate(
                 |mut client, req| async move { client.$handler(req).await },
@@ -240,9 +228,8 @@ impl ValidatorNode for GrpcClient {
     async fn handle_validated_certificate(
         &self,
         certificate: GenericCertificate<ValidatedBlock>,
-        blobs: Vec<Blob>,
     ) -> Result<linera_core::data_types::ChainInfoResponse, NodeError> {
-        let request = HandleValidatedCertificateRequest { certificate, blobs };
+        let request = HandleValidatedCertificateRequest { certificate };
         GrpcClient::try_into_chain_info(client_delegate!(
             self,
             handle_validated_certificate,
@@ -312,6 +299,7 @@ impl ValidatorNode for GrpcClient {
         })
         .flatten();
 
+        let span = tracing::info_span!("notification stream");
         // The stream of `Notification`s that inserts increasing delays after retriable errors, and
         // terminates after unexpected or fatal errors.
         let notification_stream = endlessly_retrying_notification_stream
@@ -326,7 +314,8 @@ impl ValidatorNode for GrpcClient {
                     retry_count = 0;
                     return future::Either::Left(future::ready(true));
                 };
-                if !Self::is_retryable(status) || retry_count >= max_retries {
+
+                if !span.in_scope(|| Self::is_retryable(status)) || retry_count >= max_retries {
                     return future::Either::Left(future::ready(false));
                 }
                 let delay = retry_delay.saturating_mul(retry_count);
@@ -357,21 +346,19 @@ impl ValidatorNode for GrpcClient {
     }
 
     #[instrument(target = "grpc_client", skip_all, err, fields(address = self.address))]
-    async fn get_genesis_config_hash(&self) -> Result<CryptoHash, NodeError> {
+    async fn get_network_description(&self) -> Result<NetworkDescription, NodeError> {
         let req = ();
-        Ok(client_delegate!(self, get_genesis_config_hash, req)?.try_into()?)
+        Ok(client_delegate!(self, get_network_description, req)?.try_into()?)
     }
 
     #[instrument(target = "grpc_client", skip(self), err, fields(address = self.address))]
     async fn upload_blob(&self, content: BlobContent) -> Result<BlobId, NodeError> {
-        let req = api::BlobContent::try_from(content)?;
-        Ok(client_delegate!(self, upload_blob, req)?.try_into()?)
+        Ok(client_delegate!(self, upload_blob, content)?.try_into()?)
     }
 
     #[instrument(target = "grpc_client", skip(self), err, fields(address = self.address))]
     async fn download_blob(&self, blob_id: BlobId) -> Result<BlobContent, NodeError> {
-        let req = api::BlobId::try_from(blob_id)?;
-        Ok(client_delegate!(self, download_blob, req)?.try_into()?)
+        Ok(client_delegate!(self, download_blob, blob_id)?.try_into()?)
     }
 
     #[instrument(target = "grpc_client", skip(self), err, fields(address = self.address))]
@@ -380,8 +367,18 @@ impl ValidatorNode for GrpcClient {
         chain_id: ChainId,
         blob_id: BlobId,
     ) -> Result<BlobContent, NodeError> {
-        let req = api::PendingBlobRequest::try_from((chain_id, blob_id))?;
+        let req = (chain_id, blob_id);
         client_delegate!(self, download_pending_blob, req)?.try_into()
+    }
+
+    #[instrument(target = "grpc_client", skip(self), err, fields(address = self.address))]
+    async fn handle_pending_blob(
+        &self,
+        chain_id: ChainId,
+        blob: BlobContent,
+    ) -> Result<ChainInfoResponse, NodeError> {
+        let req = (chain_id, blob);
+        GrpcClient::try_into_chain_info(client_delegate!(self, handle_pending_blob, req)?)
     }
 
     #[instrument(target = "grpc_client", skip_all, err, fields(address = self.address))]
@@ -435,79 +432,11 @@ impl ValidatorNode for GrpcClient {
 
     #[instrument(target = "grpc_client", skip(self), err, fields(address = self.address))]
     async fn blob_last_used_by(&self, blob_id: BlobId) -> Result<CryptoHash, NodeError> {
-        let req = api::BlobId::try_from(blob_id)?;
-        Ok(client_delegate!(self, blob_last_used_by, req)?.try_into()?)
+        Ok(client_delegate!(self, blob_last_used_by, blob_id)?.try_into()?)
     }
 
     #[instrument(target = "grpc_client", skip(self), err, fields(address = self.address))]
     async fn missing_blob_ids(&self, blob_ids: Vec<BlobId>) -> Result<Vec<BlobId>, NodeError> {
-        let req = api::BlobIds::try_from(blob_ids)?;
-        Ok(client_delegate!(self, missing_blob_ids, req)?.try_into()?)
-    }
-}
-
-#[cfg(not(web))]
-#[async_trait::async_trait]
-impl mass_client::MassClient for GrpcClient {
-    #[instrument(skip_all, err)]
-    async fn send(
-        &self,
-        requests: Vec<RpcMessage>,
-        max_in_flight: usize,
-    ) -> Result<Vec<RpcMessage>, mass_client::MassClientError> {
-        let client = self.client.clone();
-        let responses = stream::iter(requests)
-            .map(|request| {
-                let mut client = client.clone();
-                async move {
-                    let response = match request {
-                        RpcMessage::BlockProposal(proposal) => {
-                            let request = Request::new((*proposal).try_into()?);
-                            client.handle_block_proposal(request).await?
-                        }
-                        RpcMessage::TimeoutCertificate(request) => {
-                            let request = Request::new((*request).try_into()?);
-                            client.handle_timeout_certificate(request).await?
-                        }
-                        RpcMessage::ValidatedCertificate(request) => {
-                            let request = Request::new((*request).try_into()?);
-                            client.handle_validated_certificate(request).await?
-                        }
-                        RpcMessage::ConfirmedCertificate(request) => {
-                            let request = Request::new((*request).try_into()?);
-                            client.handle_confirmed_certificate(request).await?
-                        }
-                        msg => panic!("attempted to send msg: {:?}", msg),
-                    };
-                    match response
-                        .into_inner()
-                        .inner
-                        .ok_or(GrpcProtoConversionError::MissingField)?
-                    {
-                        api::chain_info_result::Inner::ChainInfoResponse(chain_info_response) => {
-                            Ok(Some(RpcMessage::ChainInfoResponse(Box::new(
-                                chain_info_response.try_into()?,
-                            ))))
-                        }
-                        api::chain_info_result::Inner::Error(error) => {
-                            let error = bincode::deserialize::<NodeError>(&error)
-                                .map_err(GrpcProtoConversionError::BincodeError)?;
-                            tracing::error!(?error, "received error response");
-                            Ok(None)
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(max_in_flight)
-            .filter_map(
-                |result: Result<Option<_>, mass_client::MassClientError>| async move {
-                    result.transpose()
-                },
-            )
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(responses)
+        Ok(client_delegate!(self, missing_blob_ids, blob_ids)?.try_into()?)
     }
 }

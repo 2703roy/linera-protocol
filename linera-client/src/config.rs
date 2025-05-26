@@ -2,21 +2,25 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    iter::IntoIterator,
-    ops::{Deref, DerefMut},
-};
+use std::{collections::BTreeMap, iter::IntoIterator};
 
 use linera_base::{
-    crypto::{BcsSignable, CryptoHash, CryptoRng, KeyPair, PublicKey},
-    data_types::{Amount, Timestamp},
-    identifiers::{ChainDescription, ChainId},
+    crypto::{AccountPublicKey, BcsSignable, CryptoHash, ValidatorPublicKey, ValidatorSecretKey},
+    data_types::{
+        Amount, ChainDescription, ChainOrigin, Epoch, InitialChainConfig, NetworkDescription,
+        Timestamp,
+    },
+    identifiers::ChainId,
+    ownership::ChainOwnership,
 };
 use linera_execution::{
-    committee::{Committee, ValidatorName, ValidatorState},
+    committee::{Committee, ValidatorState},
     ResourceControlPolicy,
 };
-use linera_rpc::config::{ValidatorInternalNetworkConfig, ValidatorPublicNetworkConfig};
+use linera_persistent as persistent;
+use linera_rpc::config::{
+    ExporterServiceConfig, ValidatorInternalNetworkConfig, ValidatorPublicNetworkConfig,
+};
 use linera_storage::Storage;
 use serde::{Deserialize, Serialize};
 
@@ -28,15 +32,16 @@ pub enum Error {
     Chain(#[from] linera_chain::ChainError),
     #[error("persistence error: {0}")]
     Persistence(Box<dyn std::error::Error + Send + Sync>),
+    #[error("storage is already initialized: {0:?}")]
+    StorageIsAlreadyInitialized(NetworkDescription),
+    #[error("no admin chain configured")]
+    NoAdminChain,
 }
 
-use crate::{
-    persistent, util,
-    wallet::{UserChain, Wallet},
-};
+use crate::util;
 
 util::impl_from_dynamic!(Error:Persistence, persistent::memory::Error);
-#[cfg(with_indexed_db)]
+#[cfg(web)]
 util::impl_from_dynamic!(Error:Persistence, persistent::indexed_db::Error);
 #[cfg(feature = "fs")]
 util::impl_from_dynamic!(Error:Persistence, persistent::file::Error);
@@ -45,7 +50,9 @@ util::impl_from_dynamic!(Error:Persistence, persistent::file::Error);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorConfig {
     /// The public key of the validator.
-    pub name: ValidatorName,
+    pub public_key: ValidatorPublicKey,
+    /// The account key of the validator.
+    pub account_key: AccountPublicKey,
     /// The network configuration for the validator.
     pub network: ValidatorPublicNetworkConfig,
 }
@@ -54,14 +61,9 @@ pub struct ValidatorConfig {
 #[derive(Serialize, Deserialize)]
 pub struct ValidatorServerConfig {
     pub validator: ValidatorConfig,
-    pub key: KeyPair,
+    pub validator_secret: ValidatorSecretKey,
     pub internal_network: ValidatorInternalNetworkConfig,
 }
-
-#[cfg(web)]
-use crate::persistent::{LocalPersist as Persist, LocalPersistExt as _};
-#[cfg(not(web))]
-use crate::persistent::{Persist, PersistExt as _};
 
 /// The (public) configuration for all validators.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -76,10 +78,11 @@ impl CommitteeConfig {
             .into_iter()
             .map(|v| {
                 (
-                    v.name,
+                    v.public_key,
                     ValidatorState {
                         network_address: v.network.to_string(),
                         votes: 100,
+                        account_public_key: v.account_key,
                     },
                 )
             })
@@ -88,153 +91,150 @@ impl CommitteeConfig {
     }
 }
 
-/// The runtime state of the wallet, persisted atomically on change via an instance of
-/// [`Persist`].
-pub struct WalletState<W> {
-    wallet: W,
-    prng: Box<dyn CryptoRng>,
-}
-
-impl<W: Persist<Target = Wallet>> WalletState<W> {
-    pub async fn add_chains<Chains: IntoIterator<Item = UserChain>>(
-        &mut self,
-        chains: Chains,
-    ) -> Result<(), Error> {
-        self.wallet.as_mut().extend(chains);
-        W::persist(&mut self.wallet)
-            .await
-            .map_err(|e| Error::Persistence(Box::new(e)))
-    }
-}
-
-impl<W: Deref> Deref for WalletState<W> {
-    type Target = W::Target;
-    fn deref(&self) -> &W::Target {
-        self.wallet.deref()
-    }
-}
-
-impl<W: DerefMut> DerefMut for WalletState<W> {
-    fn deref_mut(&mut self) -> &mut W::Target {
-        self.wallet.deref_mut()
-    }
-}
-
-impl<W: Persist<Target = Wallet>> Persist for WalletState<W> {
-    type Error = W::Error;
-
-    fn as_mut(&mut self) -> &mut Wallet {
-        self.wallet.as_mut()
-    }
-
-    async fn persist(&mut self) -> Result<(), W::Error> {
-        self.wallet
-            .mutate(|w| w.refresh_prng_seed(&mut self.prng))
-            .await?;
-        tracing::debug!("Persisted user chains");
-        Ok(())
-    }
-
-    fn into_value(self) -> Wallet {
-        self.wallet.into_value()
-    }
-}
-
-#[cfg(feature = "fs")]
-impl WalletState<persistent::File<Wallet>> {
-    pub fn create_from_file(path: &std::path::Path, wallet: Wallet) -> Result<Self, Error> {
-        Ok(Self::new(persistent::File::read_or_create(path, || {
-            Ok(wallet)
-        })?))
-    }
-
-    pub fn read_from_file(path: &std::path::Path) -> Result<Self, Error> {
-        Ok(Self::new(persistent::File::read(path)?))
-    }
-}
-
-#[cfg(with_indexed_db)]
-impl WalletState<persistent::IndexedDb<Wallet>> {
-    pub async fn create_from_indexed_db(key: &str, wallet: Wallet) -> Result<Self, Error> {
-        Ok(Self::new(
-            persistent::IndexedDb::read_or_create(key, wallet).await?,
-        ))
-    }
-
-    pub async fn read_from_indexed_db(key: &str) -> Result<Option<Self>, Error> {
-        Ok(persistent::IndexedDb::read(key).await?.map(Self::new))
-    }
-}
-
-impl<W: Deref<Target = Wallet>> WalletState<W> {
-    pub fn new(wallet: W) -> Self {
-        Self {
-            prng: wallet.make_prng(),
-            wallet,
-        }
-    }
-
-    pub fn generate_key_pair(&mut self) -> KeyPair {
-        KeyPair::generate_from(&mut self.prng)
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenesisConfig {
-    pub committee: CommitteeConfig,
-    pub admin_id: ChainId,
+    pub committee: Committee,
     pub timestamp: Timestamp,
-    pub chains: Vec<(PublicKey, Amount)>,
-    pub policy: ResourceControlPolicy,
+    pub chains: Vec<ChainDescription>,
     pub network_name: String,
 }
 
-impl<'de> BcsSignable<'de> for GenesisConfig {}
+impl BcsSignable<'_> for GenesisConfig {}
+
+fn make_chain(
+    committee: &Committee,
+    index: u32,
+    public_key: AccountPublicKey,
+    balance: Amount,
+    timestamp: Timestamp,
+) -> ChainDescription {
+    let committees: BTreeMap<_, _> = [(
+        Epoch::ZERO,
+        bcs::to_bytes(committee).expect("serializing a committee should not fail"),
+    )]
+    .into_iter()
+    .collect();
+    let origin = ChainOrigin::Root(index);
+    let config = InitialChainConfig {
+        application_permissions: Default::default(),
+        balance,
+        committees: committees.clone(),
+        epoch: Epoch::ZERO,
+        ownership: ChainOwnership::single(public_key.into()),
+    };
+    ChainDescription::new(origin, config, timestamp)
+}
 
 impl GenesisConfig {
+    /// Creates a `GenesisConfig` with the first chain being the admin chain.
     pub fn new(
         committee: CommitteeConfig,
-        admin_id: ChainId,
         timestamp: Timestamp,
         policy: ResourceControlPolicy,
         network_name: String,
+        admin_public_key: AccountPublicKey,
+        admin_balance: Amount,
     ) -> Self {
+        let committee = committee.into_committee(policy);
+        let admin_chain = make_chain(&committee, 0, admin_public_key, admin_balance, timestamp);
         Self {
             committee,
-            admin_id,
             timestamp,
-            chains: Vec::new(),
-            policy,
+            chains: vec![admin_chain],
             network_name,
         }
+    }
+
+    pub fn add_root_chain(
+        &mut self,
+        public_key: AccountPublicKey,
+        balance: Amount,
+    ) -> ChainDescription {
+        let description = make_chain(
+            &self.committee,
+            self.chains.len() as u32,
+            public_key,
+            balance,
+            self.timestamp,
+        );
+        self.chains.push(description.clone());
+        description
+    }
+
+    pub fn admin_chain_description(&self) -> &ChainDescription {
+        &self.chains[0]
+    }
+
+    pub fn admin_id(&self) -> ChainId {
+        self.admin_chain_description().id()
     }
 
     pub async fn initialize_storage<S>(&self, storage: &mut S) -> Result<(), Error>
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
-        let committee = self.create_committee();
-        for (chain_number, (public_key, balance)) in (0..).zip(&self.chains) {
-            let description = ChainDescription::Root(chain_number);
-            storage
-                .create_chain(
-                    committee.clone(),
-                    self.admin_id,
-                    description,
-                    *public_key,
-                    *balance,
-                    self.timestamp,
-                )
-                .await?;
+        if let Some(description) = storage
+            .read_network_description()
+            .await
+            .map_err(linera_chain::ChainError::from)?
+        {
+            return Err(Error::StorageIsAlreadyInitialized(description));
+        }
+        let network_description = self.network_description();
+        storage
+            .write_network_description(&network_description)
+            .await
+            .map_err(linera_chain::ChainError::from)?;
+        for description in &self.chains {
+            storage.create_chain(description.clone()).await?;
         }
         Ok(())
-    }
-
-    pub fn create_committee(&self) -> Committee {
-        self.committee.clone().into_committee(self.policy.clone())
     }
 
     pub fn hash(&self) -> CryptoHash {
         CryptoHash::new(self)
     }
+
+    pub fn network_description(&self) -> NetworkDescription {
+        NetworkDescription {
+            name: self.network_name.clone(),
+            genesis_config_hash: CryptoHash::new(self),
+            genesis_timestamp: self.timestamp,
+            admin_chain_id: self.admin_id(),
+        }
+    }
+}
+
+/// The configuration file for the linera-exporter.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BlockExporterConfig {
+    /// The server configuration for the linera-exporter.
+    pub service_config: ExporterServiceConfig,
+
+    /// The configuration file for the export destinations.
+    #[serde(default)]
+    pub destination_config: DestinationConfig,
+
+    /// Identity for the block exporter state.
+    pub id: u32,
+}
+
+/// Configuration file for the exports.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct DestinationConfig {
+    /// The destination URIs to export to.
+    pub destinations: Vec<Destination>,
+}
+
+// Each destination has an ID and a configuration.
+pub type DestinationId = u16;
+
+/// The uri to provide export services to.
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Destination {
+    /// The host name of the target destination (IP or hostname).
+    pub endpoint: String,
+    /// The port number of the target destination.
+    pub port: u16,
 }

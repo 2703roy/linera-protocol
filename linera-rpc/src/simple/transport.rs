@@ -194,9 +194,7 @@ impl ConnectionPool for UdpConnectionPool {
         address: &'a str,
     ) -> future::BoxFuture<'a, Result<(), codec::Error>> {
         Box::pin(async move {
-            let address = address
-                .parse()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            let address = address.parse().map_err(std::io::Error::other)?;
             self.transport.send((message, address)).await
         })
     }
@@ -241,7 +239,7 @@ where
         }
     }
 
-    /// Creates a [`UpdServer`] bound to the provided `address`, handling messages using the
+    /// Creates a [`UdpServer`] bound to the provided `address`, handling messages using the
     /// provided `handler`.
     async fn bind(address: impl ToSocketAddrs, handler: State) -> Result<Self, std::io::Error> {
         let socket = UdpSocket::bind(address).await?;

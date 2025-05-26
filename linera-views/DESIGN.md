@@ -9,10 +9,10 @@ We have designed a `KeyValueStore` trait that represents the basic functionaliti
 of a key-value store whose keys are `Vec<u8>` and whose values are `Vec<u8>`.
 
 We provide an implementation of the trait `KeyValueStore` for the following key-value stores:
-* `MemoryStore` is using the memory (and uses internally a simple B-Tree map).
+* `MemoryStore` uses the memory (and uses internally a simple B-Tree map).
 * `RocksDbStore` is a disk-based key-value store
 * `DynamoDbStore` is the AWS-based DynamoDB service.
-* `ScyllaDbStore` is a cloud based Cassandra compatible database.
+* `ScyllaDbStore` is a cloud-based Cassandra-compatible database.
 
 The trait `KeyValueStore` was designed so that more storage solutions can be easily added in the future.
 
@@ -52,8 +52,8 @@ also need to accommodate other features:
 The rules for constructing keys are the following:
 * For the construction of `struct` objects of associated base key `base_key` we do the
 following: If the corresponding type has entries `entry_0`, ..., `entry_k` then the
-base key of the object associated with the `k`-th entry is `[base_key * * * *]` with `[* * * *]`
-the serialization of the number `k` considered as a `u32`.
+base key of the object associated with the `k`-th entry is `[base_key * * * *]` where
+`[* * * *]` are the four bytes of `k` as a `u32`.
 * For each view type, we have some associated data. Some are the hash, others the counts
 (e.g. for `LogView` and `QueueView`) and some the index. The corresponding enum is
 named `KeyTag` for each of those containers. For the index, the values are serialized.

@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 40
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Install Protoc
       uses: arduino/setup-protoc@v1
@@ -58,6 +58,6 @@ jobs:
         AWS_REGION: us-east-1
         AWS_ACCESS_KEY_ID: test
         AWS_SECRET_ACCESS_KEY: test
-        LOCALSTACK_ENDPOINT: http://localhost:8000
+        DYNAMODB_LOCAL_ENDPOINT: http://localhost:8000
       run: |
         cargo test --locked --features dynamodb -- dynamo

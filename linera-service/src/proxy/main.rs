@@ -5,13 +5,11 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use async_trait::async_trait;
 use futures::{FutureExt as _, SinkExt, StreamExt};
-use linera_client::{
-    config::{GenesisConfig, ValidatorServerConfig},
-    storage::{run_with_storage, Runnable, StorageConfigNamespace},
-};
+use linera_base::listen_for_shutdown_signals;
+use linera_client::config::{GenesisConfig, ValidatorServerConfig};
 use linera_core::{node::NodeError, JoinSetExt as _};
 use linera_rpc::{
     config::{
@@ -21,12 +19,15 @@ use linera_rpc::{
     simple::{MessageHandler, TransportProtocol},
     RpcMessage,
 };
-use linera_sdk::base::Blob;
+use linera_sdk::linera_base_types::Blob;
 #[cfg(with_metrics)]
 use linera_service::prometheus_server;
-use linera_service::util;
+use linera_service::{
+    storage::{Runnable, StorageConfigNamespace},
+    util,
+};
 use linera_storage::Storage;
-use linera_views::store::CommonStoreConfig;
+use linera_views::{lru_caching::StorageCacheConfig, store::CommonStoreConfig};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument};
@@ -46,16 +47,26 @@ pub struct ProxyOptions {
     config_path: PathBuf,
 
     /// Timeout for sending queries (ms)
-    #[arg(long = "send-timeout-ms", default_value = "4000", value_parser = util::parse_millis)]
+    #[arg(long = "send-timeout-ms",
+          default_value = "4000",
+          value_parser = util::parse_millis,
+          env = "LINERA_PROXY_SEND_TIMEOUT")]
     send_timeout: Duration,
 
     /// Timeout for receiving responses (ms)
-    #[arg(long = "recv-timeout-ms", default_value = "4000", value_parser = util::parse_millis)]
+    #[arg(long = "recv-timeout-ms",
+          default_value = "4000",
+          value_parser = util::parse_millis,
+          env = "LINERA_PROXY_RECV_TIMEOUT")]
     recv_timeout: Duration,
 
     /// The number of Tokio worker threads to use.
     #[arg(long, env = "LINERA_PROXY_TOKIO_THREADS")]
     tokio_threads: Option<usize>,
+
+    /// The number of Tokio blocking threads to use.
+    #[arg(long, env = "LINERA_PROXY_TOKIO_BLOCKING_THREADS")]
+    tokio_blocking_threads: Option<usize>,
 
     /// Storage configuration for the blockchain history, chain states and binary blobs.
     #[arg(long = "storage")]
@@ -69,13 +80,25 @@ pub struct ProxyOptions {
     #[arg(long, default_value = "10")]
     max_stream_queries: usize,
 
+    /// The maximal memory used in the storage cache.
+    #[arg(long, default_value = "10000000")]
+    pub max_cache_size: usize,
+
+    /// The maximal size of an entry in the storage cache.
+    #[arg(long, default_value = "1000000")]
+    pub max_entry_size: usize,
+
     /// The maximal number of entries in the storage cache.
     #[arg(long, default_value = "1000")]
-    cache_size: usize,
+    pub max_cache_entries: usize,
 
     /// Path to the file describing the initial user chains (aka genesis state)
     #[arg(long = "genesis")]
     genesis_config_path: PathBuf,
+
+    /// The replication factor for the keyspace
+    #[arg(long, default_value = "1")]
+    storage_replication_factor: u32,
 }
 
 /// A Linera Proxy, either gRPC or over 'Simple Transport', meaning TCP or UDP.
@@ -91,7 +114,6 @@ where
 
 struct ProxyContext {
     config: ValidatorServerConfig,
-    genesis_config: GenesisConfig,
     send_timeout: Duration,
     recv_timeout: Duration,
 }
@@ -99,12 +121,10 @@ struct ProxyContext {
 impl ProxyContext {
     pub fn from_options(options: &ProxyOptions) -> Result<Self> {
         let config = util::read_json(&options.config_path)?;
-        let genesis_config = util::read_json(&options.genesis_config_path)?;
         Ok(Self {
             config,
             send_timeout: options.send_timeout,
             recv_timeout: options.recv_timeout,
-            genesis_config,
         })
     }
 }
@@ -118,7 +138,7 @@ impl Runnable for ProxyContext {
         S: Storage + Clone + Send + Sync + 'static,
     {
         let shutdown_notifier = CancellationToken::new();
-        tokio::spawn(util::listen_for_shutdown_signals(shutdown_notifier.clone()));
+        tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
         let proxy = Proxy::from_context(self, storage)?;
         match proxy {
             Proxy::Simple(simple_proxy) => simple_proxy.run(shutdown_notifier).await,
@@ -140,7 +160,6 @@ where
                 Self::Grpc(GrpcProxy::new(
                     context.config.validator.network,
                     context.config.internal_network,
-                    context.genesis_config,
                     context.send_timeout,
                     context.recv_timeout,
                     tls,
@@ -160,7 +179,6 @@ where
                     .validator
                     .network
                     .clone_with_protocol(public_transport),
-                genesis_config: context.genesis_config,
                 send_timeout: context.send_timeout,
                 recv_timeout: context.recv_timeout,
                 storage,
@@ -185,7 +203,6 @@ where
 {
     public_config: ValidatorPublicNetworkPreConfig<TransportProtocol>,
     internal_config: ValidatorInternalNetworkPreConfig<TransportProtocol>,
-    genesis_config: GenesisConfig,
     send_timeout: Duration,
     recv_timeout: Duration,
     storage: S,
@@ -242,7 +259,7 @@ where
 {
     #[instrument(name = "SimpleProxy::run", skip_all, fields(port = self.public_config.port, metrics_port = self.internal_config.metrics_port), err)]
     async fn run(self, shutdown_signal: CancellationToken) -> Result<()> {
-        info!("Starting simple server");
+        info!("Starting proxy");
         let mut join_set = JoinSet::new();
         let address = self.get_listen_address(self.public_config.port);
 
@@ -297,9 +314,16 @@ where
                     linera_version::VersionInfo::default().into(),
                 )))
             }
-            GenesisConfigHashQuery => Ok(Some(RpcMessage::GenesisConfigHashResponse(Box::new(
-                self.genesis_config.hash(),
-            )))),
+            NetworkDescriptionQuery => {
+                let description = self
+                    .storage
+                    .read_network_description()
+                    .await?
+                    .ok_or(anyhow!("Cannot find network description in the database"))?;
+                Ok(Some(RpcMessage::NetworkDescriptionResponse(Box::new(
+                    description,
+                ))))
+            }
             UploadBlob(content) => {
                 let blob = Blob::new(*content);
                 let id = blob.id();
@@ -313,14 +337,9 @@ where
                 let content = self.storage.read_blob(*blob_id).await?.into_content();
                 Ok(Some(RpcMessage::DownloadBlobResponse(Box::new(content))))
             }
-            DownloadConfirmedBlock(hash) => {
-                Ok(Some(RpcMessage::DownloadConfirmedBlockResponse(Box::new(
-                    self.storage
-                        .read_hashed_confirmed_block(*hash)
-                        .await?
-                        .into_inner(),
-                ))))
-            }
+            DownloadConfirmedBlock(hash) => Ok(Some(RpcMessage::DownloadConfirmedBlockResponse(
+                Box::new(self.storage.read_confirmed_block(*hash).await?),
+            ))),
             DownloadCertificates(hashes) => {
                 let certificates = self.storage.read_certificates(hashes).await?;
                 Ok(Some(RpcMessage::DownloadCertificatesResponse(certificates)))
@@ -342,10 +361,11 @@ where
             | Error(_)
             | ChainInfoResponse(_)
             | VersionInfoResponse(_)
-            | GenesisConfigHashResponse(_)
+            | NetworkDescriptionResponse(_)
             | DownloadBlobResponse(_)
             | DownloadPendingBlob(_)
             | DownloadPendingBlobResponse(_)
+            | HandlePendingBlob(_)
             | BlobLastUsedByResponse(_)
             | MissingBlobIdsResponse(_)
             | DownloadConfirmedBlockResponse(_)
@@ -359,9 +379,9 @@ fn main() -> Result<()> {
     let options = <ProxyOptions as clap::Parser>::parse();
     let server_config: ValidatorServerConfig =
         util::read_json(&options.config_path).expect("Fail to read server config");
-    let name = &server_config.validator.name;
+    let public_key = &server_config.validator.public_key;
 
-    linera_base::tracing::init(&format!("validator-{name}-proxy"));
+    linera_base::tracing::init(&format!("validator-{public_key}-proxy"));
 
     let mut runtime = if options.tokio_threads == Some(1) {
         tokio::runtime::Builder::new_current_thread()
@@ -375,25 +395,31 @@ fn main() -> Result<()> {
         builder
     };
 
+    if let Some(blocking_threads) = options.tokio_blocking_threads {
+        runtime.max_blocking_threads(blocking_threads);
+    }
+
     runtime.enable_all().build()?.block_on(options.run())
 }
 
 impl ProxyOptions {
     async fn run(&self) -> Result<()> {
+        let storage_cache_config = StorageCacheConfig {
+            max_cache_size: self.max_cache_size,
+            max_entry_size: self.max_entry_size,
+            max_cache_entries: self.max_cache_entries,
+        };
         let common_config = CommonStoreConfig {
             max_concurrent_queries: self.max_concurrent_queries,
             max_stream_queries: self.max_stream_queries,
-            cache_size: self.cache_size,
+            storage_cache_config,
+            replication_factor: self.storage_replication_factor,
         };
-        let full_storage_config = self.storage_config.add_common_config(common_config).await?;
         let genesis_config: GenesisConfig = util::read_json(&self.genesis_config_path)?;
-        run_with_storage(
-            full_storage_config,
-            &genesis_config,
-            None,
-            ProxyContext::from_options(self)?,
-        )
-        .boxed()
-        .await?
+        let store_config = self.storage_config.add_common_config(common_config).await?;
+        store_config
+            .run_with_storage(&genesis_config, None, ProxyContext::from_options(self)?)
+            .boxed()
+            .await?
     }
 }

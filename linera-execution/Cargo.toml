@@ -13,26 +13,30 @@ version.workspace = true
 
 [features]
 test = ["tokio/macros", "linera-base/test", "linera-views/test", "proptest"]
+revm = [
+    "dep:revm",
+    "dep:revm-context",
+    "dep:revm-context-interface",
+    "dep:revm-database",
+    "dep:revm-database-interface",
+    "dep:revm-handler",
+    "dep:revm-interpreter",
+    "dep:revm-primitives",
+    "dep:revm-state",
+    "dep:alloy-primitives",
+    "dep:alloy-sol-types",
+    "dep:hex",
+    "dep:tempfile",
+]
 fs = ["tokio/fs"]
 metrics = ["prometheus", "linera-views/metrics"]
-unstable-oracles = []
-wasmer = [
-    "dep:wasmer",
-    "wasmer/enable-serde",
-    "linera-witty/wasmer",
-    "wasm-encoder",
-    "wasm-instrument",
-    "wasmparser",
-]
-wasmtime = [
-    "dep:wasmtime",
-    "linera-witty/wasmtime",
-    "wasm-encoder",
-    "wasmparser",
-]
+wasmer = ["dep:wasmer", "wasmer/enable-serde", "linera-witty/wasmer"]
+wasmtime = ["dep:wasmtime", "linera-witty/wasmtime"]
 web = ["linera-base/web", "linera-views/web", "js-sys"]
 
 [dependencies]
+alloy-primitives = { workspace = true, optional = true }
+alloy-sol-types = { workspace = true, optional = true }
 anyhow.workspace = true
 async-graphql.workspace = true
 async-trait.workspace = true
@@ -44,8 +48,9 @@ dashmap.workspace = true
 derive_more = { workspace = true, features = ["display"] }
 dyn-clone.workspace = true
 futures.workspace = true
+hex = { workspace = true, optional = true }
 js-sys = { workspace = true, optional = true }
-linera-base.workspace = true
+linera-base = { workspace = true, features = ["reqwest"] }
 linera-views.workspace = true
 linera-views-derive.workspace = true
 linera-witty = { workspace = true, features = ["log", "macros"] }
@@ -53,20 +58,55 @@ lru.workspace = true
 oneshot.workspace = true
 prometheus = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
-reqwest = { workspace = true, features = ["blocking", "json"] }
+reqwest = { workspace = true, features = ["blocking", "json", "stream"] }
+revm = { workspace = true, optional = true, default-features = false, features = [
+    "std",
+    "kzg-rs",
+    "secp256k1",
+    "portable",
+    "blst",
+    "serde",
+] }
+revm-context = { workspace = true, optional = true, default-features = false, features = [
+    "serde",
+] }
+revm-context-interface = { workspace = true, optional = true, default-features = false, features = [
+    "serde",
+] }
+revm-database = { workspace = true, optional = true, default-features = false, features = [
+    "serde",
+] }
+revm-database-interface = { workspace = true, optional = true, default-features = false, features = [
+    "serde",
+] }
+revm-handler = { workspace = true, optional = true, default-features = false, features = [
+    "serde",
+] }
+revm-interpreter = { workspace = true, optional = true, default-features = false, features = [
+    "serde",
+] }
+revm-primitives = { workspace = true, optional = true, default-features = false, features = [
+    "serde",
+] }
+revm-state = { workspace = true, optional = true, default-features = false, features = [
+    "serde",
+] }
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing = { workspace = true, features = ["log"] }
-wasm-encoder = { workspace = true, optional = true }
-wasm-instrument = { workspace = true, optional = true, features = ["sign_ext"] }
-wasmparser = { workspace = true, optional = true }
+url.workspace = true
+wasm-instrument = { workspace = true, features = ["sign_ext"] }
 wasmtime = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-wasmer = { workspace = true, optional = true, features = ["cranelift", "singlepass"] }
+wasmer = { workspace = true, optional = true, features = [
+    "cranelift",
+    "singlepass",
+] }
 wasmer-compiler-singlepass.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -78,7 +118,10 @@ anyhow.workspace = true
 assert_matches.workspace = true
 bcs.workspace = true
 linera-base = { workspace = true, features = ["test"] }
-linera-execution = { path = ".", default-features = false, features = ["fs", "test"] }
+linera-execution = { path = ".", default-features = false, features = [
+    "fs",
+    "test",
+] }
 linera-witty = { workspace = true, features = ["log", "macros", "test"] }
 proptest.workspace = true
 test-case.workspace = true
@@ -93,3 +136,8 @@ cfg_aliases.workspace = true
 
 [package.metadata.cargo-machete]
 ignored = ["serde_bytes"]
+
+[[bin]]
+name = "wit-generator"
+path = "src/bin/wit_generator.rs"
+required-features = ["wasmer"]

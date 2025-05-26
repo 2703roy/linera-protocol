@@ -3,13 +3,11 @@
 
 use std::fmt::Debug;
 
-use alloy::{
-    primitives::{Address, Bytes, U256, U64},
-    rpc::types::eth::{
-        request::{TransactionInput, TransactionRequest},
-        BlockId, BlockNumberOrTag, Filter, Log,
-    },
+use alloy::rpc::types::eth::{
+    request::{TransactionInput, TransactionRequest},
+    BlockId, BlockNumberOrTag, Filter, Log,
 };
+use alloy_primitives::{Address, Bytes, U256, U64};
 use async_trait::async_trait;
 use linera_base::ensure;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -45,7 +43,7 @@ pub trait JsonRpcClient {
         let res = serde_json::from_str(raw.get())?;
         ensure!(id == result.id, EthereumQueryError::IdIsNotMatching);
         ensure!(
-            *"2.0" == result.jsonrpc,
+            "2.0" == result.jsonrpc,
             EthereumQueryError::WrongJsonRpcVersion
         );
         Ok(res)
@@ -99,8 +97,8 @@ pub trait EthereumQueries {
     /// Reads the events of the smart contract.
     ///
     /// This is done from a specified `contract_address` and `event_name_expanded`.
-    /// That is one should have "MyEvent(type1 indexed,type2)" instead
-    /// of the usual "MyEvent(type1,type2)"
+    /// That is one should have `MyEvent(type1 indexed,type2)` instead
+    /// of the usual `MyEvent(type1,type2)`
     ///
     /// The `from_block` is inclusive.
     /// The `to_block` is exclusive (contrary to Ethereum where it is inclusive)

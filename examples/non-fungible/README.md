@@ -2,7 +2,7 @@
 
 This example application implements non-fungible tokens (NFTs), showcasing the creation and management of unique digital assets. It highlights cross-chain messages, demonstrating how NFTs can be minted, transferred, and claimed across different chains, emphasizing the instantiation and auto-deployment of applications within the Linera blockchain ecosystem.
 
-Once this application's bytecode is published on a Linera chain, that application will contain the registry of the different NFTs.
+Once this application's module is published on a Linera chain, that application will contain the registry of the different NFTs.
 
 Some portions of this are very similar to the `fungible` README, and we'll refer to it throughout. Bash commands will always be included here for testing purposes.
 
@@ -26,25 +26,54 @@ NFTs can be transferred to various destinations, including:
 
 ### Setting Up
 
-Most of this can be referred to the [fungible app README](https://github.com/linera-io/linera-protocol/blob/main/examples/fungible/README.md#setting-up), except for at the end when compiling and publishing the bytecode, what you'll need to do will be slightly different.
+Before getting started, make sure that the binary tools `linera*` corresponding to
+your version of `linera-sdk` are in your PATH. For scripting purposes, we also assume
+that the BASH function `linera_spawn` is defined.
+
+From the root of Linera repository, this can be achieved as follows:
 
 ```bash
 export PATH="$PWD/target/debug:$PATH"
 source /dev/stdin <<<"$(linera net helper 2>/dev/null)"
-
-linera_spawn_and_read_wallet_variables linera net up --testing-prng-seed 37
 ```
 
-Compile the `non-fungible` application WebAssembly binaries, and publish them as an application bytecode:
+Next, start the local Linera network and run a faucet:
+
+```bash
+FAUCET_PORT=8079
+FAUCET_URL=http://localhost:$FAUCET_PORT
+linera_spawn linera net up --with-faucet --faucet-port $FAUCET_PORT
+
+# If you're using a testnet, run this instead:
+#   LINERA_TMP_DIR=$(mktemp -d)
+#   FAUCET_URL=https://faucet.testnet-XXX.linera.net  # for some value XXX
+```
+
+Create the user wallet and add chains to it:
+
+```bash
+export LINERA_WALLET="$LINERA_TMP_DIR/wallet.json"
+export LINERA_KEYSTORE="$LINERA_TMP_DIR/keystore.json"
+export LINERA_STORAGE="rocksdb:$LINERA_TMP_DIR/client.db"
+
+linera wallet init --faucet $FAUCET_URL
+
+INFO_1=($(linera wallet request-chain --faucet $FAUCET_URL))
+INFO_2=($(linera wallet request-chain --faucet $FAUCET_URL))
+CHAIN_1="${INFO_1[0]}"
+CHAIN_2="${INFO_2[0]}"
+OWNER_1="${INFO_1[1]}"
+OWNER_2="${INFO_2[1]}"
+```
 
 ```bash
 (cd examples/non-fungible && cargo build --release --target wasm32-unknown-unknown)
 
-BYTECODE_ID=$(linera publish-bytecode \
+MODULE_ID=$(linera publish-module \
     examples/target/wasm32-unknown-unknown/release/non_fungible_{contract,service}.wasm)
 ```
 
-Here, we stored the new bytecode ID in a variable `BYTECODE_ID` to be reused later.
+Here, we stored the new module ID in a variable `MODULE_ID` to be reused later.
 
 ### Creating an NFT
 
@@ -52,19 +81,10 @@ Unlike fungible tokens, each NFT is unique and identified by a unique token ID. 
 
 Refer to the [fungible app README](https://github.com/linera-io/linera-protocol/blob/main/examples/fungible/README.md#creating-a-token) to figure out how to list the chains created for the test in the default wallet, as well as defining some variables corresponding to these values.
 
-```bash
-linera wallet show
-
-CHAIN_1=e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65  # default chain for the wallet
-OWNER_1=7136460f0c87ae46f966f898d494c4b40c4ae8c527f4d1c0b1fa0f7cff91d20f  # owner of chain 1
-CHAIN_2=256e1dbc00482ddd619c293cc0df94d366afe7980022bb22d99e33036fd465dd  # another chain in the wallet
-OWNER_2=598d18f67709fe76ed6a36b75a7c9889012d30b896800dfd027ee10e1afd49a3  # owner of chain 2
-```
-
 To create the NFT application, run the command below:
 
 ```bash
-APP_ID=$(linera create-application $BYTECODE_ID)
+APP_ID=$(linera create-application $MODULE_ID)
 ```
 
 This will store the application ID in a new variable `APP_ID`.
@@ -109,7 +129,7 @@ BLOB_HASH=$(echo "$QUERY_RESULT" | jq -r '.publishDataBlob')
 ```gql,uri=http://localhost:8080/chains/$CHAIN_1/applications/$APP_ID
 mutation {
   mint(
-    minter: "User:$OWNER_1",
+    minter: "$OWNER_1",
     name: "nft1",
     blobHash: "$BLOB_HASH",
   )
@@ -120,7 +140,7 @@ mutation {
 
 ```gql,uri=http://localhost:8080/chains/$CHAIN_1/applications/$APP_ID
 query {
-  ownedNfts(owner: "User:$OWNER_1")
+  ownedNfts(owner: "$OWNER_1")
 }
 ```
 
@@ -158,11 +178,11 @@ query {
 ```gql,uri=http://localhost:8080/chains/$CHAIN_1/applications/$APP_ID
 mutation {
   transfer(
-    sourceOwner: "User:$OWNER_1",
+    sourceOwner: "$OWNER_1",
     tokenId: "$TOKEN_ID",
     targetAccount: {
       chainId: "$CHAIN_1",
-      owner: "User:$OWNER_2"
+      owner: "$OWNER_2"
     }
   )
 }

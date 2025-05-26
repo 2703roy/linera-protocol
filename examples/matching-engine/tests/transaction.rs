@@ -7,8 +7,8 @@
 
 use async_graphql::InputType;
 use linera_sdk::{
-    base::{AccountOwner, Amount, ApplicationId, ApplicationPermissions},
-    test::{ActiveChain, TestValidator},
+    linera_base_types::{AccountOwner, Amount, ApplicationId, ApplicationPermissions},
+    test::{ActiveChain, QueryOutcome, TestValidator},
 };
 use matching_engine::{
     MatchingEngineAbi, Operation, Order, OrderId, OrderNature, Parameters, Price,
@@ -23,8 +23,8 @@ pub async fn get_orders(
         "query {{ accountInfo {{ entry(key: {}) {{ value {{ orders }} }} }} }}",
         account_owner.to_value()
     );
-    let value = chain.graphql_query(application_id, query).await;
-    let orders = &value["accountInfo"]["entry"]["value"]["orders"];
+    let QueryOutcome { response, .. } = chain.graphql_query(application_id, query).await;
+    let orders = &response["accountInfo"]["entry"]["value"]["orders"];
     let values = orders
         .as_array()?
         .iter()
@@ -49,16 +49,16 @@ pub async fn get_orders(
 ///   * user_a with 10 tokens A.
 ///   * user_b with 9 tokens B.
 /// * Then we create the following orders:
-///   * User_a: Offer to buy token B in exchange of token A for a price of 1 (or 2) with
+///   * User_a: Offer to buy token B in exchange for token A for a price of 1 (or 2) with
 ///     a quantity of 3 token B.
 ///     User_a thus commits 3 * 1 + 3 * 2 = 9 token A to the matching engine chain and is
 ///     left with 1 token A on chain A
-///   * User_b: Offer to sell token B in exchange of token A for a pice of 2 (or 4) with
+///   * User_b: Offer to sell token B in exchange for token A for a price of 2 (or 4) with
 ///     a quantity of 4 token B
 ///     User_b thus commits 4 + 4 = 8 token B on the matching engine chain and is left
 ///     with 1 token B.
 /// * The price that is matching is 2 where a transaction can actually occur
-///   * Only 3 token B can be exhanged against 6 tokens A.
+///   * Only 3 token B can be exchanged against 6 tokens A.
 ///   * So, the order from user_b is only partially filled.
 /// * Then the orders are cancelled and the user get back their tokens.
 ///   After the exchange we have
@@ -66,8 +66,8 @@ pub async fn get_orders(
 ///   * User_b: It has 8 - 3 = 5 token B and the newly acquired 6 token A
 #[tokio::test]
 async fn single_transaction() {
-    let (validator, bytecode_id) =
-        TestValidator::with_current_bytecode::<MatchingEngineAbi, Parameters, ()>().await;
+    let (validator, module_id) =
+        TestValidator::with_current_module::<MatchingEngineAbi, Parameters, ()>().await;
 
     let mut user_chain_a = validator.new_chain().await;
     let owner_a = AccountOwner::from(user_chain_a.public_key());
@@ -76,11 +76,11 @@ async fn single_transaction() {
     let mut matching_chain = validator.new_chain().await;
     let admin_account = AccountOwner::from(matching_chain.public_key());
 
-    let fungible_bytecode_id_a = user_chain_a
-        .publish_bytecodes_in::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>("../fungible")
+    let fungible_module_id_a = user_chain_a
+        .publish_bytecode_files_in::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>("../fungible")
         .await;
-    let fungible_bytecode_id_b = user_chain_b
-        .publish_bytecodes_in::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>("../fungible")
+    let fungible_module_id_b = user_chain_b
+        .publish_bytecode_files_in::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>("../fungible")
         .await;
 
     let initial_state_a =
@@ -88,7 +88,7 @@ async fn single_transaction() {
     let params_a = fungible::Parameters::new("A");
     let token_id_a = user_chain_a
         .create_application(
-            fungible_bytecode_id_a,
+            fungible_module_id_a,
             params_a,
             initial_state_a.build(),
             vec![],
@@ -99,15 +99,12 @@ async fn single_transaction() {
     let params_b = fungible::Parameters::new("B");
     let token_id_b = user_chain_b
         .create_application(
-            fungible_bytecode_id_b,
+            fungible_module_id_b,
             params_b,
             initial_state_b.build(),
             vec![],
         )
         .await;
-
-    user_chain_a.register_application(token_id_b).await;
-    user_chain_b.register_application(token_id_a).await;
 
     // Check the initial starting amounts for chain a and chain b
     for (owner, amount) in [
@@ -132,15 +129,12 @@ async fn single_transaction() {
     let matching_parameter = Parameters { tokens };
     let matching_id = matching_chain
         .create_application(
-            bytecode_id,
+            module_id,
             matching_parameter,
             (),
             vec![token_id_a.forget_abi(), token_id_b.forget_abi()],
         )
         .await;
-    // Doing the registrations
-    user_chain_a.register_application(matching_id).await;
-    user_chain_b.register_application(matching_id).await;
 
     // Creating the bid orders
     let mut bid_certificates = Vec::new();
@@ -159,7 +153,7 @@ async fn single_transaction() {
             })
             .await;
 
-        assert_eq!(bid_certificate.outgoing_message_count(), 3);
+        assert_eq!(bid_certificate.outgoing_message_count(), 2);
         bid_certificates.push(bid_certificate);
     }
 
@@ -211,7 +205,7 @@ async fn single_transaction() {
             })
             .await;
 
-        assert_eq!(ask_certificate.outgoing_message_count(), 3);
+        assert_eq!(ask_certificate.outgoing_message_count(), 2);
         ask_certificates.push(ask_certificate);
     }
 
@@ -263,7 +257,7 @@ async fn single_transaction() {
             block.with_operation(matching_id, operation);
         })
         .await;
-    assert_eq!(order_certificate.outgoing_message_count(), 2);
+    assert_eq!(order_certificate.outgoing_message_count(), 1);
     matching_chain
         .add_block(|block| {
             block.with_messages_from(&order_certificate);

@@ -8,6 +8,8 @@ use linera_base::command::{current_binary_parent, CommandExt};
 use pathdiff::diff_paths;
 use tokio::process::Command;
 
+use crate::cli_wrappers::local_kubernetes_net::BuildMode;
+
 pub struct DockerImage {
     name: String,
 }
@@ -17,7 +19,13 @@ impl DockerImage {
         &self.name
     }
 
-    pub async fn build(name: &String, binaries: &BuildArg, github_root: &PathBuf) -> Result<Self> {
+    pub async fn build(
+        name: &str,
+        binaries: &BuildArg,
+        github_root: &PathBuf,
+        build_mode: &BuildMode,
+        dual_store: bool,
+    ) -> Result<Self> {
         let build_arg = match binaries {
             BuildArg::Directory(bin_path) => {
                 // Get the binaries from the specified path
@@ -47,13 +55,28 @@ impl DockerImage {
             }
         };
 
-        let docker_image = Self { name: name.clone() };
+        let docker_image = Self {
+            name: name.to_owned(),
+        };
         let mut command = Command::new("docker");
         command
             .current_dir(github_root)
             .arg("build")
             .args(["-f", "docker/Dockerfile"])
             .args(["--build-arg", &build_arg]);
+
+        match build_mode {
+            // Release is the default, so no need to add any arguments
+            BuildMode::Release => {}
+            BuildMode::Debug => {
+                command.args(["--build-arg", "build_folder=debug"]);
+                command.args(["--build-arg", "build_flag="]);
+            }
+        }
+
+        if dual_store {
+            command.args(["--build-arg", "build_features=rocksdb,scylladb,metrics"]);
+        }
 
         #[cfg(not(with_testing))]
         command

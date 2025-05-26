@@ -5,30 +5,39 @@
 
 use std::{fmt::Debug, future::Future};
 
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[cfg(with_testing)]
 use crate::random::generate_test_namespace;
-use crate::{batch::Batch, common::from_bytes_option, views::ViewError};
+use crate::{
+    batch::Batch,
+    common::from_bytes_option,
+    lru_caching::{StorageCacheConfig, DEFAULT_STORAGE_CACHE_CONFIG},
+    views::ViewError,
+};
 
 /// The common initialization parameters for the `KeyValueStore`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommonStoreInternalConfig {
     /// The number of concurrent to a database
     pub max_concurrent_queries: Option<usize>,
     /// The number of streams used for the async streams.
     pub max_stream_queries: usize,
+    /// The replication factor for the keyspace
+    pub replication_factor: u32,
 }
 
 /// The common initialization parameters for the `KeyValueStore`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommonStoreConfig {
     /// The number of concurrent to a database
     pub max_concurrent_queries: Option<usize>,
     /// The number of streams used for the async streams.
     pub max_stream_queries: usize,
     /// The cache size being used.
-    pub cache_size: usize,
+    pub storage_cache_config: StorageCacheConfig,
+    /// The replication factor for the keyspace
+    pub replication_factor: u32,
 }
 
 impl CommonStoreConfig {
@@ -37,6 +46,7 @@ impl CommonStoreConfig {
         CommonStoreInternalConfig {
             max_concurrent_queries: self.max_concurrent_queries,
             max_stream_queries: self.max_stream_queries,
+            replication_factor: self.replication_factor,
         }
     }
 }
@@ -46,13 +56,14 @@ impl Default for CommonStoreConfig {
         CommonStoreConfig {
             max_concurrent_queries: None,
             max_stream_queries: 10,
-            cache_size: 1000,
+            storage_cache_config: DEFAULT_STORAGE_CACHE_CONFIG,
+            replication_factor: 1,
         }
     }
 }
 
 /// The error type for the key-value stores.
-pub trait KeyValueStoreError: std::error::Error + Debug + From<bcs::Error> {
+pub trait KeyValueStoreError: std::error::Error + Debug + From<bcs::Error> + 'static {
     /// The name of the backend.
     const BACKEND: &'static str;
 }
@@ -73,8 +84,8 @@ pub trait WithError {
 }
 
 /// Low-level, asynchronous read key-value operations. Useful for storage APIs not based on views.
-#[trait_variant::make(ReadableKeyValueStore: Send)]
-pub trait LocalReadableKeyValueStore: WithError {
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait ReadableKeyValueStore: WithError {
     /// The maximal size of keys that can be stored.
     const MAX_KEY_SIZE: usize;
 
@@ -145,8 +156,8 @@ pub trait LocalReadableKeyValueStore: WithError {
 }
 
 /// Low-level, asynchronous write key-value operations. Useful for storage APIs not based on views.
-#[trait_variant::make(WritableKeyValueStore: Send)]
-pub trait LocalWritableKeyValueStore: WithError {
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait WritableKeyValueStore: WithError {
     /// The maximal size of values that can be stored.
     const MAX_VALUE_SIZE: usize;
 
@@ -159,25 +170,28 @@ pub trait LocalWritableKeyValueStore: WithError {
 }
 
 /// Low-level trait for the administration of stores and their namespaces.
-#[trait_variant::make(AdminKeyValueStore: Send)]
-pub trait LocalAdminKeyValueStore: WithError + Sized {
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait AdminKeyValueStore: WithError + Sized {
     /// The configuration needed to interact with a new store.
     type Config: Send + Sync;
     /// The name of this class of stores
     fn get_name() -> String;
 
     /// Connects to an existing namespace using the given configuration.
-    async fn connect(
-        config: &Self::Config,
-        namespace: &str,
-        root_key: &[u8],
-    ) -> Result<Self, Self::Error>;
+    async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, Self::Error>;
 
     /// Takes a connection and creates a new one with a different `root_key`.
     fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, Self::Error>;
 
     /// Obtains the list of existing namespaces.
     async fn list_all(config: &Self::Config) -> Result<Vec<String>, Self::Error>;
+
+    /// Lists the root keys of the namespace.
+    /// It is possible that some root keys have no keys.
+    async fn list_root_keys(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<Vec<Vec<u8>>, Self::Error>;
 
     /// Deletes all the existing namespaces.
     fn delete_all(config: &Self::Config) -> impl Future<Output = Result<(), Self::Error>> {
@@ -203,13 +217,12 @@ pub trait LocalAdminKeyValueStore: WithError + Sized {
     fn maybe_create_and_connect(
         config: &Self::Config,
         namespace: &str,
-        root_key: &[u8],
     ) -> impl Future<Output = Result<Self, Self::Error>> {
         async {
             if !Self::exists(config, namespace).await? {
                 Self::create(config, namespace).await?;
             }
-            Self::connect(config, namespace, root_key).await
+            Self::connect(config, namespace).await
         }
     }
 
@@ -217,14 +230,13 @@ pub trait LocalAdminKeyValueStore: WithError + Sized {
     fn recreate_and_connect(
         config: &Self::Config,
         namespace: &str,
-        root_key: &[u8],
     ) -> impl Future<Output = Result<Self, Self::Error>> {
         async {
             if Self::exists(config, namespace).await? {
                 Self::delete(config, namespace).await?;
             }
             Self::create(config, namespace).await?;
-            Self::connect(config, namespace, root_key).await
+            Self::connect(config, namespace).await
         }
     }
 }
@@ -233,17 +245,6 @@ pub trait LocalAdminKeyValueStore: WithError + Sized {
 pub trait RestrictedKeyValueStore: ReadableKeyValueStore + WritableKeyValueStore {}
 
 impl<T> RestrictedKeyValueStore for T where T: ReadableKeyValueStore + WritableKeyValueStore {}
-
-/// Low-level, asynchronous write and read key-value operations, without a `Send` bound. Useful for storage APIs not based on views.
-pub trait LocalRestrictedKeyValueStore:
-    LocalReadableKeyValueStore + LocalWritableKeyValueStore
-{
-}
-
-impl<T> LocalRestrictedKeyValueStore for T where
-    T: LocalReadableKeyValueStore + LocalWritableKeyValueStore
-{
-}
 
 /// Low-level, asynchronous write and read key-value operations. Useful for storage APIs not based on views.
 pub trait KeyValueStore:
@@ -256,32 +257,17 @@ impl<T> KeyValueStore for T where
 {
 }
 
-/// Low-level, asynchronous write and read key-value operations, without a `Send` bound. Useful for storage APIs not based on views.
-pub trait LocalKeyValueStore:
-    LocalReadableKeyValueStore + LocalWritableKeyValueStore + LocalAdminKeyValueStore
-{
-}
-
-impl<T> LocalKeyValueStore for T where
-    T: LocalReadableKeyValueStore + LocalWritableKeyValueStore + LocalAdminKeyValueStore
-{
-}
-
 /// The functions needed for testing purposes
 #[cfg(with_testing)]
 pub trait TestKeyValueStore: KeyValueStore {
     /// Obtains a test config
-    fn new_test_config(
-    ) -> impl std::future::Future<Output = Result<Self::Config, Self::Error>> + Send;
+    async fn new_test_config() -> Result<Self::Config, Self::Error>;
 
     /// Creates a store for testing purposes
-    fn new_test_store() -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
-        async {
-            let config = Self::new_test_config().await?;
-            let namespace = generate_test_namespace();
-            let root_key = &[];
-            Self::recreate_and_connect(&config, &namespace, root_key).await
-        }
+    async fn new_test_store() -> Result<Self, Self::Error> {
+        let config = Self::new_test_config().await?;
+        let namespace = generate_test_namespace();
+        Self::recreate_and_connect(&config, &namespace).await
     }
 }
 

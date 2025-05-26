@@ -4,18 +4,18 @@
 
 #![cfg(feature = "storage-service")]
 
-mod common;
+mod guard;
 
 use std::{env, path::PathBuf};
 
-use common::INTEGRATION_TEST_GUARD;
-use linera_client::{
-    client_options::{
-        DEFAULT_PAUSE_AFTER_GQL_MUTATIONS_SECS, DEFAULT_PAUSE_AFTER_LINERA_SERVICE_SECS,
+use guard::INTEGRATION_TEST_GUARD;
+use linera_service::{
+    test_name,
+    util::{
+        parse_secs, Markdown, DEFAULT_PAUSE_AFTER_GQL_MUTATIONS_SECS,
+        DEFAULT_PAUSE_AFTER_LINERA_SERVICE_SECS,
     },
-    util::parse_secs,
 };
-use linera_service::{test_name, util::Markdown};
 use tempfile::tempdir;
 use tokio::process::Command;
 
@@ -25,14 +25,17 @@ use tokio::process::Command;
 #[test_case::test_case("../examples/crowd-funding" ; "crowd funding")]
 #[test_case::test_case("../examples/fungible" ; "fungible")]
 #[test_case::test_case("../examples/gen-nft" ; "gen-nft")]
+#[test_case::test_case("../examples/how-to/perform-http-requests" ; "how-to-perform-http-requests")]
 #[test_case::test_case("../examples/hex-game" ; "hex-game")]
+#[test_case::test_case("../examples/llm" ; "llm")]
 #[test_case::test_case("../examples/native-fungible" ; "native-fungible")]
 #[test_case::test_case("../examples/non-fungible" ; "non-fungible")]
 #[test_case::test_case("../examples/matching-engine" ; "matching engine")]
 #[test_case::test_case("../examples/meta-counter" ; "meta counter")]
+#[test_case::test_case("../examples/rfq" ; "requests for quotes")]
 #[test_case::test_case("../examples/social" ; "social")]
 #[test_log::test(tokio::test)]
-async fn test_script_in_readme_with_storage_service(path: &str) -> std::io::Result<()> {
+async fn test_script_in_readme(path: &str) -> std::io::Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {} for path {}", test_name!(), path);
 

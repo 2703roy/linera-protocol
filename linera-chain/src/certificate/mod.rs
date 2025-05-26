@@ -8,21 +8,20 @@ mod lite;
 mod timeout;
 mod validated;
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 pub use generic::GenericCertificate;
 use linera_base::{
-    crypto::Signature,
-    data_types::{BlockHeight, Round},
+    crypto::{CryptoHash, ValidatorPublicKey, ValidatorSignature},
+    data_types::{BlockHeight, Epoch, Round},
     identifiers::{BlobId, ChainId},
 };
-use linera_execution::committee::{Epoch, ValidatorName};
 pub use lite::LiteCertificate;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{ConfirmedBlock, Timeout, ValidatedBlock};
 
-/// Certificate for a [`ValidatedBlock`]` instance.
+/// Certificate for a [`ValidatedBlock`] instance.
 /// A validated block certificate means the block is valid (but not necessarily finalized yet).
 /// Since only one block per round is validated,
 /// there can be at most one such certificate in every round.
@@ -62,21 +61,21 @@ impl Certificate {
 
     pub fn height(&self) -> BlockHeight {
         match self {
-            Certificate::Validated(cert) => cert.value().inner().executed_block().block.height,
-            Certificate::Confirmed(cert) => cert.value().inner().executed_block().block.height,
-            Certificate::Timeout(cert) => cert.inner().height,
+            Certificate::Validated(cert) => cert.value().block().header.height,
+            Certificate::Confirmed(cert) => cert.value().block().header.height,
+            Certificate::Timeout(cert) => cert.value().height(),
         }
     }
 
     pub fn chain_id(&self) -> ChainId {
         match self {
-            Certificate::Validated(cert) => cert.value().inner().executed_block().block.chain_id,
-            Certificate::Confirmed(cert) => cert.value().inner().executed_block().block.chain_id,
-            Certificate::Timeout(cert) => cert.inner().chain_id,
+            Certificate::Validated(cert) => cert.value().block().header.chain_id,
+            Certificate::Confirmed(cert) => cert.value().block().header.chain_id,
+            Certificate::Timeout(cert) => cert.value().chain_id(),
         }
     }
 
-    pub fn signatures(&self) -> &Vec<(ValidatorName, Signature)> {
+    pub fn signatures(&self) -> &Vec<(ValidatorPublicKey, ValidatorSignature)> {
         match self {
             Certificate::Validated(cert) => cert.signatures(),
             Certificate::Confirmed(cert) => cert.signatures(),
@@ -102,26 +101,32 @@ pub trait CertificateValue: Clone {
 
     fn height(&self) -> BlockHeight;
 
-    fn required_blob_ids(&self) -> HashSet<BlobId>;
+    fn required_blob_ids(&self) -> BTreeSet<BlobId>;
+
+    fn hash(&self) -> CryptoHash;
 }
 
 impl CertificateValue for Timeout {
     const KIND: CertificateKind = CertificateKind::Timeout;
 
     fn chain_id(&self) -> ChainId {
-        self.chain_id
+        self.chain_id()
     }
 
     fn epoch(&self) -> Epoch {
-        self.epoch
+        self.epoch()
     }
 
     fn height(&self) -> BlockHeight {
-        self.height
+        self.height()
     }
 
-    fn required_blob_ids(&self) -> HashSet<BlobId> {
-        HashSet::new()
+    fn required_blob_ids(&self) -> BTreeSet<BlobId> {
+        BTreeSet::new()
+    }
+
+    fn hash(&self) -> CryptoHash {
+        self.inner().hash()
     }
 }
 
@@ -129,19 +134,23 @@ impl CertificateValue for ValidatedBlock {
     const KIND: CertificateKind = CertificateKind::Validated;
 
     fn chain_id(&self) -> ChainId {
-        self.executed_block().block.chain_id
+        self.block().header.chain_id
     }
 
     fn epoch(&self) -> Epoch {
-        self.executed_block().block.epoch
+        self.block().header.epoch
     }
 
     fn height(&self) -> BlockHeight {
-        self.executed_block().block.height
+        self.block().header.height
     }
 
-    fn required_blob_ids(&self) -> HashSet<BlobId> {
-        self.executed_block().required_blob_ids()
+    fn required_blob_ids(&self) -> BTreeSet<BlobId> {
+        self.block().required_blob_ids()
+    }
+
+    fn hash(&self) -> CryptoHash {
+        self.inner().hash()
     }
 }
 
@@ -149,18 +158,22 @@ impl CertificateValue for ConfirmedBlock {
     const KIND: CertificateKind = CertificateKind::Confirmed;
 
     fn chain_id(&self) -> ChainId {
-        self.executed_block().block.chain_id
+        self.block().header.chain_id
     }
 
     fn epoch(&self) -> Epoch {
-        self.executed_block().block.epoch
+        self.block().header.epoch
     }
 
     fn height(&self) -> BlockHeight {
-        self.executed_block().block.height
+        self.block().header.height
     }
 
-    fn required_blob_ids(&self) -> HashSet<BlobId> {
-        self.executed_block().required_blob_ids()
+    fn required_blob_ids(&self) -> BTreeSet<BlobId> {
+        self.block().required_blob_ids()
+    }
+
+    fn hash(&self) -> CryptoHash {
+        self.inner().hash()
     }
 }

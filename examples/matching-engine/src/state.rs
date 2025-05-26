@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use async_graphql::SimpleObject;
 use fungible::Account;
 use linera_sdk::{
-    base::{AccountOwner, Amount},
+    linera_base_types::{AccountOwner, Amount},
     views::{
         linera_views, CustomCollectionView, MapView, QueueView, RegisterView, RootView, View,
         ViewStorageContext,
@@ -52,25 +52,25 @@ pub struct AccountInfo {
 /// cancelled order is not the oldest, then it remains
 /// though with a size zero.
 #[derive(View, SimpleObject)]
-#[view(context = "ViewStorageContext")]
+#[view(context = ViewStorageContext)]
 pub struct LevelView {
     pub queue: QueueView<OrderEntry>,
 }
 
 /// The matching engine containing the information.
 #[derive(RootView, SimpleObject)]
-#[view(context = "ViewStorageContext")]
+#[view(context = ViewStorageContext)]
 pub struct MatchingEngineState {
     ///The next_order_number contains the order_id so that
     ///the order_id gets created from 0, to infinity.
     pub next_order_number: RegisterView<OrderId>,
     /// The map of the outstanding bids, by the bitwise complement of
     /// the revert of the price. The order is from the best price
-    /// level (highest proposed by buyer) to the worse
+    /// level (highest proposed by buyer) to the worst
     pub bids: CustomCollectionView<PriceBid, LevelView>,
     /// The map of the outstanding asks, by the bitwise complement of
     /// the price. The order is from the best one (smallest asked price
-    /// by seller) to the worse.
+    /// by seller) to the worst.
     pub asks: CustomCollectionView<PriceAsk, LevelView>,
     /// The map with the list of orders giving for each order_id the
     /// fundamental information on the order (nature, owner, amount)

@@ -9,13 +9,14 @@ use futures::future::{join_all, try_join_all};
 use linera_base::{
     async_graphql::InputType,
     data_types::Amount,
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, Owner},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId},
     time::timer::Instant,
+    vm::VmRuntime,
 };
 use linera_sdk::abis::fungible::{self, FungibleTokenAbi, InitialState, Parameters};
 use linera_service::cli_wrappers::{
     local_net::{PathProvider, ProcessInbox},
-    ApplicationWrapper, ClientWrapper, Faucet, FaucetOption, Network, OnClientDrop,
+    ApplicationWrapper, ClientWrapper, Faucet, Network, OnClientDrop,
 };
 use port_selector::random_free_tcp_port;
 use rand::{Rng as _, SeedableRng};
@@ -39,7 +40,7 @@ enum Args {
         transactions: usize,
 
         /// The faucet (which implicitly defines the network)
-        #[arg(long = "faucet", default_value = "http://faucet.devnet.linera.net")]
+        #[arg(long = "faucet")]
         faucet: String,
 
         /// The seed for the PRNG determining the pattern of transactions.
@@ -47,7 +48,7 @@ enum Args {
         seed: u64,
 
         #[arg(long = "uniform")]
-        /// If set, each chain receives the exact same amount of transfers.
+        /// If set, each chain receives the exact same number of transfers.
         uniform: bool,
     },
 }
@@ -86,9 +87,8 @@ async fn benchmark_with_fungible(
         num_wallets,
         OnClientDrop::CloseChains,
     );
-    publisher
-        .wallet_init(&[], FaucetOption::NewChain(&faucet))
-        .await?;
+    publisher.wallet_init(Some(&faucet)).await?;
+    publisher.request_chain(&faucet, true).await?;
     let clients = (0..num_wallets)
         .map(|n| {
             let path_provider = PathProvider::create_temporary_directory().unwrap();
@@ -101,11 +101,10 @@ async fn benchmark_with_fungible(
             ))
         })
         .collect::<Result<Vec<_>, anyhow::Error>>()?;
-    try_join_all(
-        clients
-            .iter()
-            .map(|client| client.wallet_init(&[], FaucetOption::NewChain(&faucet))),
-    )
+    try_join_all(clients.iter().map(|client| async {
+        client.wallet_init(Some(&faucet)).await?;
+        client.request_chain(&faucet, true).await
+    }))
     .await?;
 
     info!("Synchronizing balances (sanity check)");
@@ -128,20 +127,25 @@ async fn benchmark_with_fungible(
         services.push(node_service);
     }
 
-    info!("Building the fungible application bytecode.");
+    info!("Building the fungible application module.");
     let path = Path::new("examples/fungible").canonicalize().context(
         "`linera-benchmark` is meant to run from the root of the `linera-protocol` repository",
     )?;
     let (contract, service) = publisher.build_application(&path, "fungible", true).await?;
 
-    info!("Publishing the fungible application bytecode.");
-    let bytecode_id = publisher
-        .publish_bytecode::<FungibleTokenAbi, Parameters, InitialState>(contract, service, None)
+    info!("Publishing the fungible application module.");
+    let module_id = publisher
+        .publish_module::<FungibleTokenAbi, Parameters, InitialState>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            None,
+        )
         .await?;
 
     struct BenchmarkContext {
         application_id: ApplicationId<FungibleTokenAbi>,
-        owner: Owner,
+        owner: AccountOwner,
         default_chain: ChainId,
     }
 
@@ -151,20 +155,11 @@ async fn benchmark_with_fungible(
             let owner = client.get_owner().context("missing owner")?;
             let default_chain = client.default_chain().context("missing default chain")?;
             let initial_state = InitialState {
-                accounts: BTreeMap::from([(
-                    AccountOwner::User(owner),
-                    Amount::from_tokens(num_transactions as u128),
-                )]),
+                accounts: BTreeMap::from([(owner, Amount::from_tokens(num_transactions as u128))]),
             };
             let parameters = Parameters::new(format!("FUN{}", i).leak());
             let application_id = node_service
-                .create_application(
-                    &default_chain,
-                    &bytecode_id,
-                    &parameters,
-                    &initial_state,
-                    &[],
-                )
+                .create_application(&default_chain, &module_id, &parameters, &initial_state, &[])
                 .await?;
             let context = BenchmarkContext {
                 application_id,
@@ -199,11 +194,11 @@ async fn benchmark_with_fungible(
                     .try_add_assign(Amount::ONE)
                     .unwrap();
                 sender_app.transfer(
-                    AccountOwner::User(sender_context.owner),
+                    sender_context.owner,
                     Amount::ONE,
                     fungible::Account {
                         chain_id: receiver_context.default_chain,
-                        owner: AccountOwner::User(receiver_context.owner),
+                        owner: receiver_context.owner,
                     },
                 )
             })
@@ -249,8 +244,7 @@ async fn benchmark_with_fungible(
                     );
                     for i in 0.. {
                         linera_base::time::timer::sleep(Duration::from_secs(i)).await;
-                        let actual_balance =
-                            app.get_amount(&AccountOwner::User(context.owner)).await;
+                        let actual_balance = app.get_amount(&context.owner).await;
                         if actual_balance == expected_balance {
                             break;
                         }
@@ -262,10 +256,7 @@ async fn benchmark_with_fungible(
                             );
                         }
                     }
-                    assert_eq!(
-                        app.get_amount(&AccountOwner::User(context.owner)).await,
-                        expected_balance
-                    );
+                    assert_eq!(app.get_amount(&context.owner).await, expected_balance);
                     Ok(())
                 },
             ))

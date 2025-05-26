@@ -6,31 +6,29 @@
 //! Helps with the construction of blocks, adding operations and
 
 use linera_base::{
-    crypto::PublicKey,
-    data_types::{Amount, ApplicationPermissions, Round, Timestamp},
-    hashed::Hashed,
-    identifiers::{ApplicationId, ChainId, GenericApplicationId, Owner},
+    abi::ContractAbi,
+    data_types::{Amount, ApplicationPermissions, Blob, Epoch, Round, Timestamp},
+    identifiers::{AccountOwner, ApplicationId, ChainId},
     ownership::TimeoutConfig,
 };
 use linera_chain::{
     data_types::{
-        Block, ChannelFullName, IncomingBundle, LiteValue, LiteVote, Medium, MessageAction, Origin,
-        SignatureAggregator,
+        IncomingBundle, LiteValue, LiteVote, MessageAction, ProposedBlock, SignatureAggregator,
     },
     types::{ConfirmedBlock, ConfirmedBlockCertificate},
 };
+use linera_core::worker::WorkerError;
 use linera_execution::{
-    system::{Recipient, SystemChannel, SystemOperation},
+    system::{Recipient, SystemOperation},
     Operation,
 };
 
 use super::TestValidator;
-use crate::ToBcsBytes;
 
-/// A helper type to build [`Block`]s using the builder pattern, and then signing them into
+/// A helper type to build a block proposal using the builder pattern, and then signing them into
 /// [`ConfirmedBlockCertificate`]s using a [`TestValidator`].
 pub struct BlockBuilder {
-    block: Block,
+    block: ProposedBlock,
     validator: TestValidator,
 }
 
@@ -48,7 +46,8 @@ impl BlockBuilder {
     /// block.
     pub(crate) fn new(
         chain_id: ChainId,
-        owner: Owner,
+        owner: AccountOwner,
+        epoch: Epoch,
         previous_block: Option<&ConfirmedBlockCertificate>,
         validator: TestValidator,
     ) -> Self {
@@ -64,8 +63,8 @@ impl BlockBuilder {
             .unwrap_or_default();
 
         BlockBuilder {
-            block: Block {
-                epoch: 0.into(),
+            block: ProposedBlock {
+                epoch,
                 chain_id,
                 incoming_bundles: vec![],
                 operations: vec![],
@@ -87,7 +86,7 @@ impl BlockBuilder {
     /// Adds a native token transfer to this block.
     pub fn with_native_token_transfer(
         &mut self,
-        sender: Option<Owner>,
+        sender: AccountOwner,
         recipient: Recipient,
         amount: Amount,
     ) -> &mut Self {
@@ -104,29 +103,20 @@ impl BlockBuilder {
         self
     }
 
-    /// Adds a request to register an application on this chain.
-    pub fn with_request_for_application<Abi>(
-        &mut self,
-        application: ApplicationId<Abi>,
-    ) -> &mut Self {
-        self.with_system_operation(SystemOperation::RequestApplication {
-            chain_id: application.creation.chain_id,
-            application_id: application.forget_abi(),
-        })
-    }
-
     /// Adds an operation to change this chain's ownership.
     pub fn with_owner_change(
         &mut self,
-        super_owners: Vec<PublicKey>,
-        owners: Vec<(PublicKey, u64)>,
+        super_owners: Vec<AccountOwner>,
+        owners: Vec<(AccountOwner, u64)>,
         multi_leader_rounds: u32,
+        open_multi_leader_rounds: bool,
         timeout_config: TimeoutConfig,
     ) -> &mut Self {
         self.with_system_operation(SystemOperation::ChangeOwnership {
             super_owners,
             owners,
             multi_leader_rounds,
+            open_multi_leader_rounds,
             timeout_config,
         })
     }
@@ -146,13 +136,25 @@ impl BlockBuilder {
     pub fn with_operation<Abi>(
         &mut self,
         application_id: ApplicationId<Abi>,
-        operation: impl ToBcsBytes,
+        operation: Abi::Operation,
+    ) -> &mut Self
+    where
+        Abi: ContractAbi,
+    {
+        let operation = Abi::serialize_operation(&operation)
+            .expect("Failed to serialize `Operation` in BlockBuilder");
+        self.with_raw_operation(application_id.forget_abi(), operation)
+    }
+
+    /// Adds an already serialized user `operation` to this block.
+    pub fn with_raw_operation(
+        &mut self,
+        application_id: ApplicationId,
+        operation: impl Into<Vec<u8>>,
     ) -> &mut Self {
         self.block.operations.push(Operation::User {
-            application_id: application_id.forget_abi(),
-            bytes: operation
-                .to_bcs_bytes()
-                .expect("Failed to serialize operation"),
+            application_id,
+            bytes: operation.into(),
         });
         self
     }
@@ -169,63 +171,63 @@ impl BlockBuilder {
         self
     }
 
-    /// Receives all admin messages that were sent to this chain by the given certificate.
-    pub fn with_system_messages_from(
-        &mut self,
-        certificate: &ConfirmedBlockCertificate,
-        channel: SystemChannel,
-    ) -> &mut Self {
-        let medium = Medium::Channel(ChannelFullName {
-            application_id: GenericApplicationId::System,
-            name: channel.name(),
-        });
-        self.with_messages_from_by_medium(certificate, &medium, MessageAction::Accept)
-    }
-
     /// Receives all direct messages  that were sent to this chain by the given certificate.
     pub fn with_messages_from(&mut self, certificate: &ConfirmedBlockCertificate) -> &mut Self {
-        self.with_messages_from_by_medium(certificate, &Medium::Direct, MessageAction::Accept)
+        self.with_messages_from_by_action(certificate, MessageAction::Accept)
     }
 
     /// Receives all messages that were sent to this chain by the given certificate.
-    pub fn with_messages_from_by_medium(
+    pub fn with_messages_from_by_action(
         &mut self,
         certificate: &ConfirmedBlockCertificate,
-        medium: &Medium,
         action: MessageAction,
     ) -> &mut Self {
-        let origin = Origin {
-            sender: certificate.inner().chain_id(),
-            medium: medium.clone(),
-        };
-        let bundles = certificate
-            .message_bundles_for(medium, self.block.chain_id)
-            .map(|(_epoch, bundle)| IncomingBundle {
-                origin: origin.clone(),
-                bundle,
-                action,
-            });
+        let origin = certificate.inner().chain_id();
+        let bundles =
+            certificate
+                .message_bundles_for(self.block.chain_id)
+                .map(|(_epoch, bundle)| IncomingBundle {
+                    origin,
+                    bundle,
+                    action,
+                });
         self.with_incoming_bundles(bundles)
     }
 
-    /// Tries to sign the prepared [`Block`] with the [`TestValidator`]'s keys and return the
+    /// Tries to sign the prepared block with the [`TestValidator`]'s keys and return the
     /// resulting [`Certificate`]. Returns an error if block execution fails.
-    pub(crate) async fn try_sign(self) -> anyhow::Result<ConfirmedBlockCertificate> {
-        let (executed_block, _) = self
+    pub(crate) async fn try_sign(
+        self,
+        blobs: &[Blob],
+    ) -> Result<ConfirmedBlockCertificate, WorkerError> {
+        let published_blobs = self
+            .block
+            .published_blob_ids()
+            .into_iter()
+            .map(|blob_id| {
+                blobs
+                    .iter()
+                    .find(|blob| blob.id() == blob_id)
+                    .expect("missing published blob")
+                    .clone()
+            })
+            .collect();
+        let (block, _) = self
             .validator
             .worker()
-            .stage_block_execution(self.block)
+            .stage_block_execution(self.block, None, published_blobs)
             .await?;
 
-        let value = Hashed::new(ConfirmedBlock::new(executed_block));
+        let value = ConfirmedBlock::new(block);
         let vote = LiteVote::new(
             LiteValue::new(&value),
             Round::Fast,
             self.validator.key_pair(),
         );
-        let mut builder = SignatureAggregator::new(value, Round::Fast, self.validator.committee());
+        let committee = self.validator.committee().await;
+        let mut builder = SignatureAggregator::new(value, Round::Fast, &committee);
         let certificate = builder
-            .append(vote.validator, vote.signature)
+            .append(vote.public_key, vote.signature)
             .expect("Failed to sign block")
             .expect("Committee has more than one test validator");
 

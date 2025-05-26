@@ -1,0 +1,155 @@
+package linera:app;
+
+interface contract-runtime-api {
+    authenticated-signer: func() -> option<account-owner>;
+    get-message-id: func() -> option<message-id>;
+    message-is-bouncing: func() -> option<bool>;
+    authenticated-caller-id: func() -> option<application-id>;
+    send-message: func(message: send-message-request);
+    transfer: func(source: account-owner, destination: account, amount: amount);
+    claim: func(source: account, destination: account, amount: amount);
+    open-chain: func(chain-ownership: chain-ownership, application-permissions: application-permissions, balance: amount) -> chain-id;
+    close-chain: func() -> result<tuple<>, close-chain-error>;
+    change-application-permissions: func(application-permissions: application-permissions) -> result<tuple<>, change-application-permissions-error>;
+    create-application: func(module-id: module-id, parameters: list<u8>, argument: list<u8>, required-application-ids: list<application-id>) -> application-id;
+    try-call-application: func(authenticated: bool, callee-id: application-id, argument: list<u8>) -> list<u8>;
+    emit: func(name: stream-name, value: list<u8>) -> u32;
+    read-event: func(chain-id: chain-id, name: stream-name, index: u32) -> list<u8>;
+    subscribe-to-events: func(chain-id: chain-id, application-id: application-id, name: stream-name);
+    unsubscribe-from-events: func(chain-id: chain-id, application-id: application-id, name: stream-name);
+    query-service: func(application-id: application-id, query: list<u8>) -> list<u8>;
+    consume-fuel: func(fuel: u64);
+    validation-round: func() -> option<u32>;
+    write-batch: func(operations: list<write-operation>);
+
+    record account {
+        chain-id: chain-id,
+        owner: account-owner,
+    }
+
+    variant account-owner {
+        reserved(u8),
+        address32(crypto-hash),
+        address20(array20),
+    }
+
+    record amount {
+        inner0: u128,
+    }
+
+    record application-id {
+        application-description-hash: crypto-hash,
+    }
+
+    record application-permissions {
+        execute-operations: option<list<application-id>>,
+        mandatory-applications: list<application-id>,
+        close-chain: list<application-id>,
+        change-application-permissions: list<application-id>,
+        call-service-as-oracle: option<list<application-id>>,
+        make-http-requests: option<list<application-id>>,
+    }
+
+    record array20 {
+        part1: u64,
+        part2: u64,
+        part3: u64,
+    }
+
+    record block-height {
+        inner0: u64,
+    }
+
+    record chain-id {
+        inner0: crypto-hash,
+    }
+
+    record chain-ownership {
+        super-owners: list<account-owner>,
+        owners: list<tuple<account-owner, u64>>,
+        multi-leader-rounds: u32,
+        open-multi-leader-rounds: bool,
+        timeout-config: timeout-config,
+    }
+
+    enum change-application-permissions-error {
+        not-permitted,
+    }
+
+    enum close-chain-error {
+        not-permitted,
+    }
+
+    record crypto-hash {
+        part1: u64,
+        part2: u64,
+        part3: u64,
+        part4: u64,
+    }
+
+    record message-id {
+        chain-id: chain-id,
+        height: block-height,
+        index: u32,
+    }
+
+    record module-id {
+        contract-blob-hash: crypto-hash,
+        service-blob-hash: crypto-hash,
+        vm-runtime: vm-runtime,
+    }
+
+    record resources {
+        wasm-fuel: u64,
+        evm-fuel: u64,
+        read-operations: u32,
+        write-operations: u32,
+        bytes-to-read: u32,
+        bytes-to-write: u32,
+        blobs-to-read: u32,
+        blobs-to-publish: u32,
+        blob-bytes-to-read: u32,
+        blob-bytes-to-publish: u32,
+        messages: u32,
+        message-size: u32,
+        storage-size-delta: u32,
+        service-as-oracle-queries: u32,
+        http-requests: u32,
+    }
+
+    record send-message-request {
+        destination: chain-id,
+        authenticated: bool,
+        is-tracked: bool,
+        grant: resources,
+        message: list<u8>,
+    }
+
+    record stream-name {
+        inner0: list<u8>,
+    }
+
+    record time-delta {
+        inner0: u64,
+    }
+
+    record timeout-config {
+        fast-round-duration: option<time-delta>,
+        base-timeout: time-delta,
+        timeout-increment: time-delta,
+        fallback-duration: time-delta,
+    }
+
+    type u128 = tuple<u64, u64>;
+
+    enum vm-runtime {
+        wasm,
+        evm,
+    }
+
+    variant write-operation {
+        delete(list<u8>),
+        delete-prefix(list<u8>),
+        put(tuple<list<u8>, list<u8>>),
+    }
+}

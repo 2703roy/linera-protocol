@@ -8,6 +8,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex, RwLock},
 };
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(with_testing)]
@@ -24,18 +25,19 @@ use crate::{
 };
 
 /// The initial configuration of the system
-#[derive(Debug)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemoryStoreConfig {
     /// The common configuration of the key value store
     pub common_config: CommonStoreInternalConfig,
 }
 
 impl MemoryStoreConfig {
-    /// Creates a `MemoryStoreConfig`. `max_concurrent_queries` and `cache_size` are not used.
+    /// Creates a `MemoryStoreConfig`. `max_concurrent_queries`, `cache_size` and `replication_factor` are not used.
     pub fn new(max_stream_queries: usize) -> Self {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         Self { common_config }
     }
@@ -45,7 +47,7 @@ impl MemoryStoreConfig {
 pub const TEST_MEMORY_MAX_STREAM_QUERIES: usize = 10;
 
 /// The data is serialized in memory just like for RocksDB / DynamoDB
-/// The analog of the database is the BTreeMap
+/// The analog of the database is the `BTreeMap`
 type MemoryStoreMap = BTreeMap<Vec<u8>, Vec<u8>>;
 
 /// The container for the `MemoryStoreMap`s by namespace and then root key
@@ -84,6 +86,13 @@ impl MemoryStores {
 
     fn sync_list_all(&self) -> Vec<String> {
         self.stores.keys().cloned().collect::<Vec<_>>()
+    }
+
+    fn sync_list_root_keys(&self, namespace: &str) -> Vec<Vec<u8>> {
+        match self.stores.get(namespace) {
+            None => Vec::new(),
+            Some(map) => map.keys().cloned().collect::<Vec<_>>(),
+        }
     }
 
     fn sync_exists(&self, namespace: &str) -> bool {
@@ -259,29 +268,25 @@ impl MemoryStore {
     fn sync_maybe_create_and_connect(
         config: &MemoryStoreConfig,
         namespace: &str,
-        root_key: &[u8],
         kill_on_drop: bool,
     ) -> Result<Self, MemoryStoreError> {
         let mut memory_stores = MEMORY_STORES.lock().expect("lock should not be poisoned");
         if !memory_stores.sync_exists(namespace) {
             memory_stores.sync_create(namespace);
         }
-        memory_stores.sync_connect(config, namespace, root_key, kill_on_drop)
+        memory_stores.sync_connect(config, namespace, &[], kill_on_drop)
     }
 
     /// Creates a `MemoryStore` from a number of queries and a namespace.
-    pub fn new(
-        max_stream_queries: usize,
-        namespace: &str,
-        root_key: &[u8],
-    ) -> Result<Self, MemoryStoreError> {
+    pub fn new(max_stream_queries: usize, namespace: &str) -> Result<Self, MemoryStoreError> {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         let config = MemoryStoreConfig { common_config };
         let kill_on_drop = false;
-        MemoryStore::sync_maybe_create_and_connect(&config, namespace, root_key, kill_on_drop)
+        MemoryStore::sync_maybe_create_and_connect(&config, namespace, kill_on_drop)
     }
 
     /// Creates a `MemoryStore` from a number of queries and a namespace for testing.
@@ -289,15 +294,15 @@ impl MemoryStore {
     pub fn new_for_testing(
         max_stream_queries: usize,
         namespace: &str,
-        root_key: &[u8],
     ) -> Result<Self, MemoryStoreError> {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         let config = MemoryStoreConfig { common_config };
         let kill_on_drop = true;
-        MemoryStore::sync_maybe_create_and_connect(&config, namespace, root_key, kill_on_drop)
+        MemoryStore::sync_maybe_create_and_connect(&config, namespace, kill_on_drop)
     }
 }
 
@@ -308,16 +313,12 @@ impl AdminKeyValueStore for MemoryStore {
         "memory".to_string()
     }
 
-    async fn connect(
-        config: &Self::Config,
-        namespace: &str,
-        root_key: &[u8],
-    ) -> Result<Self, MemoryStoreError> {
+    async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, MemoryStoreError> {
         let mut memory_stores = MEMORY_STORES
             .lock()
             .expect("MEMORY_STORES lock should not be poisoned");
         let kill_on_drop = false;
-        memory_stores.sync_connect(config, namespace, root_key, kill_on_drop)
+        memory_stores.sync_connect(config, namespace, &[], kill_on_drop)
     }
 
     fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, MemoryStoreError> {
@@ -325,6 +326,7 @@ impl AdminKeyValueStore for MemoryStore {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         let config = MemoryStoreConfig { common_config };
         let mut memory_stores = MEMORY_STORES
@@ -342,6 +344,16 @@ impl AdminKeyValueStore for MemoryStore {
         Ok(memory_stores.sync_list_all())
     }
 
+    async fn list_root_keys(
+        _config: &Self::Config,
+        namespace: &str,
+    ) -> Result<Vec<Vec<u8>>, MemoryStoreError> {
+        let memory_stores = MEMORY_STORES
+            .lock()
+            .expect("MEMORY_STORES lock should not be poisoned");
+        Ok(memory_stores.sync_list_root_keys(namespace))
+    }
+
     async fn exists(_config: &Self::Config, namespace: &str) -> Result<bool, MemoryStoreError> {
         let memory_stores = MEMORY_STORES
             .lock()
@@ -353,6 +365,9 @@ impl AdminKeyValueStore for MemoryStore {
         let mut memory_stores = MEMORY_STORES
             .lock()
             .expect("MEMORY_STORES lock should not be poisoned");
+        if memory_stores.sync_exists(namespace) {
+            return Err(MemoryStoreError::StoreAlreadyExists);
+        }
         memory_stores.sync_create(namespace);
         Ok(())
     }
@@ -373,6 +388,7 @@ impl TestKeyValueStore for MemoryStore {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         Ok(MemoryStoreConfig { common_config })
     }
@@ -382,18 +398,21 @@ impl TestKeyValueStore for MemoryStore {
 #[cfg(with_testing)]
 pub fn create_test_memory_store() -> MemoryStore {
     let namespace = generate_test_namespace();
-    let root_key = &[];
-    MemoryStore::new_for_testing(TEST_MEMORY_MAX_STREAM_QUERIES, &namespace, root_key).unwrap()
+    MemoryStore::new_for_testing(TEST_MEMORY_MAX_STREAM_QUERIES, &namespace).unwrap()
 }
 
 /// The error type for [`MemoryStore`].
 #[derive(Error, Debug)]
 pub enum MemoryStoreError {
+    /// Store already exists during a create operation
+    #[error("Store already exists during a create operation")]
+    StoreAlreadyExists,
+
     /// Serialization error with BCS.
     #[error(transparent)]
     BcsError(#[from] bcs::Error),
 
-    /// The value is too large for the MemoryStore
+    /// The value is too large for the `MemoryStore`
     #[error("The value is too large for the MemoryStore")]
     TooLargeValue,
 

@@ -1,37 +1,38 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 use std::{borrow::Borrow, collections::BTreeMap, marker::PhantomData, mem};
 
-use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Serialize};
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{bucket_latencies, register_histogram_vec, MeasureLatency},
-    prometheus::HistogramVec,
-};
+use linera_base::prometheus_util::MeasureLatency as _;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     batch::Batch,
     common::{CustomSerialize, HasherOutput, Update},
-    context::Context,
+    context::{BaseKey, Context},
     hashable_wrapper::WrappedHashableContainerView,
-    store::KeyIterable,
+    store::{KeyIterable, ReadableKeyValueStore as _},
     views::{ClonableView, HashableView, Hasher, View, ViewError},
 };
 
 #[cfg(with_metrics)]
-/// The runtime of hash computation
-static SET_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "set_view_hash_runtime",
-        "SetView hash runtime",
-        &[],
-        bucket_latencies(5.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
+
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    /// The runtime of hash computation
+    pub static SET_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "set_view_hash_runtime",
+            "SetView hash runtime",
+            &[],
+            exponential_bucket_latencies(5.0),
+        )
+    });
+}
 
 /// A [`View`] that supports inserting and removing values indexed by a key.
 #[derive(Debug)]
@@ -41,7 +42,6 @@ pub struct ByteSetView<C> {
     updates: BTreeMap<Vec<u8>, Update<()>>,
 }
 
-#[async_trait]
 impl<C> View<C> for ByteSetView<C>
 where
     C: Context + Send + Sync,
@@ -85,17 +85,17 @@ where
         let mut delete_view = false;
         if self.delete_storage_first {
             delete_view = true;
-            batch.delete_key_prefix(self.context.base_key());
+            batch.delete_key_prefix(self.context.base_key().bytes.clone());
             for (index, update) in mem::take(&mut self.updates) {
                 if let Update::Set(_) = update {
-                    let key = self.context.base_index(&index);
+                    let key = self.context.base_key().base_index(&index);
                     batch.put_key_value_bytes(key, Vec::new());
                     delete_view = false;
                 }
             }
         } else {
             for (index, update) in mem::take(&mut self.updates) {
-                let key = self.context.base_index(&index);
+                let key = self.context.base_key().base_index(&index);
                 match update {
                     Update::Removed => batch.delete_key(key),
                     Update::Set(_) => batch.put_key_value_bytes(key, Vec::new()),
@@ -134,9 +134,9 @@ where
     /// Insert a value. If already present then it has no effect.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::ByteSetView};
+    /// # use linera_views::{context::MemoryContext, set_view::ByteSetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = ByteSetView::load(context).await.unwrap();
     /// set.insert(vec![0, 1]);
     /// assert_eq!(set.contains(&[0, 1]).await.unwrap(), true);
@@ -149,9 +149,9 @@ where
     /// Removes a value from the set. If absent then no effect.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::ByteSetView};
+    /// # use linera_views::{context::MemoryContext, set_view::ByteSetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = ByteSetView::load(context).await.unwrap();
     /// set.remove(vec![0, 1]);
     /// assert_eq!(set.contains(&[0, 1]).await.unwrap(), false);
@@ -180,9 +180,9 @@ where
     /// Returns true if the given index exists in the set.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::ByteSetView};
+    /// # use linera_views::{context::MemoryContext, set_view::ByteSetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = ByteSetView::load(context).await.unwrap();
     /// set.insert(vec![0, 1]);
     /// assert_eq!(set.contains(&[34]).await.unwrap(), false);
@@ -200,8 +200,8 @@ where
         if self.delete_storage_first {
             return Ok(false);
         }
-        let key = self.context.base_index(short_key);
-        Ok(self.context.contains_key(&key).await?)
+        let key = self.context.base_key().base_index(short_key);
+        Ok(self.context.store().contains_key(&key).await?)
     }
 }
 
@@ -213,9 +213,9 @@ where
     /// Returns the list of keys in the set. The order is lexicographic.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::ByteSetView};
+    /// # use linera_views::{context::MemoryContext, set_view::ByteSetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = ByteSetView::load(context).await.unwrap();
     /// set.insert(vec![0, 1]);
     /// set.insert(vec![0, 2]);
@@ -235,9 +235,9 @@ where
     /// Returns the number of entries in the set.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::ByteSetView};
+    /// # use linera_views::{context::MemoryContext, set_view::ByteSetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = ByteSetView::load(context).await.unwrap();
     /// set.insert(vec![0, 1]);
     /// set.insert(vec![0, 2]);
@@ -259,9 +259,9 @@ where
     /// prematurely.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::ByteSetView};
+    /// # use linera_views::{context::MemoryContext, set_view::ByteSetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = ByteSetView::load(context).await.unwrap();
     /// set.insert(vec![0, 1]);
     /// set.insert(vec![0, 2]);
@@ -283,8 +283,14 @@ where
         let mut updates = self.updates.iter();
         let mut update = updates.next();
         if !self.delete_storage_first {
-            let base = self.context.base_key();
-            for index in self.context.find_keys_by_prefix(&base).await?.iterator() {
+            let base = &self.context.base_key().bytes;
+            for index in self
+                .context
+                .store()
+                .find_keys_by_prefix(base)
+                .await?
+                .iterator()
+            {
                 let index = index?;
                 loop {
                     match update {
@@ -324,9 +330,9 @@ where
     /// lexicographic order.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::ByteSetView};
+    /// # use linera_views::{context::MemoryContext, set_view::ByteSetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = ByteSetView::load(context).await.unwrap();
     /// set.insert(vec![0, 1]);
     /// set.insert(vec![0, 2]);
@@ -353,7 +359,6 @@ where
     }
 }
 
-#[async_trait]
 impl<C> HashableView<C> for ByteSetView<C>
 where
     C: Context + Send + Sync,
@@ -367,7 +372,7 @@ where
 
     async fn hash(&self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = SET_VIEW_HASH_RUNTIME.measure_latency();
+        let _hash_latency = metrics::SET_VIEW_HASH_RUNTIME.measure_latency();
         let mut hasher = sha3::Sha3_256::default();
         let mut count = 0u32;
         self.for_each_key(|key| {
@@ -388,7 +393,6 @@ pub struct SetView<C, I> {
     _phantom: PhantomData<I>,
 }
 
-#[async_trait]
 impl<C, I> View<C> for SetView<C, I>
 where
     C: Context + Send + Sync,
@@ -457,10 +461,10 @@ where
     /// Inserts a value. If already present then no effect.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::SetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = SetView::<_, u32>::load(context).await.unwrap();
     /// set.insert(&(34 as u32));
     /// assert_eq!(set.indices().await.unwrap().len(), 1);
@@ -471,7 +475,7 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.set.insert(short_key);
         Ok(())
     }
@@ -479,9 +483,9 @@ where
     /// Removes a value. If absent then nothing is done.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::SetView};
+    /// # use linera_views::{context::MemoryContext, set_view::SetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = SetView::<_, u32>::load(context).await.unwrap();
     /// set.remove(&(34 as u32));
     /// assert_eq!(set.indices().await.unwrap().len(), 0);
@@ -492,7 +496,7 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.set.remove(short_key);
         Ok(())
     }
@@ -512,9 +516,9 @@ where
     /// Returns true if the given index exists in the set.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::SetView};
+    /// # use linera_views::{context::MemoryContext, set_view::SetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set: SetView<_, u32> = SetView::load(context).await.unwrap();
     /// set.insert(&(34 as u32));
     /// assert_eq!(set.contains(&(34 as u32)).await.unwrap(), true);
@@ -526,7 +530,7 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.set.contains(&short_key).await
     }
 }
@@ -540,9 +544,9 @@ where
     /// Returns the list of indices in the set. The order is determined by serialization.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::SetView};
+    /// # use linera_views::{context::MemoryContext, set_view::SetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set: SetView<_, u32> = SetView::load(context).await.unwrap();
     /// set.insert(&(34 as u32));
     /// assert_eq!(set.indices().await.unwrap(), vec![34 as u32]);
@@ -561,9 +565,9 @@ where
     /// Returns the number of entries in the set.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::{context::create_test_memory_context, set_view::SetView};
+    /// # use linera_views::{context::MemoryContext, set_view::SetView};
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set: SetView<_, u32> = SetView::load(context).await.unwrap();
     /// set.insert(&(34 as u32));
     /// assert_eq!(set.count().await.unwrap(), 1);
@@ -578,10 +582,10 @@ where
     /// loop ends prematurely.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::SetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = SetView::<_, u32>::load(context).await.unwrap();
     /// set.insert(&(34 as u32));
     /// set.insert(&(37 as u32));
@@ -602,7 +606,7 @@ where
     {
         self.set
             .for_each_key_while(|key| {
-                let index = C::deserialize_value(key)?;
+                let index = BaseKey::deserialize_value(key)?;
                 f(index)
             })
             .await?;
@@ -613,10 +617,10 @@ where
     /// determined by the serialization.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::SetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = SetView::<_, u32>::load(context).await.unwrap();
     /// set.insert(&(34 as u32));
     /// set.insert(&(37 as u32));
@@ -637,7 +641,7 @@ where
     {
         self.set
             .for_each_key(|key| {
-                let index = C::deserialize_value(key)?;
+                let index = BaseKey::deserialize_value(key)?;
                 f(index)
             })
             .await?;
@@ -645,7 +649,6 @@ where
     }
 }
 
-#[async_trait]
 impl<C, I> HashableView<C> for SetView<C, I>
 where
     C: Context + Send + Sync,
@@ -671,7 +674,6 @@ pub struct CustomSetView<C, I> {
     _phantom: PhantomData<I>,
 }
 
-#[async_trait]
 impl<C, I> View<C> for CustomSetView<C, I>
 where
     C: Context + Send + Sync,
@@ -740,10 +742,10 @@ where
     /// Inserts a value. If present then it has no effect.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::CustomSetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = CustomSetView::<_, u128>::load(context).await.unwrap();
     /// set.insert(&(34 as u128));
     /// assert_eq!(set.indices().await.unwrap().len(), 1);
@@ -762,10 +764,10 @@ where
     /// Removes a value. If absent then nothing is done.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::CustomSetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = CustomSetView::<_, u128>::load(context).await.unwrap();
     /// set.remove(&(34 as u128));
     /// assert_eq!(set.indices().await.unwrap().len(), 0);
@@ -796,10 +798,10 @@ where
     /// Returns true if the given index exists in the set.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::CustomSetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = CustomSetView::<_, u128>::load(context).await.unwrap();
     /// set.insert(&(34 as u128));
     /// assert_eq!(set.contains(&(34 as u128)).await.unwrap(), true);
@@ -826,10 +828,10 @@ where
     /// serialization.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::CustomSetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = CustomSetView::<_, u128>::load(context).await.unwrap();
     /// set.insert(&(34 as u128));
     /// set.insert(&(37 as u128));
@@ -849,10 +851,10 @@ where
     /// Returns the number of entries of the set.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::CustomSetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = CustomSetView::<_, u128>::load(context).await.unwrap();
     /// set.insert(&(34 as u128));
     /// set.insert(&(37 as u128));
@@ -868,10 +870,10 @@ where
     /// false, then the loop prematurely ends.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::CustomSetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = CustomSetView::<_, u128>::load(context).await.unwrap();
     /// set.insert(&(34 as u128));
     /// set.insert(&(37 as u128));
@@ -903,10 +905,10 @@ where
     /// determined by the custom serialization.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::set_view::CustomSetView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut set = CustomSetView::<_, u128>::load(context).await.unwrap();
     /// set.insert(&(34 as u128));
     /// set.insert(&(37 as u128));
@@ -935,7 +937,6 @@ where
     }
 }
 
-#[async_trait]
 impl<C, I> HashableView<C> for CustomSetView<C, I>
 where
     C: Context + Send + Sync,
@@ -963,6 +964,7 @@ pub type HashedSetView<C, I> = WrappedHashableContainerView<C, SetView<C, I>, Ha
 pub type HashedCustomSetView<C, I> =
     WrappedHashableContainerView<C, CustomSetView<C, I>, HasherOutput>;
 
+#[cfg(with_graphql)]
 mod graphql {
     use std::borrow::Cow;
 

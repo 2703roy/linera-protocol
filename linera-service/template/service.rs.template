@@ -2,9 +2,12 @@
 
 mod state;
 
+use std::sync::Arc;
+
 use async_graphql::{{EmptySubscription, Object, Schema}};
 use linera_sdk::{{
-    base::WithServiceAbi, graphql::GraphQLMutationRoot, views::View, Service, ServiceRuntime,
+    graphql::GraphQLMutationRoot, linera_base_types::WithServiceAbi, views::View, Service,
+    ServiceRuntime,
 }};
 
 use {module_name}::Operation;
@@ -13,7 +16,7 @@ use self::state::{project_name}State;
 
 pub struct {project_name}Service {{
     state: {project_name}State,
-    runtime: ServiceRuntime<Self>,
+    runtime: Arc<ServiceRuntime<Self>>,
 }}
 
 linera_sdk::service!({project_name}Service);
@@ -29,7 +32,10 @@ impl Service for {project_name}Service {{
         let state = {project_name}State::load(runtime.root_view_storage_context())
             .await
             .expect("Failed to load state");
-        {project_name}Service {{ state, runtime }}
+        {project_name}Service {{
+            state,
+            runtime: Arc::new(runtime),
+        }}
     }}
 
     async fn handle_query(&self, query: Self::Query) -> Self::QueryResponse {{
@@ -37,7 +43,7 @@ impl Service for {project_name}Service {{
             QueryRoot {{
                 value: *self.state.value.get(),
             }},
-            Operation::mutation_root(),
+            Operation::mutation_root(self.runtime.clone()),
             EmptySubscription,
         )
         .finish()
@@ -59,6 +65,8 @@ impl QueryRoot {{
 
 #[cfg(test)]
 mod tests {{
+    use std::sync::Arc;
+
     use async_graphql::{{Request, Response, Value}};
     use futures::FutureExt as _;
     use linera_sdk::{{util::BlockingWait, views::View, Service, ServiceRuntime}};
@@ -69,7 +77,7 @@ mod tests {{
     #[test]
     fn query() {{
         let value = 60u64;
-        let runtime = ServiceRuntime::<{project_name}Service>::new();
+        let runtime = Arc::new(ServiceRuntime::<{project_name}Service>::new());
         let mut state = {project_name}State::load(runtime.root_view_storage_context())
             .blocking_wait()
             .expect("Failed to read from mock key value store");

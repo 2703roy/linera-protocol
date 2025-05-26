@@ -31,11 +31,11 @@ pub enum ValueSplittingError<E> {
     #[error("the key is of length less than 4, so we cannot extract the first byte")]
     TooShortKey,
 
-    /// value segment is missing from the database
+    /// Value segment is missing from the database
     #[error("value segment is missing from the database")]
     MissingSegment,
 
-    /// no count of size u32 is available in the value
+    /// No count of size `u32` is available in the value
     #[error("no count of size u32 is available in the value")]
     NoCountAvailable,
 }
@@ -56,7 +56,7 @@ impl<E: KeyValueStoreError + 'static> KeyValueStoreError for ValueSplittingError
 /// It wraps a key-value store, potentially _with_ a size limit, and automatically
 /// splits up large values into smaller ones. A single logical key-value pair is
 /// stored as multiple smaller key-value pairs in the wrapped store.
-/// See the README.md for additional details.
+/// See the `README.md` for additional details.
 #[derive(Clone)]
 pub struct ValueSplittingStore<K> {
     /// The underlying store of the transformed store.
@@ -289,12 +289,8 @@ where
         format!("value splitting {}", K::get_name())
     }
 
-    async fn connect(
-        config: &Self::Config,
-        namespace: &str,
-        root_key: &[u8],
-    ) -> Result<Self, Self::Error> {
-        let store = K::connect(config, namespace, root_key).await?;
+    async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, Self::Error> {
+        let store = K::connect(config, namespace).await?;
         Ok(Self { store })
     }
 
@@ -305,6 +301,13 @@ where
 
     async fn list_all(config: &Self::Config) -> Result<Vec<String>, Self::Error> {
         Ok(K::list_all(config).await?)
+    }
+
+    async fn list_root_keys(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<Vec<Vec<u8>>, Self::Error> {
+        Ok(K::list_root_keys(config, namespace).await?)
     }
 
     async fn delete_all(config: &Self::Config) -> Result<(), Self::Error> {
@@ -468,10 +471,8 @@ impl LimitedTestMemoryStore {
     /// Creates a `LimitedTestMemoryStore`
     pub fn new() -> Self {
         let namespace = generate_test_namespace();
-        let root_key = &[];
         let store =
-            MemoryStore::new_for_testing(TEST_MEMORY_MAX_STREAM_QUERIES, &namespace, root_key)
-                .unwrap();
+            MemoryStore::new_for_testing(TEST_MEMORY_MAX_STREAM_QUERIES, &namespace).unwrap();
         LimitedTestMemoryStore { store }
     }
 }

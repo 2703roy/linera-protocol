@@ -3,8 +3,11 @@
 
 use std::{fmt::Debug, io::Write};
 
-use async_trait::async_trait;
-use linera_base::{crypto::CryptoHash, data_types::ArithmeticError, identifiers::BlobId};
+use linera_base::{
+    crypto::CryptoHash,
+    data_types::ArithmeticError,
+    identifiers::{BlobId, EventId},
+};
 pub use linera_views_derive::{
     ClonableView, CryptoHashRootView, CryptoHashView, HashableView, RootView, View,
 };
@@ -47,12 +50,12 @@ pub mod key_value_store_view;
 /// Wrapping a view to compute a hash.
 pub mod hashable_wrapper;
 
-/// The minimum value for the view tags. Values in 0..MIN_VIEW_TAG are used for other purposes.
+/// The minimum value for the view tags. Values in `0..MIN_VIEW_TAG` are used for other purposes.
 pub const MIN_VIEW_TAG: u8 = 1;
 
 /// A view gives exclusive access to read and write the data stored at an underlying
 /// address in storage.
-#[async_trait]
+#[cfg_attr(not(web), trait_variant::make(Send))]
 pub trait View<C>: Sized {
     /// The number of keys used for the initialization
     const NUM_INIT_KEYS: usize;
@@ -102,7 +105,7 @@ pub enum ViewError {
     #[error(transparent)]
     BcsError(#[from] bcs::Error),
 
-    /// We failed to acquire an entry in a CollectionView or a ReentrantCollectionView.
+    /// We failed to acquire an entry in a `CollectionView` or a `ReentrantCollectionView`.
     #[error("trying to access a collection view or reentrant collection view while some entries are still being accessed")]
     CannotAcquireCollectionEntry,
 
@@ -122,7 +125,7 @@ pub enum ViewError {
     #[error("Panic in sub-task: {0}")]
     TokioJoinError(#[from] tokio::task::JoinError),
 
-    /// Errors within the context can occur and are presented as ViewError.
+    /// Errors within the context can occur and are presented as `ViewError`.
     #[error("Storage operation error in {backend}: {error}")]
     StoreError {
         /// backend can be e.g. RocksDB / DynamoDB / Memory / etc.
@@ -135,7 +138,8 @@ pub enum ViewError {
     #[error("The key must not be too long")]
     KeyTooLong,
 
-    /// FIXME(#148): This belongs to a future `linera_storage::StoreError`.
+    /// The entry does not exist in memory
+    // FIXME(#148): This belongs to a future `linera_storage::StoreError`.
     #[error("Entry does not exist in memory: {0}")]
     NotFound(String),
 
@@ -158,6 +162,10 @@ pub enum ViewError {
     /// Some blobs were not found.
     #[error("Blobs not found: {0:?}")]
     BlobsNotFound(Vec<BlobId>),
+
+    /// Some events were not found.
+    #[error("Events not found: {0:?}")]
+    EventsNotFound(Vec<EventId>),
 }
 
 impl ViewError {
@@ -168,7 +176,7 @@ impl ViewError {
 }
 
 /// A view that supports hashing its values.
-#[async_trait]
+#[cfg_attr(not(web), trait_variant::make(Send))]
 pub trait HashableView<C>: View<C> {
     /// How to compute hashes.
     type Hasher: Hasher;
@@ -218,14 +226,14 @@ impl Hasher for sha3::Sha3_256 {
 }
 
 /// A [`View`] whose staged modifications can be saved in storage.
-#[async_trait]
+#[cfg_attr(not(web), trait_variant::make(Send))]
 pub trait RootView<C>: View<C> {
     /// Saves the root view to the database context
     async fn save(&mut self) -> Result<(), ViewError>;
 }
 
 /// A [`View`] that also supports crypto hash
-#[async_trait]
+#[cfg_attr(not(web), trait_variant::make(Send))]
 pub trait CryptoHashView<C>: HashableView<C> {
     /// Computing the hash and attributing the type to it.
     async fn crypto_hash(&self) -> Result<CryptoHash, ViewError>;
@@ -235,7 +243,7 @@ pub trait CryptoHashView<C>: HashableView<C> {
 }
 
 /// A [`RootView`] that also supports crypto hash
-#[async_trait]
+#[cfg_attr(not(web), trait_variant::make(Send))]
 pub trait CryptoHashRootView<C>: RootView<C> + CryptoHashView<C> {}
 
 /// A [`ClonableView`] supports being shared (unsafely) by cloning it.

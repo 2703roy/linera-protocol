@@ -4,11 +4,12 @@
 use linera_base::{
     crypto::CryptoHash,
     data_types::BlockHeight,
-    identifiers::{BytecodeId, ChainId, MessageId},
+    identifiers::{ChainId, MessageId, ModuleId},
+    vm::VmRuntime,
 };
 
 use super::{
-    ApplicationRegistry, ApplicationRegistryView, UserApplicationDescription, UserApplicationId,
+    ApplicationRegistry, ApplicationRegistryView, ApplicationDescription, ApplicationId,
 };
 
 fn message_id(index: u32) -> MessageId {
@@ -19,23 +20,24 @@ fn message_id(index: u32) -> MessageId {
     }
 }
 
-fn bytecode_id() -> BytecodeId {
-    BytecodeId::new(
+fn module_id() -> ModuleId {
+    ModuleId::new(
         CryptoHash::test_hash("contract"),
         CryptoHash::test_hash("service"),
+        VmRuntime::Wasm,
     )
 }
 
-fn app_id(index: u32) -> UserApplicationId {
-    UserApplicationId {
-        bytecode_id: bytecode_id(),
+fn app_id(index: u32) -> ApplicationId {
+    ApplicationId {
+        module_id: module_id(),
         creation: message_id(index),
     }
 }
 
-fn app_description(index: u32, deps: Vec<u32>) -> UserApplicationDescription {
-    UserApplicationDescription {
-        bytecode_id: bytecode_id(),
+fn app_description(index: u32, deps: Vec<u32>) -> ApplicationDescription {
+    ApplicationDescription {
+        module_id: module_id(),
         creation: message_id(index),
         parameters: vec![],
         required_application_ids: deps.into_iter().map(app_id).collect(),
@@ -57,40 +59,15 @@ fn registry(graph: impl IntoIterator<Item = (u32, Vec<u32>)>) -> ApplicationRegi
 async fn test_topological_sort() {
     let mut view = ApplicationRegistryView::new().await;
     view.import(registry([(1, vec![2, 3])])).unwrap();
-    assert!(view
-        .find_dependencies(vec![app_id(1)], &Default::default())
-        .await
-        .is_err());
+    assert!(view.find_dependencies(vec![app_id(1)]).await.is_err());
     view.import(registry([(3, vec![2]), (2, vec![]), (0, vec![1])]))
         .unwrap();
-    let app_ids = view
-        .find_dependencies(vec![app_id(1)], &Default::default())
-        .await
-        .unwrap();
+    let app_ids = view.find_dependencies(vec![app_id(1)]).await.unwrap();
     assert_eq!(app_ids, Vec::from_iter([2, 3, 1].into_iter().map(app_id)));
-    let app_ids = view
-        .find_dependencies(vec![app_id(0)], &Default::default())
-        .await
-        .unwrap();
+    let app_ids = view.find_dependencies(vec![app_id(0)]).await.unwrap();
     assert_eq!(
         app_ids,
         Vec::from_iter([2, 3, 1, 0].into_iter().map(app_id))
-    );
-    let app_ids = view
-        .find_dependencies(
-            vec![app_id(0), app_id(5)],
-            &vec![
-                (app_id(5), app_description(5, vec![4])),
-                (app_id(4), app_description(5, vec![2])),
-            ]
-            .into_iter()
-            .collect(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        app_ids,
-        Vec::from_iter([2, 4, 5, 3, 1, 0].into_iter().map(app_id))
     );
 }
 
@@ -104,15 +81,9 @@ async fn test_topological_sort_with_loop() {
         (0, vec![1]),
     ]))
     .unwrap();
-    let app_ids = view
-        .find_dependencies(vec![app_id(1)], &Default::default())
-        .await
-        .unwrap();
+    let app_ids = view.find_dependencies(vec![app_id(1)]).await.unwrap();
     assert_eq!(app_ids, Vec::from_iter([2, 3, 1].into_iter().map(app_id)));
-    let app_ids = view
-        .find_dependencies(vec![app_id(0)], &Default::default())
-        .await
-        .unwrap();
+    let app_ids = view.find_dependencies(vec![app_id(0)]).await.unwrap();
     assert_eq!(
         app_ids,
         Vec::from_iter([2, 3, 1, 0].into_iter().map(app_id))

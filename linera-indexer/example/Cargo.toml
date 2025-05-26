@@ -17,7 +17,10 @@ benchmark = ["linera-base/test", "linera-indexer/benchmark"]
 rocksdb = ["linera-indexer/rocksdb", "linera-indexer-plugins/rocksdb"]
 dynamodb = ["linera-indexer/dynamodb", "linera-indexer-plugins/dynamodb"]
 scylladb = ["linera-indexer/scylladb", "linera-indexer-plugins/scylladb"]
-storage-service = ["linera-indexer/storage-service", "linera-service/storage-service"]
+storage-service = [
+    "linera-indexer/storage-service",
+    "linera-service/storage-service",
+]
 wasmer = ["linera-indexer-plugins/wasmer"]
 wasmtime = ["linera-indexer-plugins/wasmtime"]
 test = ["linera-service/test"]
@@ -31,7 +34,7 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 [dev-dependencies]
 anyhow.workspace = true
 async-graphql.workspace = true
-linera-base.workspace = true
+linera-base = { workspace = true, features = ["test"] }
 linera-indexer-graphql-client.workspace = true
 linera-service = { workspace = true, features = ["rocksdb", "test"] }
 linera-service-graphql-client.workspace = true

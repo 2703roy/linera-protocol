@@ -10,6 +10,8 @@
 * Rust
     - `brew install rustup-init`
     - `rustup target add wasm32-unknown-unknown`
+* Clang/LLVM
+    - `brew install llvm@18` then make sure to update your `PATH` as instructed.
 * Protoc
     - `brew install protobuf`
 
@@ -22,7 +24,7 @@
 
 * `brew install jq`
 * `cargo install cargo-rdme`
-* `cargo install cargo-sort`
+* `cargo install taplo-cli`
 * `cargo install cargo-all-features`
 * `cargo install cargo-machete`
 
@@ -49,7 +51,7 @@ Alternatively, we have added experimental Nix support (see `flake.nix`).
 
 * `sudo apt-get install jq`
 * `cargo install cargo-rdme`
-* `cargo install cargo-sort`
+* `cargo install taplo-cli`
 * `cargo install cargo-all-features`
 * `cargo install cargo-machete`
 

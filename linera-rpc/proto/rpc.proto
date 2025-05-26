@@ -34,6 +34,9 @@ service ValidatorWorker {
   // Download a blob that belongs to a pending block on the given chain.
   rpc DownloadPendingBlob(PendingBlobRequest) returns (PendingBlobResult);
 
+  // Handle a blob that belongs to a pending block on the given chain.
+  rpc HandlePendingBlob(HandlePendingBlobRequest) returns (ChainInfoResult);
+
   // Handle a (trusted!) cross-chain request.
   rpc HandleCrossChainRequest(CrossChainRequest) returns (google.protobuf.Empty);
 }
@@ -61,14 +64,17 @@ service ValidatorNode {
   // Request the node's version info.
   rpc GetVersionInfo(google.protobuf.Empty) returns (VersionInfo);
 
-  // Request the genesis configuration hash of the network this node is part of.
-  rpc GetGenesisConfigHash(google.protobuf.Empty) returns (CryptoHash);
+  // Request the network description seen by this node.
+  rpc GetNetworkDescription(google.protobuf.Empty) returns (NetworkDescription);
 
   // Download a blob.
   rpc DownloadBlob(BlobId) returns (BlobContent);
 
   // Download a blob that belongs to a pending block on the given chain.
   rpc DownloadPendingBlob(PendingBlobRequest) returns (PendingBlobResult);
+
+  // Handle a blob that belongs to a pending block on the given chain.
+  rpc HandlePendingBlob(HandlePendingBlobRequest) returns (ChainInfoResult);
 
   // Upload a blob. Returns an error if the validator has not seen a
   // certificate using this blob.
@@ -114,6 +120,13 @@ message VersionInfo {
     string wit_hash = 6;
 }
 
+message NetworkDescription {
+    string name = 1;
+    CryptoHash genesis_config_hash = 2;
+    uint64 genesis_timestamp = 3;
+    ChainId admin_chain_id = 4;
+}
+
 // A request for client to subscribe to notifications for a given `ChainId`
 message SubscriptionRequest {
   repeated ChainId chain_ids = 1;
@@ -147,14 +160,14 @@ message CrossChainRequest {
 message UpdateRecipient {
   ChainId sender = 1;
   ChainId recipient = 2;
-  bytes bundle_vecs = 3;
+  bytes bundles = 3;
 }
 
 // Acknowledge the height of the highest confirmed blocks communicated with `UpdateRecipient`.
 message ConfirmUpdatedRecipient {
   ChainId sender = 1;
   ChainId recipient = 2;
-  bytes latest_heights = 3;
+  BlockHeight latest_height = 3;
 }
 
 // Request information on a chain.
@@ -168,7 +181,7 @@ message ChainInfoQuery {
   // Query the current committees
   bool request_committees = 3;
 
-  // Query the received messages that are waiting be picked in the next block.
+  // Query the received messages that are waiting to be picked in the next block.
   bool request_pending_message_bundles = 4;
 
   // Query a range of certificates hashes sent from the chain.
@@ -184,7 +197,7 @@ message ChainInfoQuery {
   bool request_leader_timeout = 8;
 
   // Query the balance of a given owner.
-  optional AccountOwner request_owner_balance = 9;
+  AccountOwner request_owner_balance = 9;
 
   // Request a signed vote for fallback mode.
   bool request_fallback = 10;
@@ -199,16 +212,17 @@ message BlockProposal {
   bytes content = 2;
 
   // Byte-encoded public key
-  Owner owner = 3;
+  AccountPublicKey public_key = 3;
 
-  // Signature value
-  Signature signature = 4;
+  // Byte-encoded owner
+  AccountOwner owner = 4;
 
-  // A lite certificate for a validated block that justifies the proposal in this round.
-  optional bytes validated_block_certificate = 6;
+  // Signature by chain owner
+  AccountSignature signature = 5;
 
-  // Required blob
-  bytes blobs = 7;
+  // A lite certificate for a validated block, or a fast block proposal, that
+  // justifies the proposal in this round.
+  optional bytes original_proposal = 6;
 }
 
 // A certified statement from the committee, without the value.
@@ -250,9 +264,6 @@ message HandleValidatedCertificateRequest {
 
   // A certified statement from the committee.
   Certificate certificate = 2;
-
-  // Blobs required by this certificate
-  bytes blobs = 3;
 }
 
 // A certified statement from the committee, together with other certificates
@@ -284,6 +295,12 @@ message PendingBlobResult {
   }
 }
 
+// A request to handle a pending blob.
+message HandlePendingBlobRequest {
+  ChainId chain_id = 1;
+  BlobContent blob = 2;
+}
+
 // A certified statement from the committee.
 message Certificate {
   // The certified value
@@ -312,7 +329,14 @@ message ChainId {
   bytes bytes = 1;
 }
 
-message PublicKey {
+/// Public key of a validator.
+message ValidatorPublicKey {
+  bytes bytes = 1;
+}
+
+/// Public key of a Linera account.
+/// Corresponding private key is used to sign block proposals.
+message AccountPublicKey {
   bytes bytes = 1;
 }
 
@@ -324,11 +348,13 @@ message AccountOwner {
   bytes bytes = 1;
 }
 
-message Owner {
+/// Signature created by a validator.
+message ValidatorSignature {
   bytes bytes = 1;
 }
 
-message Signature {
+/// Signature created by a Linera account.
+message AccountSignature {
   bytes bytes = 1;
 }
 
@@ -352,8 +378,8 @@ message ChainInfoResponse {
   // bincode-encoded chain info
   bytes chain_info = 1;
 
-  // Optional signature for the response.
-  optional Signature signature = 2;
+  // Optional validator signature for the response.
+  optional ValidatorSignature signature = 2;
 }
 
 message BlockHeight {

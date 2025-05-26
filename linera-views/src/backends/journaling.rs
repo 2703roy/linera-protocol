@@ -19,7 +19,6 @@
 //! time the data in a block are written, the journal header is updated in the same
 //! transaction to mark the block as processed.
 
-use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use static_assertions as sa;
 use thiserror::Error;
@@ -40,10 +39,13 @@ sa::const_assert!(JOURNAL_TAG < MIN_VIEW_TAG);
 
 /// Data type indicating that the database is not consistent
 #[derive(Error, Debug)]
+#[allow(missing_docs)]
 pub enum JournalConsistencyError {
-    /// The journal block could not be retrieved, it could be missing or corrupted
-    #[error("the journal block could not be retrieved, it could be missing or corrupted")]
+    #[error("The journal block could not be retrieved, it could be missing or corrupted.")]
     FailureToRetrieveJournalBlock,
+
+    #[error("Refusing to use the journal without exclusive database access to the root object.")]
+    JournalRequiresExclusiveAccess,
 }
 
 #[repr(u8)]
@@ -62,7 +64,7 @@ fn get_journaling_key(tag: u8, pos: u32) -> Result<Vec<u8>, bcs::Error> {
 }
 
 /// Low-level, asynchronous direct write key-value operations with simplified batch
-#[async_trait]
+#[cfg_attr(not(web), trait_variant::make(Send))]
 pub trait DirectWritableKeyValueStore: WithError {
     /// The maximal number of items in a batch.
     const MAX_BATCH_SIZE: usize;
@@ -102,6 +104,8 @@ struct JournalHeader {
 pub struct JournalingKeyValueStore<K> {
     /// The inner store.
     store: K,
+    /// Whether we have exclusive R/W access to the keys under root key.
+    has_exclusive_access: bool,
 }
 
 impl<K> DeletePrefixExpander for &JournalingKeyValueStore<K>
@@ -182,22 +186,31 @@ where
         format!("journaling {}", K::get_name())
     }
 
-    async fn connect(
-        config: &Self::Config,
-        namespace: &str,
-        root_key: &[u8],
-    ) -> Result<Self, Self::Error> {
-        let store = K::connect(config, namespace, root_key).await?;
-        Ok(Self { store })
+    async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, Self::Error> {
+        let store = K::connect(config, namespace).await?;
+        Ok(Self {
+            store,
+            has_exclusive_access: false,
+        })
     }
 
     fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, Self::Error> {
         let store = self.store.clone_with_root_key(root_key)?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            has_exclusive_access: true,
+        })
     }
 
     async fn list_all(config: &Self::Config) -> Result<Vec<String>, Self::Error> {
         K::list_all(config).await
+    }
+
+    async fn list_root_keys(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<Vec<Vec<u8>>, Self::Error> {
+        K::list_root_keys(config, namespace).await
     }
 
     async fn delete_all(config: &Self::Config) -> Result<(), Self::Error> {
@@ -230,6 +243,9 @@ where
         if Self::is_fastpath_feasible(&batch) {
             self.store.write_batch(batch).await
         } else {
+            if !self.has_exclusive_access {
+                return Err(JournalConsistencyError::JournalRequiresExclusiveAccess.into());
+            }
             let header = self.write_journal(batch).await?;
             self.coherently_resolve_journal(header).await
         }
@@ -265,7 +281,7 @@ where
     /// (2) the total size of the all operations in a block doesn't exceed:
     /// `K::MAX_BATCH_TOTAL_SIZE - sizeof(block_key) - sizeof(header_key) - sizeof(bcs_header)`
     ///
-    /// (3) every operation in a block satisfies the contraints on individual database
+    /// (3) every operation in a block satisfies the constraints on individual database
     /// operations represented by `K::MAX_KEY_SIZE` and `K::MAX_VALUE_SIZE`.
     ///
     /// (4) `block_key` and `header_key` don't exceed `K::MAX_KEY_SIZE` and `bcs_header`
@@ -310,7 +326,7 @@ where
     /// following conditions are met while a "transaction" batch is being built:
     ///
     /// (1) The number of blocks per transaction doesn't exceed `K::MAX_BATCH_SIZE`.
-    /// But it is perfectly possible to have K::MAX_BATCH_SIZE = usize::MAX.
+    /// But it is perfectly possible to have `K::MAX_BATCH_SIZE = usize::MAX`.
     ///
     /// (2) The total size of BCS-serialized blocks together with their corresponding keys
     /// does not exceed `K::MAX_BATCH_TOTAL_SIZE`.
@@ -322,14 +338,14 @@ where
     ///   (b) updating or removing the journal. The cost is `key_len + header_value_len`
     ///       or `key_len`. An upper bound is thus
     ///       `journal_len_upper_bound = key_len + header_value_len`.
-    ///   Thus the following has to be taken as upper bound on block_size:
+    ///   Thus the following has to be taken as upper bound on the block size:
     ///   `K::MAX_BATCH_TOTAL_SIZE - key_len - journal_len_upper_bound`.
     ///
     /// NOTE:
     /// * Since a block must contain at least one operation and M bytes of the
-    ///   serialization overhead (typically M = 2 or 3 bytes of vector sizes), condition (3)
+    ///   serialization overhead (typically M is 2 or 3 bytes of vector sizes), condition (3)
     ///   requires that each operation in the original batch satisfies:
-    ///     `sizeof(key) + sizeof(value) + M <= K::MAX_VALUE_SIZE`
+    ///   `sizeof(key) + sizeof(value) + M <= K::MAX_VALUE_SIZE`
     ///
     /// * Similarly, a transaction must contain at least one block so it is desirable that
     ///   the maximum size of a block insertion `1 + sizeof(block_key) + K::MAX_VALUE_SIZE`
@@ -403,6 +419,9 @@ where
 impl<K> JournalingKeyValueStore<K> {
     /// Creates a new journaling store.
     pub fn new(store: K) -> Self {
-        Self { store }
+        Self {
+            store,
+            has_exclusive_access: false,
+        }
     }
 }

@@ -9,12 +9,12 @@ test('Operations mounting', () => {
         operations: [
           {
             key: {
-              chain_id: "e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65",
+              chain_id: "aee928d4bf3880353b4a3cd9b6f88e6cc6e5ed050860abae439e7782e9b2dfe8",
               height: 5,
               index: 0
             },
             previousOperation: {
-              chain_id: "e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65",
+              chain_id: "aee928d4bf3880353b4a3cd9b6f88e6cc6e5ed050860abae439e7782e9b2dfe8",
               height: 4,
               index: 0
             },
@@ -22,7 +22,7 @@ test('Operations mounting', () => {
             block: "f1c748c5e39591125250e85d57fdeac0b7ba44a32c12c616eb4537f93b6e5d0a",
             content: {
               System: {
-                PublishBytecode: {
+                PublishModule: {
                   contract: { bytes: "0061..7874" },
                   service: { bytes: "0061..7874" }
                 }

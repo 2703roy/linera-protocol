@@ -1,7 +1,7 @@
 # Automated Market Maker (AMM) Example Application
 
-This example implements an Automated Market Maker (AMM) which demonstrates DeFi capabilities of the
-Linera protocol. Prerequisite for the AMM application is the `fungible` application, as we will
+This example implements an Automated Market Maker (AMM) which demonstrates the DeFi capabilities of the
+Linera protocol. The prerequisite for the AMM application is the `fungible` application, as we will
 be adding/removing liquidity and also performing a swap.
 
 ## How it works
@@ -18,7 +18,7 @@ It supports the following operations. All operations need to be executed remotel
   adding liquidity, which currently can only be a chain owner.
 
 - Remove Liquidity: This withdraws tokens from the AMM. Given the index of the token you'd
-  like to remove (can be 0 or 1), and an amount of that token that you'd like to remove, it calculates
+  like to remove (can be 0 or 1), and the amount of that token that you'd like to remove, it calculates
   how much of the other token will also be removed based on the current AMM ratio. Then it removes
   the amounts from both tokens as a removal of liquidity. The owner, in this context, is the user
   removing liquidity, which currently can only be a chain owner.
@@ -29,7 +29,7 @@ It supports the following operations. All operations need to be executed remotel
 
 Before getting started, make sure that the binary tools `linera*` corresponding to
 your version of `linera-sdk` are in your PATH. For scripting purposes, we also assume
-that the BASH function `linera_spawn_and_read_wallet_variables` is defined.
+that the BASH function `linera_spawn` is defined.
 
 From the root of Linera repository, this can be achieved as follows:
 
@@ -38,22 +38,36 @@ export PATH="$PWD/target/debug:$PATH"
 source /dev/stdin <<<"$(linera net helper 2>/dev/null)"
 ```
 
-To start the local Linera network:
+Next, start the local Linera network and run a faucet:
 
 ```bash
-linera_spawn_and_read_wallet_variables linera net up --testing-prng-seed 37
+FAUCET_PORT=8079
+FAUCET_URL=http://localhost:$FAUCET_PORT
+linera_spawn linera net up --with-faucet --faucet-port $FAUCET_PORT
+
+# If you're using a testnet, run this instead:
+#   LINERA_TMP_DIR=$(mktemp -d)
+#   FAUCET_URL=https://faucet.testnet-XXX.linera.net  # for some value XXX
 ```
 
-We use the test-only CLI option `--testing-prng-seed` to make keys deterministic and simplify our
-explanation.
+Create the user wallet and add chains to it:
 
 ```bash
-OWNER_1=d2115775b5b3c5c1ed3c1516319a7e850c75d0786a74b39f5250cf9decc88124
-OWNER_2=a477cb966190661c0dfbe50602616a78a48d2bef6cb5288d49deb3e05585d579
-CHAIN_1=673ce04da4b8ed773ee7cd5828a2083775bea4130498b847c5b34b2ed913b07f
-CHAIN_2=69705f85ac4c9fef6c02b4d83426aaaf05154c645ec1c61665f8e450f0468bc0
-CHAIN_AMM=e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65
-OWNER_AMM=7136460f0c87ae46f966f898d494c4b40c4ae8c527f4d1c0b1fa0f7cff91d20f
+export LINERA_WALLET="$LINERA_TMP_DIR/wallet.json"
+export LINERA_KEYSTORE="$LINERA_TMP_DIR/keystore.json"
+export LINERA_STORAGE="rocksdb:$LINERA_TMP_DIR/client.db"
+
+linera wallet init --faucet $FAUCET_URL
+
+INFO_AMM=($(linera wallet request-chain --faucet $FAUCET_URL))
+INFO_1=($(linera wallet request-chain --faucet $FAUCET_URL))
+INFO_2=($(linera wallet request-chain --faucet $FAUCET_URL))
+CHAIN_AMM="${INFO_AMM[0]}"
+CHAIN_1="${INFO_1[0]}"
+CHAIN_2="${INFO_2[0]}"
+OWNER_AMM="${INFO_AMM[1]}"
+OWNER_1="${INFO_1[1]}"
+OWNER_2="${INFO_2[1]}"
 ```
 
 Now we have to publish and create the fungible applications. The flag `--wait-for-outgoing-messages` waits until a quorum of validators has confirmed that all sent cross-chain messages have been delivered.
@@ -64,7 +78,7 @@ Now we have to publish and create the fungible applications. The flag `--wait-fo
 FUN1_APP_ID=$(linera --wait-for-outgoing-messages \
   publish-and-create examples/target/wasm32-unknown-unknown/release/fungible_{contract,service}.wasm \
     --json-argument "{ \"accounts\": {
-        \"User:$OWNER_AMM\": \"100.\"
+        \"$OWNER_AMM\": \"100.\"
     } }" \
     --json-parameters "{ \"ticker_symbol\": \"FUN1\" }" \
 )
@@ -72,7 +86,7 @@ FUN1_APP_ID=$(linera --wait-for-outgoing-messages \
 FUN2_APP_ID=$(linera --wait-for-outgoing-messages \
   publish-and-create examples/target/wasm32-unknown-unknown/release/fungible_{contract,service}.wasm \
     --json-argument "{ \"accounts\": {
-        \"User:$OWNER_AMM\": \"100.\"
+        \"$OWNER_AMM\": \"100.\"
     } }" \
     --json-parameters "{ \"ticker_symbol\": \"FUN2\" }" \
 )
@@ -107,11 +121,11 @@ To properly setup the tokens in the proper chains, we need to do some transfer o
 ```gql,uri=http://localhost:8080/chains/$CHAIN_AMM/applications/$FUN1_APP_ID
 mutation {
   transfer(
-    owner: "User:$OWNER_AMM",
+    owner: "$OWNER_AMM",
     amount: "50.",
     targetAccount: {
       chainId: "$CHAIN_1",
-      owner: "User:$OWNER_1",
+      owner: "$OWNER_1",
     }
   )
 }
@@ -122,11 +136,11 @@ mutation {
 ```gql,uri=http://localhost:8080/chains/$CHAIN_AMM/applications/$FUN1_APP_ID
 mutation {
   transfer(
-    owner: "User:$OWNER_AMM",
+    owner: "$OWNER_AMM",
     amount: "50.",
     targetAccount: {
       chainId: "$CHAIN_2",
-      owner: "User:$OWNER_2",
+      owner: "$OWNER_2",
     }
   )
 }
@@ -139,11 +153,11 @@ mutation {
 ```gql,uri=http://localhost:8080/chains/$CHAIN_AMM/applications/$FUN2_APP_ID
 mutation {
   transfer(
-    owner: "User:$OWNER_AMM",
+    owner: "$OWNER_AMM",
     amount: "50.",
     targetAccount: {
       chainId: "$CHAIN_1",
-      owner: "User:$OWNER_1",
+      owner: "$OWNER_1",
     }
   )
 }
@@ -154,31 +168,17 @@ mutation {
 ```gql,uri=http://localhost:8080/chains/$CHAIN_AMM/applications/$FUN2_APP_ID
 mutation {
   transfer(
-    owner: "User:$OWNER_AMM",
+    owner: "$OWNER_AMM",
     amount: "50.",
     targetAccount: {
       chainId: "$CHAIN_2",
-      owner: "User:$OWNER_2",
+      owner: "$OWNER_2",
     }
   )
 }
 ```
 
 All operations can only be from a remote chain i.e. other than the chain on which `AMM` is deployed to.
-We can do it from GraphiQL by performing the `requestApplication` mutation so that we can perform the
-operation from the chain.
-
-```gql,uri=http://localhost:8080
-mutation {
-  requestApplication (
-    chainId:"$CHAIN_1",
-    applicationId: "$AMM_APPLICATION_ID",
-    targetChainId: "$CHAIN_AMM"
-  )
-}
-```
-
-Note: The above mutation has to be performed from `http://localhost:8080`.
 
 Before performing any operation we need to provide liquidity to it, so we will use the `AddLiquidity` operation,
 navigate to the URL you get by running `echo "http://localhost:8080/chains/$CHAIN_1/applications/$AMM_APPLICATION_ID"`.
@@ -188,24 +188,12 @@ To perform the `AddLiquidity` operation:
 ```gql,uri=http://localhost:8080/chains/$CHAIN_1/applications/$AMM_APPLICATION_ID
 mutation {
   addLiquidity(
-    owner: "User:$OWNER_1",
+    owner: "$OWNER_1",
     maxToken0Amount: "50",
     maxToken1Amount: "50",
   )
 }
 ```
-
-```gql,uri=http://localhost:8080
-mutation {
-  requestApplication (
-    chainId:"$CHAIN_2",
-    applicationId: "$AMM_APPLICATION_ID",
-    targetChainId: "$CHAIN_AMM"
-  )
-}
-```
-
-Note: The above mutation has to be performed from `http://localhost:8080`.
 
 To perform the `Swap` operation, navigate to the URL you get by running `echo "http://localhost:8080/chains/$CHAIN_2/applications/$AMM_APPLICATION_ID"` and
 perform the following mutation:
@@ -213,7 +201,7 @@ perform the following mutation:
 ```gql,uri=http://localhost:8080/chains/$CHAIN_2/applications/$AMM_APPLICATION_ID
 mutation {
   swap(
-    owner: "User:$OWNER_2",
+    owner: "$OWNER_2",
     inputTokenIdx: 1,
     inputAmount: "1",
   )
@@ -226,7 +214,7 @@ perform the following mutation:
 ```gql,uri=http://localhost:8080/chains/$CHAIN_1/applications/$AMM_APPLICATION_ID
 mutation {
   removeLiquidity(
-    owner: "User:$OWNER_1",
+    owner: "$OWNER_1",
     tokenToRemoveIdx: 1,
     tokenToRemoveAmount: "1",
   )
@@ -239,7 +227,7 @@ perform the following mutation:
 ```gql,uri=http://localhost:8080/chains/$CHAIN_1/applications/$AMM_APPLICATION_ID
 mutation {
   removeAllAddedLiquidity(
-    owner: "User:$OWNER_1",
+    owner: "$OWNER_1",
   )
 }
 ```
@@ -257,13 +245,10 @@ In addition, we make an AMM operation per block mandatory, so owners cannot spam
 with empty blocks.
 
 ```bash
-PUB_KEY_AMM=fcf518d56455283ace2bbc11c71e684eb58af81bc98b96a18129e825ce24ea84
-PUB_KEY_2=ca909dcf60df014c166be17eb4a9f6e2f9383314a57510206a54cd841ade455e
-
 kill %% && sleep 1    # Kill the service so we can use CLI commands for chain 1.
 
 linera --wait-for-outgoing-messages change-ownership \
-    --owner-public-keys $PUB_KEY_AMM $PUB_KEY_2
+    --owners $OWNER_AMM $OWNER_2
 
 linera --wait-for-outgoing-messages change-application-permissions \
     --execute-operations $AMM_APPLICATION_ID \
@@ -279,7 +264,7 @@ First, let's add some liquidity again to the AMM. Navigate to the URL you get by
 ```gql,uri=http://localhost:8080/chains/$CHAIN_1/applications/$AMM_APPLICATION_ID
 mutation {
   addLiquidity(
-    owner: "User:$OWNER_1",
+    owner: "$OWNER_1",
     maxToken0Amount: "40",
     maxToken1Amount: "40",
   )
@@ -300,7 +285,7 @@ to the URL you get by running `echo "http://localhost:8080/chains/$CHAIN_1/appli
 query {
     accounts {
         entry(
-            key: "User:$OWNER_1"
+            key: "$OWNER_1"
         ) {
             value
         }
@@ -314,7 +299,7 @@ Then navigate to the URL you get by running `echo "http://localhost:8080/chains/
 query {
     accounts {
         entry(
-            key: "User:$OWNER_1"
+            key: "$OWNER_1"
         ) {
             value
         }

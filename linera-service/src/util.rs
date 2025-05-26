@@ -16,9 +16,11 @@ use http::Uri;
 use linera_base::command::parse_version_message;
 use linera_base::data_types::TimeDelta;
 pub use linera_client::util::*;
-use tokio::signal::unix;
-use tokio_util::sync::CancellationToken;
 use tracing::debug;
+
+// Exported for readme e2e tests.
+pub static DEFAULT_PAUSE_AFTER_LINERA_SERVICE_SECS: &str = "3";
+pub static DEFAULT_PAUSE_AFTER_GQL_MUTATIONS_SECS: &str = "3";
 
 /// Extension trait for [`tokio::process::Child`].
 pub trait ChildExt: std::fmt::Debug {
@@ -36,25 +38,6 @@ impl ChildExt for tokio::process::Child {
         }
         debug!("Child process {:?} is running as expected.", self);
         Ok(())
-    }
-}
-
-/// Listens for shutdown signals, and notifies the [`CancellationToken`] if one is
-/// received.
-pub async fn listen_for_shutdown_signals(shutdown_sender: CancellationToken) {
-    let _shutdown_guard = shutdown_sender.drop_guard();
-
-    let mut sigint =
-        unix::signal(unix::SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
-    let mut sigterm =
-        unix::signal(unix::SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
-    let mut sighup =
-        unix::signal(unix::SignalKind::hangup()).expect("Failed to set up SIGHUP handler");
-
-    tokio::select! {
-        _ = sigint.recv() => debug!("Received SIGINT"),
-        _ = sigterm.recv() => debug!("Received SIGTERM"),
-        _ = sighup.recv() => debug!("Received SIGHUP"),
     }
 }
 
@@ -166,7 +149,12 @@ pub(crate) async fn graphiql(uri: Uri) -> impl IntoResponse {
     let source = GraphiQLSource::build()
         .endpoint(uri.path())
         .subscription_endpoint("/ws")
-        .finish();
+        .finish()
+        .replace("@17", "@18")
+        .replace(
+            "ReactDOM.render(",
+            "ReactDOM.createRoot(document.getElementById(\"graphiql\")).render(",
+        );
     response::Html(source)
 }
 
@@ -176,6 +164,21 @@ pub fn parse_millis(s: &str) -> Result<Duration, ParseIntError> {
 
 pub fn parse_millis_delta(s: &str) -> Result<TimeDelta, ParseIntError> {
     Ok(TimeDelta::from_millis(s.parse()?))
+}
+
+/// Checks the condition five times with increasing delays. Returns true if it is met.
+#[cfg(with_testing)]
+pub async fn eventually<F>(condition: impl Fn() -> F) -> bool
+where
+    F: std::future::Future<Output = bool>,
+{
+    for i in 0..5 {
+        linera_base::time::timer::sleep(std::time::Duration::from_secs(i)).await;
+        if condition().await {
+            return true;
+        }
+    }
+    false
 }
 
 #[test]

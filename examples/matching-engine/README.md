@@ -8,7 +8,7 @@ the `fungible` application example on how to create two token applications.
 
 An order can be of two types:
 
-- Bid: For buying token 1 and paying in token 0, these are ordered in from the highest
+- Bid: For buying token 1 and paying in token 0, these are ordered from the highest
   bid (most preferable) to the lowest price.
 - Ask: For selling token 1, to be paid in token 0, these are ordered from the lowest
   (most preferable) to the highest price.
@@ -40,7 +40,7 @@ from the remote chain to the chain of the matching engine, and a `ExecuteOrder` 
 
 Before getting started, make sure that the binary tools `linera*` corresponding to
 your version of `linera-sdk` are in your PATH. For scripting purposes, we also assume
-that the BASH function `linera_spawn_and_read_wallet_variables` is defined.
+that the BASH function `linera_spawn` is defined.
 
 From the root of Linera repository, this can be achieved as follows:
 
@@ -49,36 +49,47 @@ export PATH="$PWD/target/debug:$PATH"
 source /dev/stdin <<<"$(linera net helper 2>/dev/null)"
 ```
 
-To start the local Linera network:
+Next, start the local Linera network and run a faucet:
 
 ```bash
-linera_spawn_and_read_wallet_variables linera net up --testing-prng-seed 37
+FAUCET_PORT=8079
+FAUCET_URL=http://localhost:$FAUCET_PORT
+linera_spawn linera net up --with-faucet --faucet-port $FAUCET_PORT
+
+# If you're using a testnet, run this instead:
+#   LINERA_TMP_DIR=$(mktemp -d)
+#   FAUCET_URL=https://faucet.testnet-XXX.linera.net  # for some value XXX
 ```
 
-We use the test-only CLI option `--testing-prng-seed` to make keys deterministic and simplify our
-explanation.
+Create the user wallet and add chains to it:
 
 ```bash
-OWNER_1=7136460f0c87ae46f966f898d494c4b40c4ae8c527f4d1c0b1fa0f7cff91d20f
-OWNER_2=a477cb966190661c0dfbe50602616a78a48d2bef6cb5288d49deb3e05585d579
-OWNER_3=d2115775b5b3c5c1ed3c1516319a7e850c75d0786a74b39f5250cf9decc88124
-CHAIN_1=e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65
-CHAIN_2=69705f85ac4c9fef6c02b4d83426aaaf05154c645ec1c61665f8e450f0468bc0
-PUB_KEY_1=fcf518d56455283ace2bbc11c71e684eb58af81bc98b96a18129e825ce24ea84
-PUB_KEY_2=ca909dcf60df014c166be17eb4a9f6e2f9383314a57510206a54cd841ade455e
+export LINERA_WALLET="$LINERA_TMP_DIR/wallet.json"
+export LINERA_KEYSTORE="$LINERA_TMP_DIR/keystore.json"
+export LINERA_STORAGE="rocksdb:$LINERA_TMP_DIR/client.db"
+
+linera wallet init --faucet $FAUCET_URL
+
+INFO_1=($(linera wallet request-chain --faucet $FAUCET_URL))
+INFO_2=($(linera wallet request-chain --faucet $FAUCET_URL))
+INFO_3=($(linera wallet request-chain --faucet $FAUCET_URL))
+CHAIN_1="${INFO_1[0]}"
+CHAIN_2="${INFO_2[0]}"
+CHAIN_3="${INFO_3[0]}"
+OWNER_1="${INFO_1[1]}"
+OWNER_2="${INFO_2[1]}"
+OWNER_3="${INFO_3[1]}"
 ```
 
 Publish and create two `fungible` applications whose IDs will be used as a
-parameter for the `matching-engine` application. The flag `--wait-for-outgoing-messages`
-waits until a quorum of validators has confirmed that all sent cross-chain messages have been
-delivered.
+parameter for the `matching-engine` application:
 
 ```bash
 FUN1_APP_ID=$(linera --wait-for-outgoing-messages \
   project publish-and-create examples/fungible \
     --json-argument "{ \"accounts\": {
-        \"User:$OWNER_1\": \"100.\",
-        \"User:$OWNER_2\": \"150.\"
+        \"$OWNER_1\": \"100.\",
+        \"$OWNER_2\": \"150.\"
     } }" \
     --json-parameters "{ \"ticker_symbol\": \"FUN1\" }" \
 )
@@ -86,27 +97,23 @@ FUN1_APP_ID=$(linera --wait-for-outgoing-messages \
 FUN2_APP_ID=$(linera --wait-for-outgoing-messages \
   project publish-and-create examples/fungible \
     --json-argument "{ \"accounts\": {
-        \"User:$OWNER_1\": \"100.\",
-        \"User:$OWNER_2\": \"150.\"
+        \"$OWNER_1\": \"100.\",
+        \"$OWNER_2\": \"150.\"
     } }" \
     --json-parameters "{ \"ticker_symbol\": \"FUN2\" }" \
 )
 ```
 
-Now we publish and deploy the Matching Engine application:
+The flag `--wait-for-outgoing-messages` waits until a quorum of validators has confirmed
+that all sent cross-chain messages have been delivered.
+
+Now, we publish and deploy the Matching Engine application:
 
 ```bash
 MATCHING_ENGINE=$(linera --wait-for-outgoing-messages \
     project publish-and-create examples/matching-engine \
     --json-parameters "{\"tokens\":["\"$FUN1_APP_ID\"","\"$FUN2_APP_ID\""]}" \
     --required-application-ids $FUN1_APP_ID $FUN2_APP_ID)
-```
-
-And make sure chain 2 also has it:
-
-```bash
-linera --wait-for-outgoing-messages request-application \
-    --requester-chain-id $CHAIN_2 $MATCHING_ENGINE
 ```
 
 ### Using the Matching Engine Application
@@ -131,7 +138,7 @@ mutation {
   executeOrder(
     order: {
         Insert : {
-        owner: "User:$OWNER_1",
+        owner: "$OWNER_1",
         amount: "1",
         nature: Bid,
         price: {
@@ -170,7 +177,7 @@ Engine to close the chain.
 kill %% && sleep 1    # Kill the service so we can use CLI commands for chain 1.
 
 linera --wait-for-outgoing-messages change-ownership \
-    --owner-public-keys $PUB_KEY_1 $PUB_KEY_2
+    --owners $OWNER_1 $OWNER_2
 
 linera --wait-for-outgoing-messages change-application-permissions \
     --execute-operations $MATCHING_ENGINE \
@@ -186,12 +193,12 @@ mutation {
   claim(
     sourceAccount: {
       chainId: "$CHAIN_1",
-      owner: "User:$OWNER_2",
+      owner: "$OWNER_2",
     }
     amount: "100.",
     targetAccount: {
       chainId: "$CHAIN_2",
-      owner: "User:$OWNER_3"
+      owner: "$OWNER_3"
     }
   )
 }
@@ -204,12 +211,12 @@ mutation {
   claim(
     sourceAccount: {
       chainId: "$CHAIN_1",
-      owner: "User:$OWNER_2",
+      owner: "$OWNER_2",
     }
     amount: "150.",
     targetAccount: {
       chainId: "$CHAIN_2",
-      owner: "User:$OWNER_2"
+      owner: "$OWNER_2"
     }
   )
 }
@@ -223,7 +230,7 @@ mutation {
   executeOrder(
     order: {
       Insert : {
-        owner: "User:$OWNER_2",
+        owner: "$OWNER_2",
         amount: "2",
         nature: Ask,
         price: {
@@ -247,7 +254,7 @@ Owner 2 should now get back their tokens, and have 145 FUN2 left. On the URL you
 query {
   accounts {
     entry(
-      key: "User:$OWNER_2"
+      key: "$OWNER_2"
     ) {
       value
     }

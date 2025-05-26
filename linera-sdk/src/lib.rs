@@ -30,12 +30,13 @@
 pub mod util;
 
 pub mod abis;
-pub mod base;
+mod base;
 pub mod contract;
 #[cfg(feature = "ethereum")]
 pub mod ethereum;
 mod extensions;
 pub mod graphql;
+pub mod linera_base_types;
 mod log;
 pub mod service;
 #[cfg(with_testing)]
@@ -48,11 +49,12 @@ pub use bcs;
 pub use linera_base::{
     abi,
     data_types::{Resources, SendMessageRequest},
-    ensure,
+    ensure, http,
 };
 use linera_base::{
     abi::{ContractAbi, ServiceAbi, WithContractAbi, WithServiceAbi},
     crypto::CryptoHash,
+    data_types::StreamUpdate,
     doc_scalar,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -100,6 +102,9 @@ pub trait Contract: WithContractAbi + ContractAbi + Sized {
     /// instead.
     type InstantiationArgument: Serialize + DeserializeOwned + Debug;
 
+    /// Event values for streams created by this application.
+    type EventValue: Serialize + DeserializeOwned + Debug;
+
     /// Creates an in-memory instance of the contract handler.
     async fn load(runtime: ContractRuntime<Self>) -> Self;
 
@@ -117,7 +122,7 @@ pub trait Contract: WithContractAbi + ContractAbi + Sized {
 
     /// Applies a message originating from a cross-chain message.
     ///
-    /// Messages are messages sent across chains. These messages are created and received by
+    /// Messages are sent across chains. These messages are created and received by
     /// the same application. Messages can be either single-sender and single-receiver, or
     /// single-sender and multiple-receivers. The former allows sending cross-chain messages to the
     /// application on some other specific chain, while the latter uses broadcast channels to
@@ -127,6 +132,12 @@ pub trait Contract: WithContractAbi + ContractAbi + Sized {
     /// For a message to be executed, a user must mark it to be received in a block of the receiver
     /// chain.
     async fn execute_message(&mut self, message: Self::Message);
+
+    /// Reacts to new events on streams.
+    ///
+    /// This is called whenever there is a new event on any stream that this application
+    /// subscribes to.
+    async fn process_streams(&mut self, _updates: Vec<StreamUpdate>) {}
 
     /// Finishes the execution of the current transaction.
     ///

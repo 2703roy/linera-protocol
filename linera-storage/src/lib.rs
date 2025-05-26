@@ -12,50 +12,55 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use linera_base::{
-    crypto::{CryptoHash, PublicKey},
-    data_types::{Amount, Blob, BlockHeight, TimeDelta, Timestamp, UserApplicationDescription},
-    hashed::Hashed,
-    identifiers::{BlobId, ChainDescription, ChainId, GenericApplicationId, UserApplicationId},
-    ownership::ChainOwnership,
+    crypto::CryptoHash,
+    data_types::{
+        ApplicationDescription, Blob, ChainDescription, CompressedBytecode, Epoch,
+        NetworkDescription, TimeDelta, Timestamp,
+    },
+    identifiers::{ApplicationId, BlobId, ChainId, EventId, IndexAndEvent, StreamId},
+    vm::VmRuntime,
 };
 use linera_chain::{
-    data_types::ChannelFullName,
     types::{ConfirmedBlock, ConfirmedBlockCertificate},
     ChainError, ChainStateView,
 };
+#[cfg(with_revm)]
 use linera_execution::{
-    committee::{Committee, Epoch},
-    system::SystemChannel,
-    BlobState, ChannelSubscription, ExecutionError, ExecutionRuntimeConfig,
-    ExecutionRuntimeContext, UserContractCode, UserServiceCode, WasmRuntime,
+    evm::revm::{EvmContractModule, EvmServiceModule},
+    EvmRuntime,
 };
-use linera_views::{
-    context::Context,
-    views::{CryptoHashView, RootView, ViewError},
+use linera_execution::{
+    BlobState, ExecutionError, ExecutionRuntimeConfig, ExecutionRuntimeContext, UserContractCode,
+    UserServiceCode, WasmRuntime,
 };
 #[cfg(with_wasm_runtime)]
-use {
-    linera_base::{data_types::CompressedBytecode, identifiers::BlobType},
-    linera_execution::{WasmContractModule, WasmServiceModule},
+use linera_execution::{WasmContractModule, WasmServiceModule};
+use linera_views::{
+    context::Context,
+    views::{RootView, ViewError},
 };
 
+#[cfg(with_metrics)]
+pub use crate::db_storage::metrics;
 #[cfg(with_testing)]
 pub use crate::db_storage::TestClock;
 pub use crate::db_storage::{ChainStatesFirstAssignment, DbStorage, WallClock};
-#[cfg(with_metrics)]
-pub use crate::db_storage::{
-    READ_CERTIFICATE_COUNTER, READ_HASHED_CONFIRMED_BLOCK_COUNTER, WRITE_CERTIFICATE_COUNTER,
-};
+
+/// The default namespace to be used when none is specified
+pub const DEFAULT_NAMESPACE: &str = "table_linera";
 
 /// Communicate with a persistent storage using the "views" abstraction.
 #[cfg_attr(not(web), async_trait)]
 #[cfg_attr(web, async_trait(?Send))]
 pub trait Storage: Sized {
-    /// The low-level storage implementation in use.
+    /// The low-level storage implementation in use by the core protocol (chain workers etc).
     type Context: Context<Extra = ChainRuntimeContext<Self>> + Clone + Send + Sync + 'static;
 
     /// The clock type being used.
     type Clock: Clock;
+
+    /// The low-level storage implementation in use by the block exporter.
+    type BlockExporterContext: Context<Extra = u32> + Clone + Send + Sync + 'static;
 
     /// Returns the current wall clock time.
     fn clock(&self) -> &Self::Clock;
@@ -67,10 +72,6 @@ pub trait Storage: Sized {
     /// Each time this method is called, a new [`ChainStateView`] is created. If there are multiple
     /// instances of the same chain active at any given moment, they will race to access persistent
     /// storage. This can lead to invalid states and data corruption.
-    ///
-    /// Other methods that also create [`ChainStateView`] instances that can cause conflicts are:
-    /// [`load_active_chain`][`Self::load_active_chain`] and
-    /// [`create_chain`][`Self::create_chain`].
     async fn load_chain(&self, id: ChainId) -> Result<ChainStateView<Self::Context>, ViewError>;
 
     /// Tests the existence of a blob with the given blob ID.
@@ -83,10 +84,7 @@ pub trait Storage: Sized {
     async fn contains_blob_state(&self, blob_id: BlobId) -> Result<bool, ViewError>;
 
     /// Reads the hashed certificate value with the given hash.
-    async fn read_hashed_confirmed_block(
-        &self,
-        hash: CryptoHash,
-    ) -> Result<Hashed<ConfirmedBlock>, ViewError>;
+    async fn read_confirmed_block(&self, hash: CryptoHash) -> Result<ConfirmedBlock, ViewError>;
 
     /// Reads the blob with the given blob ID.
     async fn read_blob(&self, blob_id: BlobId) -> Result<Blob, ViewError>;
@@ -101,11 +99,11 @@ pub trait Storage: Sized {
     async fn read_blob_states(&self, blob_ids: &[BlobId]) -> Result<Vec<BlobState>, ViewError>;
 
     /// Reads the hashed certificate values in descending order from the given hash.
-    async fn read_hashed_confirmed_blocks_downward(
+    async fn read_confirmed_blocks_downward(
         &self,
         from: CryptoHash,
         limit: u32,
-    ) -> Result<Vec<Hashed<ConfirmedBlock>>, ViewError>;
+    ) -> Result<Vec<ConfirmedBlock>, ViewError>;
 
     /// Writes the given blob.
     async fn write_blob(&self, blob: &Blob) -> Result<(), ViewError>;
@@ -161,27 +159,34 @@ pub trait Storage: Sized {
         hashes: I,
     ) -> Result<Vec<ConfirmedBlockCertificate>, ViewError>;
 
-    /// Loads the view of a chain state and checks that it is active.
-    ///
-    /// # Notes
-    ///
-    /// Each time this method is called, a new [`ChainStateView`] is created. If there are multiple
-    /// instances of the same chain active at any given moment, they will race to access persistent
-    /// storage. This can lead to invalid states and data corruption.
-    ///
-    /// Other methods that also create [`ChainStateView`] instances that can cause conflicts are:
-    /// [`load_chain`][`Self::load_chain`] and [`create_chain`][`Self::create_chain`].
-    async fn load_active_chain(
+    /// Reads the event with the given ID.
+    async fn read_event(&self, id: EventId) -> Result<Vec<u8>, ViewError>;
+
+    /// Tests existence of the event with the given ID.
+    async fn contains_event(&self, id: EventId) -> Result<bool, ViewError>;
+
+    /// Lists all the events from a starting index
+    async fn read_events_from_index(
         &self,
-        id: ChainId,
-    ) -> Result<ChainStateView<Self::Context>, linera_chain::ChainError>
-    where
-        ChainRuntimeContext<Self>: ExecutionRuntimeContext,
-    {
-        let chain = self.load_chain(id).await?;
-        chain.ensure_is_active()?;
-        Ok(chain)
-    }
+        chain_id: &ChainId,
+        stream_id: &StreamId,
+        start_index: u32,
+    ) -> Result<Vec<IndexAndEvent>, ViewError>;
+
+    /// Writes a vector of events.
+    async fn write_events(
+        &self,
+        events: impl IntoIterator<Item = (EventId, Vec<u8>)> + Send,
+    ) -> Result<(), ViewError>;
+
+    /// Reads the network description.
+    async fn read_network_description(&self) -> Result<Option<NetworkDescription>, ViewError>;
+
+    /// Writes the network description.
+    async fn write_network_description(
+        &self,
+        information: &NetworkDescription,
+    ) -> Result<(), ViewError>;
 
     /// Initializes a chain in a simple way (used for testing and to create a genesis state).
     ///
@@ -190,64 +195,18 @@ pub trait Storage: Sized {
     /// This method creates a new [`ChainStateView`] instance. If there are multiple instances of
     /// the same chain active at any given moment, they will race to access persistent storage.
     /// This can lead to invalid states and data corruption.
-    ///
-    /// Other methods that also create [`ChainStateView`] instances that can cause conflicts are:
-    /// [`load_chain`][`Self::load_chain`] and [`load_active_chain`][`Self::load_active_chain`].
-    async fn create_chain(
-        &self,
-        committee: Committee,
-        admin_id: ChainId,
-        description: ChainDescription,
-        public_key: PublicKey,
-        balance: Amount,
-        timestamp: Timestamp,
-    ) -> Result<(), ChainError>
+    async fn create_chain(&self, description: ChainDescription) -> Result<(), ChainError>
     where
         ChainRuntimeContext<Self>: ExecutionRuntimeContext,
     {
-        let id = description.into();
+        let id = description.id();
+        // Store the description blob.
+        self.write_blob(&Blob::new_chain_description(&description))
+            .await?;
         let mut chain = self.load_chain(id).await?;
         assert!(!chain.is_active(), "Attempting to create a chain twice");
-        chain.manager.reset(
-            ChainOwnership::single(public_key),
-            BlockHeight(0),
-            self.clock().current_time(),
-            committee.keys_and_weights(),
-        )?;
-        let system_state = &mut chain.execution_state.system;
-        system_state.description.set(Some(description));
-        system_state.epoch.set(Some(Epoch::ZERO));
-        system_state.admin_id.set(Some(admin_id));
-        system_state
-            .committees
-            .get_mut()
-            .insert(Epoch::ZERO, committee);
-        system_state
-            .ownership
-            .set(ChainOwnership::single(public_key));
-        system_state.balance.set(balance);
-        system_state.timestamp.set(timestamp);
-
-        if id != admin_id {
-            // Add the new subscriber to the admin chain.
-            system_state.subscriptions.insert(&ChannelSubscription {
-                chain_id: admin_id,
-                name: SystemChannel::Admin.name(),
-            })?;
-            let mut admin_chain = self.load_chain(admin_id).await?;
-            let full_name = ChannelFullName {
-                application_id: GenericApplicationId::System,
-                name: SystemChannel::Admin.name(),
-            };
-            {
-                let mut channel = admin_chain.channels.try_load_entry_mut(&full_name).await?;
-                channel.subscribers.insert(&id)?;
-            } // Make channel go out of scope, so we can call save.
-            admin_chain.save().await?;
-        }
-
-        let state_hash = chain.execution_state.crypto_hash().await?;
-        chain.execution_state_hash.set(Some(state_hash));
+        let current_time = self.clock().current_time();
+        chain.ensure_is_active(current_time).await?;
         chain.save().await?;
         Ok(())
     }
@@ -257,22 +216,16 @@ pub trait Storage: Sized {
 
     /// Creates a [`UserContractCode`] instance using the bytecode in storage referenced
     /// by the `application_description`.
-    #[cfg(with_wasm_runtime)]
     async fn load_contract(
         &self,
-        application_description: &UserApplicationDescription,
+        application_description: &ApplicationDescription,
     ) -> Result<UserContractCode, ExecutionError> {
-        let Some(wasm_runtime) = self.wasm_runtime() else {
-            panic!("A Wasm runtime is required to load user applications.");
-        };
-        let contract_bytecode_blob_id = BlobId::new(
-            application_description.bytecode_id.contract_blob_hash,
-            BlobType::ContractBytecode,
-        );
+        let contract_bytecode_blob_id = application_description.contract_bytecode_blob_id();
         let contract_blob = self.read_blob(contract_bytecode_blob_id).await?;
         let compressed_contract_bytecode = CompressedBytecode {
             compressed_bytes: contract_blob.into_bytes().to_vec(),
         };
+        #[cfg_attr(not(any(with_wasm_runtime, with_revm)), allow(unused_variables))]
         let contract_bytecode =
             linera_base::task::Blocking::<linera_base::task::NoInput, _>::spawn(
                 move |_| async move { compressed_contract_bytecode.decompress() },
@@ -280,74 +233,114 @@ pub trait Storage: Sized {
             .await
             .join()
             .await?;
-        Ok(WasmContractModule::new(contract_bytecode, wasm_runtime)
-            .await?
-            .into())
-    }
-
-    #[cfg(not(with_wasm_runtime))]
-    #[allow(clippy::diverging_sub_expression)]
-    async fn load_contract(
-        &self,
-        _application_description: &UserApplicationDescription,
-    ) -> Result<UserContractCode, ExecutionError> {
-        panic!(
-            "A Wasm runtime is required to load user applications. \
-            Please enable the `wasmer` or the `wasmtime` feature flags \
-            when compiling `linera-storage`."
-        );
+        match application_description.module_id.vm_runtime {
+            VmRuntime::Wasm => {
+                cfg_if::cfg_if! {
+                    if #[cfg(with_wasm_runtime)] {
+                        let Some(wasm_runtime) = self.wasm_runtime() else {
+                            panic!("A Wasm runtime is required to load user applications.");
+                        };
+                        Ok(WasmContractModule::new(contract_bytecode, wasm_runtime)
+                           .await?
+                           .into())
+                    } else {
+                        panic!(
+                            "A Wasm runtime is required to load user applications. \
+                             Please enable the `wasmer` or the `wasmtime` feature flags \
+                             when compiling `linera-storage`."
+                        );
+                    }
+                }
+            }
+            VmRuntime::Evm => {
+                cfg_if::cfg_if! {
+                    if #[cfg(with_revm)] {
+                        let evm_runtime = EvmRuntime::Revm;
+                        Ok(EvmContractModule::new(contract_bytecode, evm_runtime)
+                           .await?
+                           .into())
+                    } else {
+                        panic!(
+                            "An Evm runtime is required to load user applications. \
+                             Please enable the `revm` feature flag \
+                             when compiling `linera-storage`."
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Creates a [`linera-sdk::UserContract`] instance using the bytecode in storage referenced
     /// by the `application_description`.
-    #[cfg(with_wasm_runtime)]
     async fn load_service(
         &self,
-        application_description: &UserApplicationDescription,
+        application_description: &ApplicationDescription,
     ) -> Result<UserServiceCode, ExecutionError> {
-        let Some(wasm_runtime) = self.wasm_runtime() else {
-            panic!("A Wasm runtime is required to load user applications.");
-        };
-        let service_bytecode_blob_id = BlobId::new(
-            application_description.bytecode_id.service_blob_hash,
-            BlobType::ServiceBytecode,
-        );
+        let service_bytecode_blob_id = application_description.service_bytecode_blob_id();
         let service_blob = self.read_blob(service_bytecode_blob_id).await?;
         let compressed_service_bytecode = CompressedBytecode {
             compressed_bytes: service_blob.into_bytes().to_vec(),
         };
+        #[cfg_attr(not(any(with_wasm_runtime, with_revm)), allow(unused_variables))]
         let service_bytecode = linera_base::task::Blocking::<linera_base::task::NoInput, _>::spawn(
             move |_| async move { compressed_service_bytecode.decompress() },
         )
         .await
         .join()
         .await?;
-        Ok(WasmServiceModule::new(service_bytecode, wasm_runtime)
-            .await?
-            .into())
+        match application_description.module_id.vm_runtime {
+            VmRuntime::Wasm => {
+                cfg_if::cfg_if! {
+                    if #[cfg(with_wasm_runtime)] {
+                        let Some(wasm_runtime) = self.wasm_runtime() else {
+                            panic!("A Wasm runtime is required to load user applications.");
+                        };
+                        Ok(WasmServiceModule::new(service_bytecode, wasm_runtime)
+                           .await?
+                           .into())
+                    } else {
+                        panic!(
+                            "A Wasm runtime is required to load user applications. \
+                             Please enable the `wasmer` or the `wasmtime` feature flags \
+                             when compiling `linera-storage`."
+                        );
+                    }
+                }
+            }
+            VmRuntime::Evm => {
+                cfg_if::cfg_if! {
+                    if #[cfg(with_revm)] {
+                        let evm_runtime = EvmRuntime::Revm;
+                        Ok(EvmServiceModule::new(service_bytecode, evm_runtime)
+                           .await?
+                           .into())
+                    } else {
+                        panic!(
+                            "An Evm runtime is required to load user applications. \
+                             Please enable the `revm` feature flag \
+                             when compiling `linera-storage`."
+                        );
+                    }
+                }
+            }
+        }
     }
 
-    #[cfg(not(with_wasm_runtime))]
-    #[allow(clippy::diverging_sub_expression)]
-    async fn load_service(
+    async fn block_exporter_context(
         &self,
-        _application_description: &UserApplicationDescription,
-    ) -> Result<UserServiceCode, ExecutionError> {
-        panic!(
-            "A Wasm runtime is required to load user applications. \
-            Please enable the `wasmer` or the `wasmtime` feature flags \
-            when compiling `linera-storage`."
-        );
-    }
+        block_exporter_id: u32,
+    ) -> Result<Self::BlockExporterContext, ViewError>;
 }
 
+/// An implementation of `ExecutionRuntimeContext` suitable for the core protocol.
 #[derive(Clone)]
 pub struct ChainRuntimeContext<S> {
     storage: S,
     chain_id: ChainId,
     execution_runtime_config: ExecutionRuntimeConfig,
-    user_contracts: Arc<DashMap<UserApplicationId, UserContractCode>>,
-    user_services: Arc<DashMap<UserApplicationId, UserServiceCode>>,
+    user_contracts: Arc<DashMap<ApplicationId, UserContractCode>>,
+    user_services: Arc<DashMap<ApplicationId, UserServiceCode>>,
 }
 
 #[cfg_attr(not(web), async_trait)]
@@ -364,17 +357,17 @@ where
         self.execution_runtime_config
     }
 
-    fn user_contracts(&self) -> &Arc<DashMap<UserApplicationId, UserContractCode>> {
+    fn user_contracts(&self) -> &Arc<DashMap<ApplicationId, UserContractCode>> {
         &self.user_contracts
     }
 
-    fn user_services(&self) -> &Arc<DashMap<UserApplicationId, UserServiceCode>> {
+    fn user_services(&self) -> &Arc<DashMap<ApplicationId, UserServiceCode>> {
         &self.user_services
     }
 
     async fn get_user_contract(
         &self,
-        description: &UserApplicationDescription,
+        description: &ApplicationDescription,
     ) -> Result<UserContractCode, ExecutionError> {
         match self.user_contracts.entry(description.into()) {
             Entry::Occupied(entry) => Ok(entry.get().clone()),
@@ -388,7 +381,7 @@ where
 
     async fn get_user_service(
         &self,
-        description: &UserApplicationDescription,
+        description: &ApplicationDescription,
     ) -> Result<UserServiceCode, ExecutionError> {
         match self.user_services.entry(description.into()) {
             Entry::Occupied(entry) => Ok(entry.get().clone()),
@@ -404,8 +397,20 @@ where
         self.storage.read_blob(blob_id).await
     }
 
+    async fn get_event(&self, event_id: EventId) -> Result<Vec<u8>, ViewError> {
+        self.storage.read_event(event_id).await
+    }
+
+    async fn get_network_description(&self) -> Result<Option<NetworkDescription>, ViewError> {
+        self.storage.read_network_description().await
+    }
+
     async fn contains_blob(&self, blob_id: BlobId) -> Result<bool, ViewError> {
         self.storage.contains_blob(blob_id).await
+    }
+
+    async fn contains_event(&self, event_id: EventId) -> Result<bool, ViewError> {
+        self.storage.contains_event(event_id).await
     }
 
     #[cfg(with_testing)]
@@ -415,6 +420,14 @@ where
     ) -> Result<(), ViewError> {
         let blobs = Vec::from_iter(blobs);
         self.storage.write_blobs(&blobs).await
+    }
+
+    #[cfg(with_testing)]
+    async fn add_events(
+        &self,
+        events: impl IntoIterator<Item = (EventId, Vec<u8>)> + Send,
+    ) -> Result<(), ViewError> {
+        self.storage.write_events(events).await
     }
 }
 

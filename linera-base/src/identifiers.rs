@@ -4,39 +4,58 @@
 //! Core identifiers used by the Linera protocol.
 
 use std::{
-    fmt::{self, Display, Formatter},
+    fmt,
     hash::{Hash, Hasher},
     marker::PhantomData,
-    str::FromStr,
 };
 
+#[cfg(with_revm)]
+use alloy_primitives::{Address, B256};
 use anyhow::{anyhow, Context};
-use async_graphql::SimpleObject;
+use async_graphql::{InputObject, SimpleObject};
 use custom_debug_derive::Debug;
+use derive_more::{Display, FromStr};
 use linera_witty::{WitLoad, WitStore, WitType};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     bcs_scalar,
-    crypto::{BcsHashable, CryptoError, CryptoHash, PublicKey},
-    data_types::BlockHeight,
+    crypto::{
+        AccountPublicKey, CryptoError, CryptoHash, Ed25519PublicKey, EvmPublicKey,
+        Secp256k1PublicKey,
+    },
+    data_types::{BlobContent, BlockHeight, ChainDescription},
     doc_scalar, hex_debug,
+    vm::VmRuntime,
 };
-
-/// The owner of a chain. This is currently the hash of the owner's public key used to
-/// verify signatures.
-#[derive(Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Hash, Debug, WitLoad, WitStore, WitType)]
-#[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
-pub struct Owner(pub CryptoHash);
 
 /// An account owner.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, WitLoad, WitStore, WitType)]
 #[cfg_attr(with_testing, derive(test_strategy::Arbitrary))]
 pub enum AccountOwner {
-    /// An account owned by a user.
-    User(Owner),
-    /// An account for an application.
-    Application(ApplicationId),
+    /// Short addresses reserved for the protocol.
+    Reserved(u8),
+    /// 32-byte account address.
+    Address32(CryptoHash),
+    /// 20-byte account EVM-compatible address.
+    Address20([u8; 20]),
+}
+
+impl AccountOwner {
+    /// Returns the default chain address.
+    pub const CHAIN: AccountOwner = AccountOwner::Reserved(0);
+
+    /// Tests if the account is the chain address.
+    pub fn is_chain(&self) -> bool {
+        self == &AccountOwner::CHAIN
+    }
+}
+
+#[cfg(with_testing)]
+impl From<CryptoHash> for AccountOwner {
+    fn from(address: CryptoHash) -> Self {
+        AccountOwner::Address32(address)
+    }
 }
 
 /// A system account.
@@ -47,38 +66,31 @@ pub struct Account {
     /// The chain of the account.
     pub chain_id: ChainId,
     /// The owner of the account, or `None` for the chain balance.
-    #[debug(skip_if = Option::is_none)]
-    pub owner: Option<AccountOwner>,
+    pub owner: AccountOwner,
 }
 
 impl Account {
+    /// Creates a new [`Account`] with the given chain ID and owner.
+    pub fn new(chain_id: ChainId, owner: AccountOwner) -> Self {
+        Self { chain_id, owner }
+    }
+
     /// Creates an [`Account`] representing the balance shared by a chain's owners.
     pub fn chain(chain_id: ChainId) -> Self {
         Account {
             chain_id,
-            owner: None,
-        }
-    }
-
-    /// Creates an [`Account`] for a specific [`Owner`] on a chain.
-    pub fn owner(chain_id: ChainId, owner: impl Into<AccountOwner>) -> Self {
-        Account {
-            chain_id,
-            owner: Some(owner.into()),
+            owner: AccountOwner::CHAIN,
         }
     }
 }
 
-impl Display for Account {
+impl fmt::Display for Account {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.owner {
-            Some(owner) => write!(f, "{}:{}", self.chain_id, owner),
-            None => write!(f, "{}", self.chain_id),
-        }
+        write!(f, "{}:{}", self.chain_id, self.owner)
     }
 }
 
-impl FromStr for Account {
+impl std::str::FromStr for Account {
     type Err = anyhow::Error;
 
     fn from_str(string: &str) -> Result<Self, Self::Err> {
@@ -93,26 +105,10 @@ impl FromStr for Account {
 
         if let Some(owner_string) = parts.next() {
             let owner = owner_string.parse::<AccountOwner>()?;
-            Ok(Account::owner(chain_id, owner))
+            Ok(Account::new(chain_id, owner))
         } else {
             Ok(Account::chain(chain_id))
         }
-    }
-}
-
-/// How to create a chain.
-#[derive(Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Hash, Debug, Serialize, Deserialize)]
-pub enum ChainDescription {
-    /// The chain was created by the genesis configuration.
-    Root(u32),
-    /// The chain was created by a message from another chain.
-    Child(MessageId),
-}
-
-impl ChainDescription {
-    /// Whether the chain was created by another chain.
-    pub fn is_child(&self) -> bool {
-        matches!(self, ChainDescription::Child(_))
     }
 }
 
@@ -159,26 +155,47 @@ pub enum BlobType {
     /// A generic data blob.
     #[default]
     Data,
-    /// A blob containing compressed contract bytecode.
+    /// A blob containing compressed contract Wasm bytecode.
     ContractBytecode,
-    /// A blob containing compressed service bytecode.
+    /// A blob containing compressed service Wasm bytecode.
     ServiceBytecode,
+    /// A blob containing compressed EVM bytecode.
+    EvmBytecode,
+    /// A blob containing an application description.
+    ApplicationDescription,
+    /// A blob containing a committee of validators.
+    Committee,
+    /// A blob containing a chain description.
+    ChainDescription,
 }
 
-impl Display for BlobType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match serde_json::to_string(self) {
-            Ok(s) => write!(f, "{}", s),
-            Err(_) => Err(fmt::Error),
+impl BlobType {
+    /// Returns whether the blob is of [`BlobType::Committee`] variant.
+    pub fn is_committee_blob(&self) -> bool {
+        match self {
+            BlobType::Data
+            | BlobType::ContractBytecode
+            | BlobType::ServiceBytecode
+            | BlobType::EvmBytecode
+            | BlobType::ApplicationDescription
+            | BlobType::ChainDescription => false,
+            BlobType::Committee => true,
         }
     }
 }
 
-impl FromStr for BlobType {
+impl fmt::Display for BlobType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::str::FromStr for BlobType {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(s).with_context(|| format!("Invalid BlobType: {}", s))
+        serde_json::from_str(&format!("\"{s}\""))
+            .with_context(|| format!("Invalid BlobType: {}", s))
     }
 }
 
@@ -199,14 +216,14 @@ impl BlobId {
     }
 }
 
-impl Display for BlobId {
+impl fmt::Display for BlobId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.blob_type, self.hash)?;
         Ok(())
     }
 }
 
-impl FromStr for BlobId {
+impl std::str::FromStr for BlobId {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -288,19 +305,16 @@ pub struct MessageId {
     pub index: u32,
 }
 
-/// A unique identifier for a user application.
+/// A unique identifier for a user application from a blob.
 #[derive(Debug, WitLoad, WitStore, WitType)]
 #[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
 pub struct ApplicationId<A = ()> {
-    /// The bytecode to use for the application.
-    pub bytecode_id: BytecodeId<A>,
-    /// The unique ID of the application's creation.
-    pub creation: MessageId,
+    /// The hash of the `ApplicationDescription` this refers to.
+    pub application_description_hash: CryptoHash,
+    #[witty(skip)]
+    #[debug(skip)]
+    _phantom: PhantomData<A>,
 }
-
-/// Alias for `ApplicationId`. Use this alias in the core
-/// protocol where the distinction with the more general enum `GenericApplicationId` matters.
-pub type UserApplicationId<A = ()> = ApplicationId<A>;
 
 /// A unique identifier for an application.
 #[derive(
@@ -325,6 +339,33 @@ pub enum GenericApplicationId {
     User(ApplicationId),
 }
 
+impl fmt::Display for GenericApplicationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GenericApplicationId::System => Display::fmt("System", f),
+            GenericApplicationId::User(application_id) => {
+                Display::fmt("User:", f)?;
+                Display::fmt(&application_id, f)
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for GenericApplicationId {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "System" {
+            return Ok(GenericApplicationId::System);
+        }
+        if let Some(result) = s.strip_prefix("User:") {
+            let application_id = ApplicationId::from_str(result)?;
+            return Ok(GenericApplicationId::User(application_id));
+        }
+        Err(anyhow!("Invalid parsing of GenericApplicationId"))
+    }
+}
+
 impl GenericApplicationId {
     /// Returns the `ApplicationId`, or `None` if it is `System`.
     pub fn user_application_id(&self) -> Option<&ApplicationId> {
@@ -336,45 +377,60 @@ impl GenericApplicationId {
     }
 }
 
-impl From<ApplicationId> for GenericApplicationId {
-    fn from(user_application_id: ApplicationId) -> Self {
-        GenericApplicationId::User(user_application_id)
+impl<A> From<ApplicationId<A>> for AccountOwner {
+    fn from(app_id: ApplicationId<A>) -> Self {
+        AccountOwner::Address32(app_id.application_description_hash)
     }
 }
 
-/// A unique identifier for an application bytecode.
+impl From<AccountPublicKey> for AccountOwner {
+    fn from(public_key: AccountPublicKey) -> Self {
+        match public_key {
+            AccountPublicKey::Ed25519(public_key) => public_key.into(),
+            AccountPublicKey::Secp256k1(public_key) => public_key.into(),
+            AccountPublicKey::EvmSecp256k1(public_key) => public_key.into(),
+        }
+    }
+}
+
+impl From<ApplicationId> for GenericApplicationId {
+    fn from(application_id: ApplicationId) -> Self {
+        GenericApplicationId::User(application_id)
+    }
+}
+
+impl From<Secp256k1PublicKey> for AccountOwner {
+    fn from(public_key: Secp256k1PublicKey) -> Self {
+        AccountOwner::Address32(CryptoHash::new(&public_key))
+    }
+}
+
+impl From<Ed25519PublicKey> for AccountOwner {
+    fn from(public_key: Ed25519PublicKey) -> Self {
+        AccountOwner::Address32(CryptoHash::new(&public_key))
+    }
+}
+
+impl From<EvmPublicKey> for AccountOwner {
+    fn from(public_key: EvmPublicKey) -> Self {
+        AccountOwner::Address20(alloy_primitives::Address::from_public_key(&public_key.0).into())
+    }
+}
+
+/// A unique identifier for a module.
 #[derive(Debug, WitLoad, WitStore, WitType)]
 #[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
-pub struct BytecodeId<Abi = (), Parameters = (), InstantiationArgument = ()> {
+pub struct ModuleId<Abi = (), Parameters = (), InstantiationArgument = ()> {
     /// The hash of the blob containing the contract bytecode.
     pub contract_blob_hash: CryptoHash,
     /// The hash of the blob containing the service bytecode.
     pub service_blob_hash: CryptoHash,
+    /// The virtual machine being used.
+    pub vm_runtime: VmRuntime,
     #[witty(skip)]
     #[debug(skip)]
     _phantom: PhantomData<(Abi, Parameters, InstantiationArgument)>,
 }
-
-/// The name of a subscription channel.
-#[derive(
-    Clone,
-    Debug,
-    Eq,
-    Hash,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-    Deserialize,
-    WitLoad,
-    WitStore,
-    WitType,
-)]
-pub struct ChannelName(
-    #[serde(with = "serde_bytes")]
-    #[debug(with = "hex_debug")]
-    Vec<u8>,
-);
 
 /// The name of an event stream.
 #[derive(
@@ -397,6 +453,30 @@ pub struct StreamName(
     pub Vec<u8>,
 );
 
+impl<T> From<T> for StreamName
+where
+    T: Into<Vec<u8>>,
+{
+    fn from(name: T) -> Self {
+        StreamName(name.into())
+    }
+}
+
+impl fmt::Display for StreamName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&hex::encode(&self.0), f)
+    }
+}
+
+impl std::str::FromStr for StreamName {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let vec = hex::decode(s)?;
+        Ok(StreamName(vec))
+    }
+}
+
 /// An event stream ID.
 #[derive(
     Clone,
@@ -412,7 +492,9 @@ pub struct StreamName(
     WitStore,
     WitType,
     SimpleObject,
+    InputObject,
 )]
+#[graphql(input_name = "StreamIdInput")]
 pub struct StreamId {
     /// The application that can add events to this stream.
     pub application_id: GenericApplicationId,
@@ -420,64 +502,87 @@ pub struct StreamId {
     pub stream_name: StreamName,
 }
 
-/// The destination of a message, relative to a particular application.
+impl StreamId {
+    /// Creates a system stream ID with the given name.
+    pub fn system(name: impl Into<StreamName>) -> Self {
+        StreamId {
+            application_id: GenericApplicationId::System,
+            stream_name: name.into(),
+        }
+    }
+}
+
+/// The result of an `events_from_index`.
 #[derive(
-    Clone,
     Debug,
     Eq,
-    Hash,
-    Ord,
     PartialEq,
+    Ord,
     PartialOrd,
+    Clone,
+    Hash,
     Serialize,
     Deserialize,
     WitLoad,
     WitStore,
     WitType,
+    SimpleObject,
 )]
-pub enum Destination {
-    /// Direct message to a chain.
-    Recipient(ChainId),
-    /// Broadcast to the current subscribers of our channel.
-    Subscribers(ChannelName),
+pub struct IndexAndEvent {
+    /// The index of the found event.
+    pub index: u32,
+    /// The event being returned.
+    pub event: Vec<u8>,
 }
 
-impl Destination {
-    /// Whether the destination is a broadcast channel.
-    pub fn is_channel(&self) -> bool {
-        matches!(self, Destination::Subscribers(_))
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.application_id, f)?;
+        Display::fmt(":", f)?;
+        Display::fmt(&self.stream_name, f)
     }
 }
 
-impl From<ChainId> for Destination {
-    fn from(chain_id: ChainId) -> Self {
-        Destination::Recipient(chain_id)
+impl std::str::FromStr for StreamId {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts = s.rsplit_once(":");
+        if let Some((part0, part1)) = parts {
+            let application_id =
+                GenericApplicationId::from_str(part0).context("Invalid GenericApplicationId!")?;
+            let stream_name = StreamName::from_str(part1).context("Invalid StreamName!")?;
+            Ok(StreamId {
+                application_id,
+                stream_name,
+            })
+        } else {
+            Err(anyhow!("Invalid blob ID: {}", s))
+        }
     }
 }
 
-impl From<ChannelName> for Destination {
-    fn from(channel_name: ChannelName) -> Self {
-        Destination::Subscribers(channel_name)
-    }
-}
-
-impl AsRef<[u8]> for ChannelName {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl From<Vec<u8>> for ChannelName {
-    fn from(name: Vec<u8>) -> Self {
-        ChannelName(name)
-    }
-}
-
-impl ChannelName {
-    /// Turns the channel name into bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
-    }
+/// An event identifier.
+#[derive(
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Clone,
+    Serialize,
+    Deserialize,
+    WitLoad,
+    WitStore,
+    WitType,
+    SimpleObject,
+)]
+pub struct EventId {
+    /// The ID of the chain that generated this event.
+    pub chain_id: ChainId,
+    /// The ID of the stream this event belongs to.
+    pub stream_id: StreamId,
+    /// The event index, i.e. the number of events in the stream before this one.
+    pub index: u32,
 }
 
 impl StreamName {
@@ -489,7 +594,7 @@ impl StreamName {
 
 // Cannot use #[derive(Clone)] because it requires `A: Clone`.
 impl<Abi, Parameters, InstantiationArgument> Clone
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn clone(&self) -> Self {
         *self
@@ -497,31 +602,33 @@ impl<Abi, Parameters, InstantiationArgument> Clone
 }
 
 impl<Abi, Parameters, InstantiationArgument> Copy
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
 }
 
 impl<Abi, Parameters, InstantiationArgument> PartialEq
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn eq(&self, other: &Self) -> bool {
-        let BytecodeId {
+        let ModuleId {
             contract_blob_hash,
             service_blob_hash,
+            vm_runtime,
             _phantom,
         } = other;
         self.contract_blob_hash == *contract_blob_hash
             && self.service_blob_hash == *service_blob_hash
+            && self.vm_runtime == *vm_runtime
     }
 }
 
 impl<Abi, Parameters, InstantiationArgument> Eq
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
 }
 
 impl<Abi, Parameters, InstantiationArgument> PartialOrd
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -529,63 +636,72 @@ impl<Abi, Parameters, InstantiationArgument> PartialOrd
 }
 
 impl<Abi, Parameters, InstantiationArgument> Ord
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let BytecodeId {
+        let ModuleId {
             contract_blob_hash,
             service_blob_hash,
+            vm_runtime,
             _phantom,
         } = other;
-        (self.contract_blob_hash, self.service_blob_hash)
-            .cmp(&(*contract_blob_hash, *service_blob_hash))
+        (
+            self.contract_blob_hash,
+            self.service_blob_hash,
+            self.vm_runtime,
+        )
+            .cmp(&(*contract_blob_hash, *service_blob_hash, *vm_runtime))
     }
 }
 
 impl<Abi, Parameters, InstantiationArgument> Hash
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let BytecodeId {
+        let ModuleId {
             contract_blob_hash: contract_blob_id,
             service_blob_hash: service_blob_id,
+            vm_runtime: vm_runtime_id,
             _phantom,
         } = self;
         contract_blob_id.hash(state);
         service_blob_id.hash(state);
+        vm_runtime_id.hash(state);
     }
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename = "BytecodeId")]
-struct SerializableBytecodeId {
+#[serde(rename = "ModuleId")]
+struct SerializableModuleId {
     contract_blob_hash: CryptoHash,
     service_blob_hash: CryptoHash,
+    vm_runtime: VmRuntime,
 }
 
 impl<Abi, Parameters, InstantiationArgument> Serialize
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::ser::Serializer,
     {
-        let serializable_bytecode_id = SerializableBytecodeId {
+        let serializable_module_id = SerializableModuleId {
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
+            vm_runtime: self.vm_runtime,
         };
         if serializer.is_human_readable() {
             let bytes =
-                bcs::to_bytes(&serializable_bytecode_id).map_err(serde::ser::Error::custom)?;
+                bcs::to_bytes(&serializable_module_id).map_err(serde::ser::Error::custom)?;
             serializer.serialize_str(&hex::encode(bytes))
         } else {
-            SerializableBytecodeId::serialize(&serializable_bytecode_id, serializer)
+            SerializableModuleId::serialize(&serializable_module_id, serializer)
         }
     }
 }
 
 impl<'de, Abi, Parameters, InstantiationArgument> Deserialize<'de>
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -593,62 +709,89 @@ impl<'de, Abi, Parameters, InstantiationArgument> Deserialize<'de>
     {
         if deserializer.is_human_readable() {
             let s = String::deserialize(deserializer)?;
-            let bytecode_id_bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
-            let serializable_bytecode_id: SerializableBytecodeId =
-                bcs::from_bytes(&bytecode_id_bytes).map_err(serde::de::Error::custom)?;
-            Ok(BytecodeId {
-                contract_blob_hash: serializable_bytecode_id.contract_blob_hash,
-                service_blob_hash: serializable_bytecode_id.service_blob_hash,
+            let module_id_bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+            let serializable_module_id: SerializableModuleId =
+                bcs::from_bytes(&module_id_bytes).map_err(serde::de::Error::custom)?;
+            Ok(ModuleId {
+                contract_blob_hash: serializable_module_id.contract_blob_hash,
+                service_blob_hash: serializable_module_id.service_blob_hash,
+                vm_runtime: serializable_module_id.vm_runtime,
                 _phantom: PhantomData,
             })
         } else {
-            let serializable_bytecode_id = SerializableBytecodeId::deserialize(deserializer)?;
-            Ok(BytecodeId {
-                contract_blob_hash: serializable_bytecode_id.contract_blob_hash,
-                service_blob_hash: serializable_bytecode_id.service_blob_hash,
+            let serializable_module_id = SerializableModuleId::deserialize(deserializer)?;
+            Ok(ModuleId {
+                contract_blob_hash: serializable_module_id.contract_blob_hash,
+                service_blob_hash: serializable_module_id.service_blob_hash,
+                vm_runtime: serializable_module_id.vm_runtime,
                 _phantom: PhantomData,
             })
         }
     }
 }
 
-impl BytecodeId {
-    /// Creates a bytecode ID from contract/service hashes.
-    pub fn new(contract_blob_hash: CryptoHash, service_blob_hash: CryptoHash) -> Self {
-        BytecodeId {
+impl ModuleId {
+    /// Creates a module ID from contract/service hashes and the VM runtime to use.
+    pub fn new(
+        contract_blob_hash: CryptoHash,
+        service_blob_hash: CryptoHash,
+        vm_runtime: VmRuntime,
+    ) -> Self {
+        ModuleId {
             contract_blob_hash,
             service_blob_hash,
+            vm_runtime,
             _phantom: PhantomData,
         }
     }
 
-    /// Specializes a bytecode ID for a given ABI.
+    /// Specializes a module ID for a given ABI.
     pub fn with_abi<Abi, Parameters, InstantiationArgument>(
         self,
-    ) -> BytecodeId<Abi, Parameters, InstantiationArgument> {
-        BytecodeId {
+    ) -> ModuleId<Abi, Parameters, InstantiationArgument> {
+        ModuleId {
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
+            vm_runtime: self.vm_runtime,
             _phantom: PhantomData,
+        }
+    }
+
+    /// Gets the `BlobId` of the contract
+    pub fn contract_bytecode_blob_id(&self) -> BlobId {
+        match self.vm_runtime {
+            VmRuntime::Wasm => BlobId::new(self.contract_blob_hash, BlobType::ContractBytecode),
+            VmRuntime::Evm => BlobId::new(self.contract_blob_hash, BlobType::EvmBytecode),
+        }
+    }
+
+    /// Gets the `BlobId` of the service
+    pub fn service_bytecode_blob_id(&self) -> BlobId {
+        match self.vm_runtime {
+            VmRuntime::Wasm => BlobId::new(self.service_blob_hash, BlobType::ServiceBytecode),
+            VmRuntime::Evm => BlobId::new(self.contract_blob_hash, BlobType::EvmBytecode),
+        }
+    }
+
+    /// Gets all bytecode `BlobId`s of the module
+    pub fn bytecode_blob_ids(&self) -> Vec<BlobId> {
+        match self.vm_runtime {
+            VmRuntime::Wasm => vec![
+                BlobId::new(self.contract_blob_hash, BlobType::ContractBytecode),
+                BlobId::new(self.service_blob_hash, BlobType::ServiceBytecode),
+            ],
+            VmRuntime::Evm => vec![BlobId::new(self.contract_blob_hash, BlobType::EvmBytecode)],
         }
     }
 }
 
-impl<Abi, Parameters, InstantiationArgument> BytecodeId<Abi, Parameters, InstantiationArgument> {
-    /// Forgets the ABI of a bytecode ID (if any).
-    pub fn forget_abi(self) -> BytecodeId {
-        BytecodeId {
+impl<Abi, Parameters, InstantiationArgument> ModuleId<Abi, Parameters, InstantiationArgument> {
+    /// Forgets the ABI of a module ID (if any).
+    pub fn forget_abi(self) -> ModuleId {
+        ModuleId {
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Leaves just the ABI of a bytecode ID (if any).
-    pub fn just_abi(self) -> BytecodeId<Abi> {
-        BytecodeId {
-            contract_blob_hash: self.contract_blob_hash,
-            service_blob_hash: self.service_blob_hash,
+            vm_runtime: self.vm_runtime,
             _phantom: PhantomData,
         }
     }
@@ -665,11 +808,7 @@ impl<A> Copy for ApplicationId<A> {}
 
 impl<A: PartialEq> PartialEq for ApplicationId<A> {
     fn eq(&self, other: &Self) -> bool {
-        let ApplicationId {
-            bytecode_id,
-            creation,
-        } = other;
-        self.bytecode_id == *bytecode_id && self.creation == *creation
+        self.application_description_hash == other.application_description_hash
     }
 }
 
@@ -677,46 +816,28 @@ impl<A: Eq> Eq for ApplicationId<A> {}
 
 impl<A: PartialOrd> PartialOrd for ApplicationId<A> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        let ApplicationId {
-            bytecode_id,
-            creation,
-        } = other;
-        match self.bytecode_id.partial_cmp(bytecode_id) {
-            Some(std::cmp::Ordering::Equal) => self.creation.partial_cmp(creation),
-            result => result,
-        }
+        self.application_description_hash
+            .partial_cmp(&other.application_description_hash)
     }
 }
 
 impl<A: Ord> Ord for ApplicationId<A> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let ApplicationId {
-            bytecode_id,
-            creation,
-        } = other;
-        match self.bytecode_id.cmp(bytecode_id) {
-            std::cmp::Ordering::Equal => self.creation.cmp(creation),
-            result => result,
-        }
+        self.application_description_hash
+            .cmp(&other.application_description_hash)
     }
 }
 
 impl<A> Hash for ApplicationId<A> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let ApplicationId {
-            bytecode_id,
-            creation,
-        } = self;
-        bytecode_id.hash(state);
-        creation.hash(state);
+        self.application_description_hash.hash(state);
     }
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename = "ApplicationId")]
 struct SerializableApplicationId {
-    pub bytecode_id: BytecodeId,
-    pub creation: MessageId,
+    pub application_description_hash: CryptoHash,
 }
 
 impl<A> Serialize for ApplicationId<A> {
@@ -726,16 +847,14 @@ impl<A> Serialize for ApplicationId<A> {
     {
         if serializer.is_human_readable() {
             let bytes = bcs::to_bytes(&SerializableApplicationId {
-                bytecode_id: self.bytecode_id.forget_abi(),
-                creation: self.creation,
+                application_description_hash: self.application_description_hash,
             })
             .map_err(serde::ser::Error::custom)?;
             serializer.serialize_str(&hex::encode(bytes))
         } else {
             SerializableApplicationId::serialize(
                 &SerializableApplicationId {
-                    bytecode_id: self.bytecode_id.forget_abi(),
-                    creation: self.creation,
+                    application_description_hash: self.application_description_hash,
                 },
                 serializer,
             )
@@ -754,114 +873,77 @@ impl<'de, A> Deserialize<'de> for ApplicationId<A> {
             let application_id: SerializableApplicationId =
                 bcs::from_bytes(&application_id_bytes).map_err(serde::de::Error::custom)?;
             Ok(ApplicationId {
-                bytecode_id: application_id.bytecode_id.with_abi(),
-                creation: application_id.creation,
+                application_description_hash: application_id.application_description_hash,
+                _phantom: PhantomData,
             })
         } else {
             let value = SerializableApplicationId::deserialize(deserializer)?;
             Ok(ApplicationId {
-                bytecode_id: value.bytecode_id.with_abi(),
-                creation: value.creation,
+                application_description_hash: value.application_description_hash,
+                _phantom: PhantomData,
             })
         }
     }
 }
 
 impl ApplicationId {
+    /// Creates an application ID from the application description hash.
+    pub fn new(application_description_hash: CryptoHash) -> Self {
+        ApplicationId {
+            application_description_hash,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Converts the application ID to the ID of the blob containing the
+    /// `ApplicationDescription`.
+    pub fn description_blob_id(self) -> BlobId {
+        BlobId::new(
+            self.application_description_hash,
+            BlobType::ApplicationDescription,
+        )
+    }
+
     /// Specializes an application ID for a given ABI.
     pub fn with_abi<A>(self) -> ApplicationId<A> {
         ApplicationId {
-            bytecode_id: self.bytecode_id.with_abi(),
-            creation: self.creation,
+            application_description_hash: self.application_description_hash,
+            _phantom: PhantomData,
         }
     }
 }
 
 impl<A> ApplicationId<A> {
-    /// Forgets the ABI of a bytecode ID (if any).
+    /// Forgets the ABI of an application ID (if any).
     pub fn forget_abi(self) -> ApplicationId {
         ApplicationId {
-            bytecode_id: self.bytecode_id.forget_abi(),
-            creation: self.creation,
+            application_description_hash: self.application_description_hash,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl Display for Owner {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.0, f)
-    }
-}
-
-impl From<PublicKey> for Owner {
-    fn from(value: PublicKey) -> Self {
-        Self(CryptoHash::new(&value))
-    }
-}
-
-impl From<&PublicKey> for Owner {
-    fn from(value: &PublicKey) -> Self {
-        Self(CryptoHash::new(value))
-    }
-}
-
-impl std::str::FromStr for Owner {
-    type Err = CryptoError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Owner(CryptoHash::from_str(s)?))
-    }
-}
-
-impl Serialize for Owner {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        if serializer.is_human_readable() {
-            serializer.serialize_str(&self.to_string())
-        } else {
-            serializer.serialize_newtype_struct("Owner", &self.0)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Owner {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        if deserializer.is_human_readable() {
-            let string = String::deserialize(deserializer)?;
-            Self::from_str(&string).map_err(serde::de::Error::custom)
-        } else {
-            deserializer.deserialize_newtype_struct("Owner", OwnerVisitor)
-        }
-    }
-}
-
-struct OwnerVisitor;
-
-impl<'de> serde::de::Visitor<'de> for OwnerVisitor {
-    type Value = Owner;
-
-    fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
-        write!(formatter, "an owner represented as a `CryptoHash`")
+#[cfg(with_revm)]
+impl<A> ApplicationId<A> {
+    /// Converts the `ApplicationId` into an Ethereum Address.
+    pub fn evm_address(&self) -> Address {
+        let bytes = self.application_description_hash.as_bytes();
+        let bytes = bytes.0.as_ref();
+        Address::from_slice(&bytes[0..20])
     }
 
-    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Ok(Owner(CryptoHash::deserialize(deserializer)?))
+    /// Converts the `ApplicationId` into an Ethereum-compatible 32-byte array.
+    pub fn bytes32(&self) -> B256 {
+        *self.application_description_hash.as_bytes()
     }
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename = "AccountOwner")]
 enum SerializableAccountOwner {
-    User(Owner),
-    Application(ApplicationId),
+    Reserved(u8),
+    Address32(CryptoHash),
+    Address20([u8; 20]),
 }
 
 impl Serialize for AccountOwner {
@@ -870,8 +952,9 @@ impl Serialize for AccountOwner {
             serializer.serialize_str(&self.to_string())
         } else {
             match self {
-                AccountOwner::Application(app_id) => SerializableAccountOwner::Application(*app_id),
-                AccountOwner::User(owner) => SerializableAccountOwner::User(*owner),
+                AccountOwner::Reserved(value) => SerializableAccountOwner::Reserved(*value),
+                AccountOwner::Address32(value) => SerializableAccountOwner::Address32(*value),
+                AccountOwner::Address20(value) => SerializableAccountOwner::Address20(*value),
             }
             .serialize(serializer)
         }
@@ -887,60 +970,64 @@ impl<'de> Deserialize<'de> for AccountOwner {
         } else {
             let value = SerializableAccountOwner::deserialize(deserializer)?;
             match value {
-                SerializableAccountOwner::Application(app_id) => {
-                    Ok(AccountOwner::Application(app_id))
-                }
-                SerializableAccountOwner::User(owner) => Ok(AccountOwner::User(owner)),
+                SerializableAccountOwner::Reserved(value) => Ok(AccountOwner::Reserved(value)),
+                SerializableAccountOwner::Address32(value) => Ok(AccountOwner::Address32(value)),
+                SerializableAccountOwner::Address20(value) => Ok(AccountOwner::Address20(value)),
             }
         }
     }
 }
 
-impl Display for AccountOwner {
+impl fmt::Display for AccountOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AccountOwner::User(owner) => write!(f, "User:{}", owner)?,
-            AccountOwner::Application(app_id) => write!(f, "Application:{}", app_id)?,
+            AccountOwner::Reserved(value) => {
+                write!(f, "0x{}", hex::encode(&value.to_be_bytes()[..]))?
+            }
+            AccountOwner::Address32(value) => write!(f, "0x{}", value)?,
+            AccountOwner::Address20(value) => write!(f, "0x{}", hex::encode(&value[..]))?,
         };
 
         Ok(())
     }
 }
 
-impl FromStr for AccountOwner {
+impl std::str::FromStr for AccountOwner {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(owner) = s.strip_prefix("User:") {
-            Ok(AccountOwner::User(
-                Owner::from_str(owner).context("Getting Owner should not fail")?,
-            ))
-        } else if let Some(app_id) = s.strip_prefix("Application:") {
-            Ok(AccountOwner::Application(
-                ApplicationId::from_str(app_id).context("Getting ApplicationId should not fail")?,
-            ))
-        } else {
-            Err(anyhow!("Invalid enum! Enum: {}", s))
+        if let Some(s) = s.strip_prefix("0x") {
+            if s.len() == 64 {
+                if let Ok(hash) = CryptoHash::from_str(s) {
+                    return Ok(AccountOwner::Address32(hash));
+                }
+            } else if s.len() == 40 {
+                let address = hex::decode(s)?;
+                if address.len() != 20 {
+                    anyhow::bail!("Invalid address length: {}", s);
+                }
+                let address = <[u8; 20]>::try_from(address.as_slice()).unwrap();
+                return Ok(AccountOwner::Address20(address));
+            }
+            if s.len() == 2 {
+                let bytes = hex::decode(s)?;
+                if bytes.len() == 1 {
+                    let value = u8::from_be_bytes(bytes.try_into().expect("one byte"));
+                    return Ok(AccountOwner::Reserved(value));
+                }
+            }
         }
+        anyhow::bail!("Invalid address value: {}", s);
     }
 }
 
-impl<T> From<T> for AccountOwner
-where
-    T: Into<Owner>,
-{
-    fn from(owner: T) -> Self {
-        AccountOwner::User(owner.into())
-    }
-}
-
-impl Display for ChainId {
+impl fmt::Display for ChainId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Display::fmt(&self.0, f)
     }
 }
 
-impl FromStr for ChainId {
+impl std::str::FromStr for ChainId {
     type Err = CryptoError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -962,54 +1049,37 @@ impl fmt::Debug for ChainId {
     }
 }
 
+impl<'a> From<&'a ChainDescription> for ChainId {
+    fn from(description: &'a ChainDescription) -> Self {
+        Self(CryptoHash::new(&BlobContent::new_chain_description(
+            description,
+        )))
+    }
+}
+
 impl From<ChainDescription> for ChainId {
     fn from(description: ChainDescription) -> Self {
-        Self(CryptoHash::new(&description))
+        From::from(&description)
     }
 }
-
-impl ChainId {
-    /// The chain ID representing the N-th chain created at genesis time.
-    pub fn root(index: u32) -> Self {
-        Self(CryptoHash::new(&ChainDescription::Root(index)))
-    }
-
-    /// The chain ID representing the chain created by the given message.
-    pub fn child(id: MessageId) -> Self {
-        Self(CryptoHash::new(&ChainDescription::Child(id)))
-    }
-}
-
-impl<'de> BcsHashable<'de> for ChainDescription {}
 
 bcs_scalar!(ApplicationId, "A unique identifier for a user application");
 doc_scalar!(
     GenericApplicationId,
     "A unique identifier for a user application or for the system application"
 );
-bcs_scalar!(
-    BytecodeId,
-    "A unique identifier for an application bytecode"
-);
-doc_scalar!(ChainDescription, "How to create a chain");
+bcs_scalar!(ModuleId, "A unique identifier for an application module");
 doc_scalar!(
     ChainId,
     "The unique identifier (UID) of a chain. This is currently computed as the hash value of a \
     ChainDescription."
 );
-doc_scalar!(ChannelName, "The name of a subscription channel");
 doc_scalar!(StreamName, "The name of an event stream");
 bcs_scalar!(MessageId, "The index of a message in a chain");
 doc_scalar!(
-    Owner,
-    "The owner of a chain. This is currently the hash of the owner's public key used to verify \
-    signatures."
+    AccountOwner,
+    "A unique identifier for a user or an application."
 );
-doc_scalar!(
-    Destination,
-    "The destination of a message, relative to a particular application."
-);
-doc_scalar!(AccountOwner, "An owner of an account.");
 doc_scalar!(Account, "An account");
 doc_scalar!(
     BlobId,
@@ -1018,23 +1088,115 @@ doc_scalar!(
 
 #[cfg(test)]
 mod tests {
-    use super::ChainId;
+    use std::str::FromStr as _;
 
-    /// Verifies that chain IDs that are explicitly used in some example and test scripts don't
-    /// change.
+    use assert_matches::assert_matches;
+
+    use super::{AccountOwner, BlobType};
+    use crate::{
+        data_types::{Amount, ChainDescription, ChainOrigin, Epoch, InitialChainConfig, Timestamp},
+        identifiers::{ApplicationId, CryptoHash, GenericApplicationId, StreamId, StreamName},
+        ownership::ChainOwnership,
+    };
+
+    /// Verifies that the way of computing chain IDs doesn't change.
     #[test]
-    fn chain_ids() {
-        assert_eq!(
-            &ChainId::root(0).to_string(),
-            "e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65"
+    fn chain_id_computing() {
+        let example_chain_origin = ChainOrigin::Root(0);
+        let example_chain_config = InitialChainConfig {
+            epoch: Epoch::ZERO,
+            ownership: ChainOwnership::single(AccountOwner::Reserved(0)),
+            balance: Amount::ZERO,
+            committees: [(Epoch::ZERO, vec![])].into_iter().collect(),
+            application_permissions: Default::default(),
+        };
+        let description = ChainDescription::new(
+            example_chain_origin,
+            example_chain_config,
+            Timestamp::from(0),
         );
         assert_eq!(
-            &ChainId::root(9).to_string(),
-            "256e1dbc00482ddd619c293cc0df94d366afe7980022bb22d99e33036fd465dd"
+            description.id().to_string(),
+            "4423610c1010c31be88bc6cc041a9c1063d58062e9d748c1552a1e75e7ea13a9"
         );
+    }
+
+    #[test]
+    fn blob_types() {
+        assert_eq!("ContractBytecode", BlobType::ContractBytecode.to_string());
         assert_eq!(
-            &ChainId::root(999).to_string(),
-            "9c8a838e8f7b63194f6c7585455667a8379d2b5db19a3300e9961f0b1e9091ea"
+            BlobType::ContractBytecode,
+            BlobType::from_str("ContractBytecode").unwrap()
         );
+    }
+
+    #[test]
+    fn addresses() {
+        assert_eq!(&AccountOwner::Reserved(0).to_string(), "0x00");
+
+        let address = AccountOwner::from_str("0x10").unwrap();
+        assert_eq!(address, AccountOwner::Reserved(16));
+        assert_eq!(address.to_string(), "0x10");
+
+        let address = AccountOwner::from_str(
+            "0x5487b70625ce71f7ee29154ad32aefa1c526cb483bdb783dea2e1d17bc497844",
+        )
+        .unwrap();
+        assert_matches!(address, AccountOwner::Address32(_));
+        assert_eq!(
+            address.to_string(),
+            "0x5487b70625ce71f7ee29154ad32aefa1c526cb483bdb783dea2e1d17bc497844"
+        );
+
+        let address = AccountOwner::from_str("0x6E0ab7F37b667b7228D3a03116Ca21Be83213823").unwrap();
+        assert_matches!(address, AccountOwner::Address20(_));
+        assert_eq!(
+            address.to_string(),
+            "0x6e0ab7f37b667b7228d3a03116ca21be83213823"
+        );
+
+        assert!(AccountOwner::from_str("0x5487b7").is_err());
+        assert!(AccountOwner::from_str("0").is_err());
+        assert!(AccountOwner::from_str(
+            "5487b70625ce71f7ee29154ad32aefa1c526cb483bdb783dea2e1d17bc497844"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stream_name() {
+        let vec = vec![32, 54, 120, 234];
+        let stream_name1 = StreamName(vec);
+        let stream_name2 = StreamName::from_str(&format!("{stream_name1}")).unwrap();
+        assert_eq!(stream_name1, stream_name2);
+    }
+
+    fn test_generic_application_id(application_id: GenericApplicationId) {
+        let application_id2 = GenericApplicationId::from_str(&format!("{application_id}")).unwrap();
+        assert_eq!(application_id, application_id2);
+    }
+
+    #[test]
+    fn generic_application_id() {
+        test_generic_application_id(GenericApplicationId::System);
+        let hash = CryptoHash::test_hash("test case");
+        let application_id = ApplicationId::new(hash);
+        test_generic_application_id(GenericApplicationId::User(application_id));
+    }
+
+    #[test]
+    fn stream_id() {
+        let hash = CryptoHash::test_hash("test case");
+        let application_id = ApplicationId::new(hash);
+        let application_id = GenericApplicationId::User(application_id);
+        let vec = vec![32, 54, 120, 234];
+        let stream_name = StreamName(vec);
+
+        let stream_id1 = StreamId {
+            application_id,
+            stream_name,
+        };
+        let stream_id2 = StreamId::from_str(&format!("{stream_id1}")).unwrap();
+        assert_eq!(stream_id1, stream_id2);
     }
 }

@@ -3,7 +3,7 @@
 
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-use linera_sdk::{base::WithContractAbi, Contract, ContractRuntime};
+use linera_sdk::{linera_base_types::WithContractAbi, Contract, ContractRuntime};
 
 pub struct LlmContract;
 
@@ -17,6 +17,7 @@ impl Contract for LlmContract {
     type Message = ();
     type InstantiationArgument = ();
     type Parameters = ();
+    type EventValue = ();
 
     async fn load(_runtime: ContractRuntime<Self>) -> Self {
         LlmContract

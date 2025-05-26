@@ -1,7 +1,7 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Command functionality used for spanning child processes.
+//! Command functionality used for spawning child processes.
 
 use std::{
     path::{Path, PathBuf},
@@ -114,7 +114,7 @@ pub fn parse_version_message(message: &str) -> String {
         .unwrap_or_default()
         .trim()
         .split(' ')
-        .last()
+        .next_back()
         .expect("splitting strings gives non-empty lists")
         .to_string()
 }
@@ -163,9 +163,10 @@ impl CommandExt for tokio::process::Command {
             .with_context(|| self.description())?;
         ensure!(
             output.status.success(),
-            "{}: got non-zero error code {}",
+            "{}: got non-zero error code {}. Stderr: \n{:?}\n",
             self.description(),
-            output.status
+            output.status,
+            String::from_utf8(output.stderr),
         );
         String::from_utf8(output.stdout).with_context(|| self.description())
     }

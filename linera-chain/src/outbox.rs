@@ -3,10 +3,10 @@
 
 use linera_base::data_types::{ArithmeticError, BlockHeight};
 #[cfg(with_testing)]
-use linera_views::context::{create_test_memory_context, MemoryContext};
+use linera_views::context::MemoryContext;
 use linera_views::{
+    bucket_queue_view::BucketQueueView,
     context::Context,
-    queue_view::QueueView,
     register_view::RegisterView,
     views::{ClonableView, View, ViewError},
 };
@@ -15,14 +15,38 @@ use linera_views::{
 #[path = "unit_tests/outbox_tests.rs"]
 mod outbox_tests;
 
+#[cfg(with_metrics)]
+mod metrics {
+    use std::sync::LazyLock;
+
+    use linera_base::prometheus_util::{exponential_bucket_interval, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    pub static OUTBOX_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "outbox_size",
+            "Outbox size",
+            &[],
+            exponential_bucket_interval(1.0, 10_000.0),
+        )
+    });
+}
+
+// The number of block heights in a bucket
+// The `BlockHeight` has just 8 bytes so the size is constant.
+// This means that by choosing a size of 1000, we have a
+// reasonable size that will not create any memory issues.
+const BLOCK_HEIGHT_BUCKET_SIZE: usize = 1000;
+
 /// The state of an outbox
 /// * An outbox is used to send messages to another chain.
 /// * Internally, this is implemented as a FIFO queue of (increasing) block heights.
 ///   Messages are contained in blocks, together with destination information, so currently
 ///   we just send the certified blocks over and let the receivers figure out what were the
 ///   messages for them.
-/// * When marking block heights as received, messages at lower heights are also marked (ie. dequeued).
-#[derive(Debug, ClonableView, View, async_graphql::SimpleObject)]
+/// * When marking block heights as received, messages at lower heights are also marked (i.e. dequeued).
+#[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
+#[derive(Debug, ClonableView, View)]
 pub struct OutboxStateView<C>
 where
     C: Context + Send + Sync + 'static,
@@ -31,7 +55,7 @@ where
     pub next_height_to_schedule: RegisterView<C, BlockHeight>,
     /// Keep sending these certified blocks of ours until they are acknowledged by
     /// receivers.
-    pub queue: QueueView<C, BlockHeight>,
+    pub queue: BucketQueueView<C, BlockHeight, BLOCK_HEIGHT_BUCKET_SIZE>,
 }
 
 impl<C> OutboxStateView<C>
@@ -49,6 +73,10 @@ where
         }
         self.next_height_to_schedule.set(height.try_add_one()?);
         self.queue.push_back(height);
+        #[cfg(with_metrics)]
+        metrics::OUTBOX_SIZE
+            .with_label_values(&[])
+            .observe(self.queue.count() as f64);
         Ok(true)
     }
 
@@ -59,13 +87,17 @@ where
         height: BlockHeight,
     ) -> Result<Vec<BlockHeight>, ViewError> {
         let mut updates = Vec::new();
-        while let Some(h) = self.queue.front().await? {
+        while let Some(h) = self.queue.front().cloned() {
             if h > height {
                 break;
             }
-            self.queue.delete_front();
+            self.queue.delete_front().await?;
             updates.push(h);
         }
+        #[cfg(with_metrics)]
+        metrics::OUTBOX_SIZE
+            .with_label_values(&[])
+            .observe(self.queue.count() as f64);
         Ok(updates)
     }
 }
@@ -76,7 +108,7 @@ where
     MemoryContext<()>: Context + Clone + Send + Sync + 'static,
 {
     pub async fn new() -> Self {
-        let context = create_test_memory_context();
+        let context = MemoryContext::new_for_testing(());
         Self::load(context)
             .await
             .expect("Loading from memory should work")

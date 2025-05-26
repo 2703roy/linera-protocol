@@ -28,7 +28,7 @@ impl Template<C> {
 
     // Private functions are directly applied to the `Template` struct.
     async fn helper1(&self, ...) -> Result<.., IndexerError> {
-        // handle some thinfs on the `Template` struct
+        // handle some things on the `Template` struct
     }
 
     // Public functions are the ones accessible through the GraphQL server.
@@ -37,7 +37,7 @@ impl Template<C> {
     }
 
     pub async fn entrypoint2(&self, key: u32) -> Result<String, IndexerError> {
-        Ok(self.view1.get(&key).await?)
+        Ok(self.view2.get(&key).await?)
     }
 
     // Other functions are derived to fill the `linera_indexer::plugin::Plugin` trait.

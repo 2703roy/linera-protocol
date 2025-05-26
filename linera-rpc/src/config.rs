@@ -1,14 +1,17 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use linera_base::identifiers::ChainId;
-use linera_execution::committee::ValidatorName;
+use std::ffi::OsString;
+
+use clap::Parser;
+use linera_base::{crypto::ValidatorPublicKey, identifiers::ChainId};
 use serde::{Deserialize, Serialize};
 
 #[cfg(with_simple_network)]
 use crate::simple;
 
-#[derive(Clone, Debug, clap::Parser)]
+#[derive(Clone, Debug, Parser)]
+#[cfg_attr(with_testing, derive(PartialEq))]
 pub struct CrossChainConfig {
     /// Number of cross-chain messages allowed before dropping them.
     #[arg(long = "cross-chain-queue-size", default_value = "1000")]
@@ -29,13 +32,32 @@ pub struct CrossChainConfig {
     /// Drop cross-chain messages randomly at the given rate (0 <= rate < 1) (meant for testing).
     #[arg(long = "cross-chain-sender-failure-rate", default_value = "0.0")]
     pub(crate) sender_failure_rate: f32,
-
-    /// How many concurrent tasks to spawn for cross-chain message handling RPCs.
-    #[arg(long = "cross-chain-max-tasks", default_value = "10")]
-    pub(crate) max_concurrent_tasks: usize,
 }
 
-#[derive(Clone, Debug, clap::Parser)]
+impl Default for CrossChainConfig {
+    fn default() -> Self {
+        CrossChainConfig::parse_from::<[OsString; 1], OsString>(["".into()])
+    }
+}
+
+impl CrossChainConfig {
+    pub fn to_args(&self) -> Vec<String> {
+        vec![
+            "--cross-chain-queue-size".to_string(),
+            self.queue_size.to_string(),
+            "--cross-chain-max-retries".to_string(),
+            self.max_retries.to_string(),
+            "--cross-chain-retry-delay-ms".to_string(),
+            self.retry_delay_ms.to_string(),
+            "--cross-chain-sender-delay-ms".to_string(),
+            self.sender_delay_ms.to_string(),
+            "--cross-chain-sender-failure-rate".to_string(),
+            self.sender_failure_rate.to_string(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Parser)]
 pub struct NotificationConfig {
     /// Number of notifications allowed before blocking the main server loop
     #[arg(long = "notification-queue-size", default_value = "1000")]
@@ -47,12 +69,10 @@ pub type ShardId = usize;
 /// The network configuration of a shard.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardConfig {
-    /// The host name (e.g an IP address).
+    /// The host name (e.g., an IP address).
     pub host: String,
     /// The port.
     pub port: u16,
-    /// The host on which metrics are served.
-    pub metrics_host: String,
     /// The port on which metrics are served.
     pub metrics_port: Option<u16>,
 }
@@ -103,8 +123,8 @@ pub type ValidatorPublicNetworkConfig = ValidatorPublicNetworkPreConfig<NetworkP
 /// The network configuration for all shards.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorInternalNetworkPreConfig<P> {
-    /// The name of the validator.
-    pub name: ValidatorName,
+    /// The public key of the validator.
+    pub public_key: ValidatorPublicKey,
     /// The network protocol to use for all shards.
     pub protocol: P,
     /// The available shards. Each chain UID is mapped to a unique shard in the vector in
@@ -114,8 +134,10 @@ pub struct ValidatorInternalNetworkPreConfig<P> {
     pub host: String,
     /// The port the proxy listens on the internal network.
     pub port: u16,
-    /// The host name of the proxy's metrics endpoint.
-    pub metrics_host: String,
+    /// The server configurations for the linera-exporter.
+    /// They can be used as optional locations to forward notifications to destinations other than
+    /// the proxy, by the workers.
+    pub block_exporters: Vec<ExporterServiceConfig>,
     /// The port of the proxy's metrics endpoint.
     pub metrics_port: u16,
 }
@@ -123,12 +145,12 @@ pub struct ValidatorInternalNetworkPreConfig<P> {
 impl<P> ValidatorInternalNetworkPreConfig<P> {
     pub fn clone_with_protocol<Q>(&self, protocol: Q) -> ValidatorInternalNetworkPreConfig<Q> {
         ValidatorInternalNetworkPreConfig {
-            name: self.name,
+            public_key: self.public_key,
             protocol,
             shards: self.shards.clone(),
             host: self.host.clone(),
             port: self.port,
-            metrics_host: self.metrics_host.clone(),
+            block_exporters: self.block_exporters.clone(),
             metrics_port: self.metrics_port,
         }
     }
@@ -137,6 +159,15 @@ impl<P> ValidatorInternalNetworkPreConfig<P> {
 impl ValidatorInternalNetworkConfig {
     pub fn proxy_address(&self) -> String {
         format!("{}://{}:{}", self.protocol.scheme(), self.host, self.port)
+    }
+
+    pub fn exporter_addresses(&self) -> Vec<String> {
+        self.block_exporters
+            .iter()
+            .map(|ExporterServiceConfig { host, port }| {
+                format!("{}://{}:{}", self.protocol.scheme(), host, port)
+            })
+            .collect::<Vec<_>>()
     }
 }
 
@@ -235,7 +266,7 @@ impl<P> ValidatorInternalNetworkPreConfig<P> {
         use std::hash::{Hash, Hasher};
         let mut s = std::collections::hash_map::DefaultHasher::new();
         // Use the validator public key to randomise shard assignment.
-        self.name.hash(&mut s);
+        self.public_key.hash(&mut s);
         chain_id.hash(&mut s);
         (s.finish() as ShardId) % self.shards.len()
     }
@@ -248,4 +279,25 @@ impl<P> ValidatorInternalNetworkPreConfig<P> {
     pub fn get_shard_for(&self, chain_id: ChainId) -> &ShardConfig {
         self.shard(self.get_shard_id(chain_id))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The server configuration for the linera-exporter.
+pub struct ExporterServiceConfig {
+    /// The host name of the server (IP or hostname).
+    pub host: String,
+    /// The port for the server to listen on.
+    pub port: u16,
+}
+
+#[test]
+fn cross_chain_config_to_args() {
+    let config = CrossChainConfig::default();
+    let args = config.to_args();
+    let mut cmd = vec![String::new()];
+    cmd.extend(args.clone());
+    let config2 = CrossChainConfig::parse_from(cmd);
+    let args2 = config2.to_args();
+    assert_eq!(config, config2);
+    assert_eq!(args, args2);
 }

@@ -1,14 +1,13 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use linera_base::{
-    data_types::{Blob, BlockHeight, Bytecode},
-    identifiers::ApplicationId,
-};
+use linera_base::data_types::{Blob, BlockHeight, Bytecode};
+#[cfg(with_testing)]
+use linera_base::vm::VmRuntime;
 use linera_views::context::MemoryContext;
 
 use super::*;
-use crate::{ExecutionOutcome, ExecutionStateView, TestExecutionRuntimeContext};
+use crate::{test_utils::dummy_chain_description, ExecutionStateView, TestExecutionRuntimeContext};
 
 /// Returns an execution state view and a matching operation context, for epoch 1, with root
 /// chain 0 as the admin ID and one empty committee.
@@ -16,23 +15,42 @@ async fn new_view_and_context() -> (
     ExecutionStateView<MemoryContext<TestExecutionRuntimeContext>>,
     OperationContext,
 ) {
-    let description = ChainDescription::Root(5);
+    let description = dummy_chain_description(5);
     let context = OperationContext {
-        chain_id: ChainId::from(description),
+        chain_id: ChainId::from(&description),
         authenticated_signer: None,
         authenticated_caller_id: None,
         height: BlockHeight::from(7),
-        index: Some(2),
+        round: Some(0),
+        timestamp: Default::default(),
     };
     let state = SystemExecutionState {
         description: Some(description),
-        epoch: Some(Epoch(1)),
-        admin_id: Some(ChainId::root(0)),
+        epoch: Epoch(1),
+        admin_id: Some(dummy_chain_description(0).id()),
         committees: BTreeMap::new(),
         ..SystemExecutionState::default()
     };
     let view = state.into_view().await;
     (view, context)
+}
+
+fn expected_application_id(
+    context: &OperationContext,
+    module_id: &ModuleId,
+    parameters: Vec<u8>,
+    required_application_ids: Vec<ApplicationId>,
+    application_index: u32,
+) -> ApplicationId {
+    let description = ApplicationDescription {
+        module_id: *module_id,
+        creator_chain_id: context.chain_id,
+        block_height: context.height,
+        application_index,
+        parameters,
+        required_application_ids,
+    };
+    From::from(&description)
 }
 
 #[tokio::test]
@@ -42,10 +60,11 @@ async fn application_message_index() -> anyhow::Result<()> {
     let service = Bytecode::new(b"service".into());
     let contract_blob = Blob::new_contract_bytecode(contract.compress());
     let service_blob = Blob::new_service_bytecode(service.compress());
-    let bytecode_id = BytecodeId::new(contract_blob.id().hash, service_blob.id().hash);
+    let vm_runtime = VmRuntime::Wasm;
+    let module_id = ModuleId::new(contract_blob.id().hash, service_blob.id().hash, vm_runtime);
 
     let operation = SystemOperation::CreateApplication {
-        bytecode_id,
+        module_id,
         parameters: vec![],
         instantiation_argument: vec![],
         required_application_ids: vec![],
@@ -57,24 +76,14 @@ async fn application_message_index() -> anyhow::Result<()> {
         .await?;
     let new_application = view
         .system
-        .execute_operation(context, operation, &mut txn_tracker)
+        .execute_operation(
+            context,
+            operation,
+            &mut txn_tracker,
+            &mut ResourceController::default(),
+        )
         .await?;
-    let [ExecutionOutcome::System(result)] = &txn_tracker.destructure()?.0[..] else {
-        panic!("Unexpected outcome");
-    };
-    assert_eq!(
-        result.messages[CREATE_APPLICATION_MESSAGE_INDEX as usize].message,
-        SystemMessage::ApplicationCreated
-    );
-    let creation = MessageId {
-        chain_id: context.chain_id,
-        height: context.height,
-        index: CREATE_APPLICATION_MESSAGE_INDEX,
-    };
-    let id = ApplicationId {
-        bytecode_id,
-        creation,
-    };
+    let id = expected_application_id(&context, &module_id, vec![], vec![], 0);
     assert_eq!(new_application, Some((id, vec![])));
 
     Ok(())
@@ -83,15 +92,10 @@ async fn application_message_index() -> anyhow::Result<()> {
 #[tokio::test]
 async fn open_chain_message_index() {
     let (mut view, context) = new_view_and_context().await;
-    let epoch = view.system.epoch.get().unwrap();
-    let admin_id = view.system.admin_id.get().unwrap();
-    let committees = view.system.committees.get().clone();
-    let ownership = ChainOwnership::single(PublicKey::test_key(0));
+    let owner = linera_base::crypto::AccountPublicKey::test_key(0).into();
+    let ownership = ChainOwnership::single(owner);
     let config = OpenChainConfig {
         ownership,
-        committees,
-        epoch,
-        admin_id,
         balance: Amount::ZERO,
         application_permissions: Default::default(),
     };
@@ -99,34 +103,36 @@ async fn open_chain_message_index() {
     let operation = SystemOperation::OpenChain(config.clone());
     let new_application = view
         .system
-        .execute_operation(context, operation, &mut txn_tracker)
+        .execute_operation(
+            context,
+            operation,
+            &mut txn_tracker,
+            &mut ResourceController::default(),
+        )
         .await
         .unwrap();
     assert_eq!(new_application, None);
-    let [ExecutionOutcome::System(result)] = &txn_tracker.destructure().unwrap().0[..] else {
-        panic!("Unexpected outcome");
-    };
     assert_eq!(
-        result.messages[OPEN_CHAIN_MESSAGE_INDEX as usize].message,
-        SystemMessage::OpenChain(config)
+        txn_tracker.into_outcome().unwrap().blobs[0].id().blob_type,
+        BlobType::ChainDescription,
     );
 }
 
 /// Tests if an account is removed from storage if it is drained.
 #[tokio::test]
 async fn empty_accounts_are_removed() -> anyhow::Result<()> {
-    let owner = AccountOwner::User(Owner(CryptoHash::test_hash("account owner")));
+    let owner = AccountOwner::from(CryptoHash::test_hash("account owner"));
     let amount = Amount::from_tokens(99);
 
     let mut view = SystemExecutionState {
-        description: Some(ChainDescription::Root(0)),
+        description: Some(dummy_chain_description(0)),
         balances: BTreeMap::from([(owner, amount)]),
         ..SystemExecutionState::default()
     }
     .into_view()
     .await;
 
-    view.system.debit(Some(&owner), amount).await?;
+    view.system.debit(&owner, amount).await?;
 
     assert!(view.system.balances.indices().await?.is_empty());
 

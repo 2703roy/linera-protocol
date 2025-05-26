@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
     vec,
 };
 
@@ -15,9 +16,10 @@ use futures::{
     Future,
 };
 use linera_base::{
-    crypto::*,
+    crypto::{AccountPublicKey, CryptoHash, InMemorySigner, ValidatorKeypair, ValidatorPublicKey},
     data_types::*,
-    identifiers::{BlobId, ChainDescription, ChainId},
+    identifiers::{AccountOwner, BlobId, ChainId},
+    ownership::ChainOwnership,
 };
 use linera_chain::{
     data_types::BlockProposal,
@@ -26,10 +28,7 @@ use linera_chain::{
         LiteCertificate, Timeout, ValidatedBlock,
     },
 };
-use linera_execution::{
-    committee::{Committee, ValidatorName},
-    ResourceControlPolicy, WasmRuntime,
-};
+use linera_execution::{committee::Committee, ResourceControlPolicy, WasmRuntime};
 use linera_storage::{DbStorage, Storage, TestClock};
 #[cfg(all(not(target_arch = "wasm32"), feature = "storage-service"))]
 use linera_storage_service::client::ServiceStoreClient;
@@ -50,7 +49,7 @@ use {
 };
 
 use crate::{
-    client::{ChainClient, Client},
+    client::Client,
     data_types::*,
     node::{
         CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode,
@@ -92,7 +91,7 @@ pub struct LocalValidatorClient<S>
 where
     S: Storage,
 {
-    name: ValidatorName,
+    public_key: ValidatorPublicKey,
     client: Arc<Mutex<LocalValidator<S>>>,
 }
 
@@ -129,7 +128,7 @@ where
         certificate: GenericCertificate<Timeout>,
     ) -> Result<ChainInfoResponse, NodeError> {
         self.spawn_and_receive(move |validator, sender| {
-            validator.do_handle_certificate(certificate, vec![], sender)
+            validator.do_handle_certificate(certificate, sender)
         })
         .await
     }
@@ -137,10 +136,9 @@ where
     async fn handle_validated_certificate(
         &self,
         certificate: GenericCertificate<ValidatedBlock>,
-        blobs: Vec<Blob>,
     ) -> Result<ChainInfoResponse, NodeError> {
         self.spawn_and_receive(move |validator, sender| {
-            validator.do_handle_certificate(certificate, blobs, sender)
+            validator.do_handle_certificate(certificate, sender)
         })
         .await
     }
@@ -151,7 +149,7 @@ where
         _delivery: CrossChainMessageDelivery,
     ) -> Result<ChainInfoResponse, NodeError> {
         self.spawn_and_receive(move |validator, sender| {
-            validator.do_handle_certificate(certificate, vec![], sender)
+            validator.do_handle_certificate(certificate, sender)
         })
         .await
     }
@@ -175,8 +173,23 @@ where
         Ok(Default::default())
     }
 
-    async fn get_genesis_config_hash(&self) -> Result<CryptoHash, NodeError> {
-        Ok(CryptoHash::test_hash("genesis config"))
+    async fn get_network_description(&self) -> Result<NetworkDescription, NodeError> {
+        Ok(NetworkDescription {
+            name: "test network".to_string(),
+            genesis_config_hash: CryptoHash::test_hash("genesis config"),
+            genesis_timestamp: Timestamp::default(),
+            admin_chain_id: self
+                .client
+                .lock()
+                .await
+                .state
+                .storage_client()
+                .read_network_description()
+                .await
+                .unwrap()
+                .unwrap()
+                .admin_chain_id,
+        })
     }
 
     async fn upload_blob(&self, content: BlobContent) -> Result<BlobId, NodeError> {
@@ -200,6 +213,17 @@ where
         .await
     }
 
+    async fn handle_pending_blob(
+        &self,
+        chain_id: ChainId,
+        blob: BlobContent,
+    ) -> Result<ChainInfoResponse, NodeError> {
+        self.spawn_and_receive(move |validator, sender| {
+            validator.do_handle_pending_blob(chain_id, blob, sender)
+        })
+        .await
+    }
+
     async fn download_certificate(
         &self,
         hash: CryptoHash,
@@ -208,7 +232,6 @@ where
             validator.do_download_certificate(hash, sender)
         })
         .await
-        .map(Into::into)
     }
 
     async fn download_certificates(
@@ -240,20 +263,20 @@ impl<S> LocalValidatorClient<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    fn new(name: ValidatorName, state: WorkerState<S>) -> Self {
+    fn new(public_key: ValidatorPublicKey, state: WorkerState<S>) -> Self {
         let client = LocalValidator {
             fault_type: FaultType::Honest,
             state,
             notifier: Arc::new(ChannelNotifier::default()),
         };
         Self {
-            name,
+            public_key,
             client: Arc::new(Mutex::new(client)),
         }
     }
 
-    pub fn name(&self) -> ValidatorName {
-        self.name
+    pub fn name(&self) -> ValidatorPublicKey {
+        self.public_key
     }
 
     async fn set_fault_type(&self, fault_type: FaultType) {
@@ -344,7 +367,6 @@ where
     async fn handle_certificate<T: ProcessableCertificate>(
         certificate: GenericCertificate<T>,
         validator: &mut MutexGuard<'_, LocalValidator<S>>,
-        blobs: Vec<Blob>,
     ) -> Option<Result<ChainInfoResponse, NodeError>> {
         match validator.fault_type {
             FaultType::DontProcessValidated if T::KIND == CertificateKind::Validated => None,
@@ -355,11 +377,7 @@ where
             | FaultType::DontSendValidateVote => Some(
                 validator
                     .state
-                    .fully_handle_certificate_with_notifications(
-                        certificate,
-                        blobs,
-                        &validator.notifier,
-                    )
+                    .fully_handle_certificate_with_notifications(certificate, &validator.notifier)
                     .await
                     .map_err(Into::into),
             ),
@@ -377,11 +395,11 @@ where
         let result = async move {
             match validator.state.full_certificate(certificate).await? {
                 Either::Left(confirmed) => {
-                    self.do_handle_certificate_internal(confirmed, &mut validator, vec![])
+                    self.do_handle_certificate_internal(confirmed, &mut validator)
                         .await
                 }
                 Either::Right(validated) => {
-                    self.do_handle_certificate_internal(validated, &mut validator, vec![])
+                    self.do_handle_certificate_internal(validated, &mut validator)
                         .await
                 }
             }
@@ -394,10 +412,8 @@ where
         &self,
         certificate: GenericCertificate<T>,
         validator: &mut MutexGuard<'_, LocalValidator<S>>,
-        blobs: Vec<Blob>,
     ) -> Result<ChainInfoResponse, NodeError> {
-        let handle_certificate_result =
-            Self::handle_certificate(certificate, validator, blobs).await;
+        let handle_certificate_result = Self::handle_certificate(certificate, validator).await;
         match handle_certificate_result {
             Some(Err(NodeError::BlobsNotFound(_))) => {
                 handle_certificate_result.expect("handle_certificate_result should be Some")
@@ -427,12 +443,11 @@ where
     async fn do_handle_certificate<T: ProcessableCertificate>(
         self,
         certificate: GenericCertificate<T>,
-        blobs: Vec<Blob>,
         sender: oneshot::Sender<Result<ChainInfoResponse, NodeError>>,
     ) -> Result<(), Result<ChainInfoResponse, NodeError>> {
         let mut validator = self.client.lock().await;
         let result = self
-            .do_handle_certificate_internal(certificate, &mut validator, blobs)
+            .do_handle_certificate_internal(certificate, &mut validator)
             .await;
         sender.send(result)
     }
@@ -516,6 +531,21 @@ where
         sender.send(result.map(|blob| blob.into_content()))
     }
 
+    async fn do_handle_pending_blob(
+        self,
+        chain_id: ChainId,
+        blob: BlobContent,
+        sender: oneshot::Sender<Result<ChainInfoResponse, NodeError>>,
+    ) -> Result<(), Result<ChainInfoResponse, NodeError>> {
+        let validator = self.client.lock().await;
+        let result = validator
+            .state
+            .handle_pending_blob(chain_id, Blob::new(blob))
+            .await
+            .map_err(Into::into);
+        sender.send(result)
+    }
+
     async fn do_download_certificate(
         self,
         hash: CryptoHash,
@@ -582,7 +612,7 @@ where
 }
 
 #[derive(Clone)]
-pub struct NodeProvider<S>(BTreeMap<ValidatorName, Arc<Mutex<LocalValidator<S>>>>)
+pub struct NodeProvider<S>(BTreeMap<ValidatorPublicKey, Arc<Mutex<LocalValidator<S>>>>)
 where
     S: Storage;
 
@@ -598,21 +628,21 @@ where
 
     fn make_nodes_from_list<A>(
         &self,
-        validators: impl IntoIterator<Item = (ValidatorName, A)>,
-    ) -> Result<impl Iterator<Item = (ValidatorName, Self::Node)>, NodeError>
+        validators: impl IntoIterator<Item = (ValidatorPublicKey, A)>,
+    ) -> Result<impl Iterator<Item = (ValidatorPublicKey, Self::Node)>, NodeError>
     where
         A: AsRef<str>,
     {
         Ok(validators
             .into_iter()
-            .map(|(name, address)| {
+            .map(|(public_key, address)| {
                 self.0
-                    .get(&name)
+                    .get(&public_key)
                     .ok_or_else(|| NodeError::CannotResolveValidatorAddress {
                         address: address.as_ref().to_string(),
                     })
                     .cloned()
-                    .map(|client| (name, LocalValidatorClient { name, client }))
+                    .map(|client| (public_key, LocalValidatorClient { public_key, client }))
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter())
@@ -627,7 +657,8 @@ where
     where
         T: IntoIterator<Item = LocalValidatorClient<S>>,
     {
-        let destructure = |validator: LocalValidatorClient<S>| (validator.name, validator.client);
+        let destructure =
+            |validator: LocalValidatorClient<S>| (validator.public_key, validator.client);
         Self(iter.into_iter().map(destructure).collect())
     }
 }
@@ -638,14 +669,18 @@ where
 // * When using `LocalValidatorClient`, clients communicate with an exact quorum then stop.
 // * Most tests have 1 faulty validator out 4 so that there is exactly only 1 quorum to
 // communicate with.
-pub struct TestBuilder<B: StorageBuilder> {
+#[allow(dead_code)]
+pub struct TestBuilder<'a, B: StorageBuilder> {
     storage_builder: B,
     pub initial_committee: Committee,
-    admin_id: ChainId,
+    admin_description: Option<ChainDescription>,
+    network_description: Option<NetworkDescription>,
     genesis_storage_builder: GenesisStorageBuilder,
     validator_clients: Vec<LocalValidatorClient<B::Storage>>,
-    validator_storages: HashMap<ValidatorName, B::Storage>,
+    validator_storages: HashMap<ValidatorPublicKey, B::Storage>,
     chain_client_storages: Vec<B::Storage>,
+    pub chain_owners: BTreeMap<ChainId, AccountOwner>,
+    pub signer: &'a mut InMemorySigner,
 }
 
 #[async_trait]
@@ -664,33 +699,24 @@ struct GenesisStorageBuilder {
 
 struct GenesisAccount {
     description: ChainDescription,
-    public_key: PublicKey,
-    balance: Amount,
+    public_key: AccountPublicKey,
 }
 
 impl GenesisStorageBuilder {
-    fn add(&mut self, description: ChainDescription, public_key: PublicKey, balance: Amount) {
+    fn add(&mut self, description: ChainDescription, public_key: AccountPublicKey) {
         self.accounts.push(GenesisAccount {
             description,
             public_key,
-            balance,
         })
     }
 
-    async fn build<S>(&self, storage: S, initial_committee: Committee, admin_id: ChainId) -> S
+    async fn build<S>(&self, storage: S) -> S
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
         for account in &self.accounts {
             storage
-                .create_chain(
-                    initial_committee.clone(),
-                    admin_id,
-                    account.description,
-                    account.public_key,
-                    account.balance,
-                    Timestamp::from(0),
-                )
+                .create_chain(account.description.clone())
                 .await
                 .unwrap();
         }
@@ -698,7 +724,9 @@ impl GenesisStorageBuilder {
     }
 }
 
-impl<B> TestBuilder<B>
+pub type ChainClient<S> = crate::client::ChainClient<crate::environment::Impl<S, NodeProvider<S>>>;
+
+impl<'signer, B> TestBuilder<'signer, B>
 where
     B: StorageBuilder,
 {
@@ -706,37 +734,40 @@ where
         mut storage_builder: B,
         count: usize,
         with_faulty_validators: usize,
+        signer: &'signer mut InMemorySigner,
     ) -> Result<Self, anyhow::Error> {
-        let mut key_pairs = Vec::new();
         let mut validators = Vec::new();
         for _ in 0..count {
-            let key_pair = KeyPair::generate();
-            let name = ValidatorName(key_pair.public());
-            validators.push(name);
-            key_pairs.push(key_pair);
+            let validator_keypair = ValidatorKeypair::generate();
+            let account_public_key = signer.generate_new();
+            validators.push((validator_keypair, account_public_key));
         }
-        let initial_committee = Committee::make_simple(validators);
+        let for_committee = validators
+            .iter()
+            .map(|(validating, account)| (validating.public_key, *account))
+            .collect::<Vec<_>>();
+        let initial_committee = Committee::make_simple(for_committee);
         let mut validator_clients = Vec::new();
         let mut validator_storages = HashMap::new();
         let mut faulty_validators = HashSet::new();
-        for (i, key_pair) in key_pairs.into_iter().enumerate() {
-            let name = ValidatorName(key_pair.public());
+        for (i, (validator_keypair, _account_public_key)) in validators.into_iter().enumerate() {
+            let validator_public_key = validator_keypair.public_key;
             let storage = storage_builder.build().await?;
             let state = WorkerState::new(
                 format!("Node {}", i),
-                Some(key_pair),
+                Some(validator_keypair.secret_key),
                 storage.clone(),
                 NonZeroUsize::new(100).expect("Chain worker limit should not be zero"),
             )
             .with_allow_inactive_chains(false)
             .with_allow_messages_from_deprecated_epochs(false);
-            let validator = LocalValidatorClient::new(name, state);
+            let validator = LocalValidatorClient::new(validator_public_key, state);
             if i < with_faulty_validators {
-                faulty_validators.insert(name);
+                faulty_validators.insert(validator_public_key);
                 validator.set_fault_type(FaultType::Malicious).await;
             }
             validator_clients.push(validator);
-            validator_storages.insert(name, storage);
+            validator_storages.insert(validator_public_key, storage);
         }
         tracing::info!(
             "Test will use the following faulty validators: {:?}",
@@ -745,11 +776,14 @@ where
         Ok(Self {
             storage_builder,
             initial_committee,
-            admin_id: ChainId::root(0),
+            admin_description: None,
+            network_description: None,
             genesis_storage_builder: GenesisStorageBuilder::default(),
             validator_clients,
             validator_storages,
             chain_client_storages: Vec::new(),
+            chain_owners: BTreeMap::new(),
+            signer,
         })
     }
 
@@ -764,7 +798,7 @@ where
         for index in indexes.as_ref() {
             let validator = &mut self.validator_clients[*index];
             validator.set_fault_type(fault_type).await;
-            faulty_validators.push(validator.name);
+            faulty_validators.push(validator.public_key);
         }
         tracing::info!(
             "Making the following validators {:?}: {:?}",
@@ -774,76 +808,102 @@ where
     }
 
     /// Creates the root chain with the given `index`, and returns a client for it.
+    ///
+    /// Root chain 0 is the admin chain and needs to be initialized first, otherwise its balance
+    /// is automatically set to zero.
     pub async fn add_root_chain(
         &mut self,
         index: u32,
         balance: Amount,
-    ) -> Result<ChainClient<NodeProvider<B::Storage>, B::Storage>, anyhow::Error> {
-        let description = ChainDescription::Root(index);
-        let key_pair = KeyPair::generate();
-        let public_key = key_pair.public();
+    ) -> anyhow::Result<ChainClient<B::Storage>> {
+        // Make sure the admin chain is initialized.
+        if self.admin_description.is_none() && index != 0 {
+            Box::pin(self.add_root_chain(0, Amount::ZERO)).await?;
+        }
+        let origin = ChainOrigin::Root(index);
+        let mut committees = BTreeMap::new();
+        committees.insert(
+            Epoch(0),
+            bcs::to_bytes(&self.initial_committee)
+                .expect("Serializing a committee should not fail!"),
+        );
+        let public_key = self.signer.generate_new();
+        let open_chain_config = InitialChainConfig {
+            ownership: ChainOwnership::single(public_key.into()),
+            epoch: Epoch(0),
+            committees,
+            balance,
+            application_permissions: ApplicationPermissions::default(),
+        };
+        let description = ChainDescription::new(origin, open_chain_config, Timestamp::from(0));
+        if index == 0 {
+            self.admin_description = Some(description.clone());
+            self.network_description = Some(NetworkDescription {
+                admin_chain_id: description.id(),
+                // dummy values to fill the description
+                genesis_config_hash: CryptoHash::test_hash("genesis config"),
+                genesis_timestamp: Timestamp::from(0),
+                name: "test network".to_string(),
+            });
+        }
         // Remember what's in the genesis store for future clients to join.
         self.genesis_storage_builder
-            .add(description, public_key, balance);
+            .add(description.clone(), public_key);
         for validator in &self.validator_clients {
-            let storage = self.validator_storages.get_mut(&validator.name).unwrap();
+            let storage = self
+                .validator_storages
+                .get_mut(&validator.public_key)
+                .unwrap();
+            storage
+                .write_network_description(self.network_description.as_ref().unwrap())
+                .await
+                .expect("writing the NetworkDescription should succeed");
             if validator.fault_type().await == FaultType::Malicious {
+                let origin = description.origin();
+                let config = InitialChainConfig {
+                    balance: Amount::ZERO,
+                    ..description.config().clone()
+                };
                 storage
-                    .create_chain(
-                        self.initial_committee.clone(),
-                        self.admin_id,
-                        description,
-                        public_key,
-                        Amount::ZERO,
-                        Timestamp::from(0),
-                    )
+                    .create_chain(ChainDescription::new(origin, config, Timestamp::from(0)))
                     .await
                     .unwrap();
             } else {
-                storage
-                    .create_chain(
-                        self.initial_committee.clone(),
-                        self.admin_id,
-                        description,
-                        public_key,
-                        balance,
-                        Timestamp::from(0),
-                    )
-                    .await
-                    .unwrap();
+                storage.create_chain(description.clone()).await.unwrap();
             }
         }
         for storage in self.chain_client_storages.iter_mut() {
-            storage
-                .create_chain(
-                    self.initial_committee.clone(),
-                    self.admin_id,
-                    description,
-                    public_key,
-                    balance,
-                    Timestamp::from(0),
-                )
-                .await
-                .unwrap();
+            storage.create_chain(description.clone()).await.unwrap();
         }
-        self.make_client(description.into(), key_pair, None, BlockHeight::ZERO)
-            .await
+        let chain_id = description.id();
+        self.chain_owners.insert(chain_id, public_key.into());
+        self.make_client(chain_id, None, BlockHeight::ZERO).await
     }
 
-    pub fn genesis_chains(&self) -> Vec<(PublicKey, Amount)> {
+    pub fn genesis_chains(&self) -> Vec<(AccountPublicKey, Amount)> {
         let mut result = Vec::new();
         for (i, genesis_account) in self.genesis_storage_builder.accounts.iter().enumerate() {
             assert_eq!(
-                genesis_account.description,
-                ChainDescription::Root(i as u32)
+                genesis_account.description.origin(),
+                ChainOrigin::Root(i as u32)
             );
-            result.push((genesis_account.public_key, genesis_account.balance));
+            result.push((
+                genesis_account.public_key,
+                genesis_account.description.config().balance,
+            ));
         }
         result
     }
 
     pub fn admin_id(&self) -> ChainId {
-        self.admin_id
+        self.admin_description
+            .as_ref()
+            .expect("admin chain not initialized")
+            .id()
+    }
+
+    pub fn admin_description(&self) -> Option<&ChainDescription> {
+        self.admin_description.as_ref()
     }
 
     pub fn make_node_provider(&self) -> NodeProvider<B::Storage> {
@@ -855,48 +915,47 @@ where
     }
 
     pub async fn make_storage(&mut self) -> anyhow::Result<B::Storage> {
-        Ok(self
-            .genesis_storage_builder
-            .build(
-                self.storage_builder.build().await?,
-                self.initial_committee.clone(),
-                self.admin_id,
-            )
-            .await)
+        let storage = self.storage_builder.build().await?;
+        storage
+            .write_network_description(self.network_description.as_ref().unwrap())
+            .await
+            .expect("writing the NetworkDescription should succeed");
+        Ok(self.genesis_storage_builder.build(storage).await)
     }
 
     pub async fn make_client(
         &mut self,
         chain_id: ChainId,
-        key_pair: KeyPair,
         block_hash: Option<CryptoHash>,
         block_height: BlockHeight,
-    ) -> Result<ChainClient<NodeProvider<B::Storage>, B::Storage>, anyhow::Error> {
+    ) -> anyhow::Result<ChainClient<B::Storage>> {
         // Note that new clients are only given the genesis store: they must figure out
         // the rest by asking validators.
         let storage = self.make_storage().await?;
         self.chain_client_storages.push(storage.clone());
-        let provider = self.make_node_provider();
-        let builder = Arc::new(Client::new(
-            provider,
-            storage,
+        let client = Arc::new(Client::new(
+            crate::environment::Impl {
+                network: self.make_node_provider(),
+                storage,
+            },
+            Box::new(self.signer.clone()),
             10,
+            self.admin_id(),
             CrossChainMessageDelivery::NonBlocking,
             false,
             [chain_id],
             format!("Client node for {:.8}", chain_id),
             NonZeroUsize::new(20).expect("Chain worker limit should not be zero"),
             DEFAULT_GRACE_PERIOD,
+            Duration::from_secs(1),
         ));
-        Ok(builder.create_chain_client(
+        Ok(client.create_chain_client(
             chain_id,
-            vec![key_pair],
-            self.admin_id,
             block_hash,
             Timestamp::from(0),
             block_height,
             None,
-            BTreeMap::new(),
+            self.chain_owners.get(&chain_id).copied(),
         ))
     }
 
@@ -916,7 +975,7 @@ where
         let mut certificate = None;
         for validator in self.validator_clients.clone() {
             if let Ok(response) = validator.handle_chain_info_query(query.clone()).await {
-                if response.check(&validator.name).is_ok() {
+                if response.check(&validator.public_key).is_ok() {
                     let ChainInfo {
                         mut requested_sent_certificate_hashes,
                         ..
@@ -924,8 +983,8 @@ where
                     debug_assert!(requested_sent_certificate_hashes.len() <= 1);
                     if let Some(cert_hash) = requested_sent_certificate_hashes.pop() {
                         if let Ok(cert) = validator.download_certificate(cert_hash).await {
-                            if cert.inner().executed_block().block.chain_id == chain_id
-                                && cert.inner().executed_block().block.height == block_height
+                            if cert.inner().block().header.chain_id == chain_id
+                                && cert.inner().block().header.height == block_height
                             {
                                 cert.check(&self.initial_committee).unwrap();
                                 count += 1;
@@ -955,7 +1014,7 @@ where
             if let Ok(response) = validator.handle_chain_info_query(query.clone()).await {
                 if response.info.manager.current_round == round
                     && response.info.next_block_height == block_height
-                    && response.check(&validator.name).is_ok()
+                    && response.check(&validator.public_key).is_ok()
                 {
                     count += 1;
                 }
@@ -997,15 +1056,10 @@ impl StorageBuilder for MemoryStorageBuilder {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {
@@ -1069,15 +1123,10 @@ impl StorageBuilder for RocksDbStorageBuilder {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {
@@ -1122,15 +1171,10 @@ impl StorageBuilder for ServiceStorageBuilder {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {
@@ -1172,15 +1216,10 @@ impl StorageBuilder for DynamoDbStorageBuilder {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {
@@ -1222,15 +1261,10 @@ impl StorageBuilder for ScyllaDbStorageBuilder {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {

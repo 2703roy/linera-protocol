@@ -5,23 +5,25 @@
 
 #![deny(clippy::large_futures)]
 
-mod block;
+pub mod block;
 mod certificate;
 
 pub mod types {
     pub use super::{block::*, certificate::*};
 }
 
+mod block_tracker;
 mod chain;
 pub mod data_types;
 mod inbox;
 pub mod manager;
 mod outbox;
+mod pending_blobs;
 #[cfg(with_testing)]
 pub mod test;
 
 pub use chain::ChainStateView;
-use data_types::{MessageBundle, Origin, PostedMessage};
+use data_types::{MessageBundle, PostedMessage};
 use linera_base::{
     bcs,
     crypto::{CryptoError, CryptoHash},
@@ -52,7 +54,7 @@ pub enum ChainError {
     )]
     MissingCrossChainUpdate {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         height: BlockHeight,
     },
     #[error(
@@ -61,7 +63,7 @@ pub enum ChainError {
     )]
     UnexpectedMessage {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         bundle: Box<MessageBundle>,
         previous_bundle: Box<MessageBundle>,
     },
@@ -72,7 +74,7 @@ pub enum ChainError {
     )]
     IncorrectMessageOrder {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         bundle: Box<MessageBundle>,
         next_height: BlockHeight,
         next_index: u32,
@@ -83,7 +85,7 @@ pub enum ChainError {
     )]
     CannotRejectMessage {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         posted_message: Box<PostedMessage>,
     },
     #[error(
@@ -92,7 +94,7 @@ pub enum ChainError {
     )]
     CannotSkipMessage {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         bundle: Box<MessageBundle>,
     },
     #[error(
@@ -127,8 +129,10 @@ pub enum ChainError {
     InsufficientRoundStrict(Round),
     #[error("Round number should be {0:?}")]
     WrongRound(Round),
-    #[error("A different block for height {0:?} was already locked at round number {1:?}")]
-    HasLockedBlock(BlockHeight, Round),
+    #[error("Already voted to confirm a different block for height {0:?} at round number {1:?}")]
+    HasIncompatibleConfirmedVote(BlockHeight, Round),
+    #[error("Proposal for height {0:?} is not newer than locking block in round {1:?}")]
+    MustBeNewerThanLockingBlock(BlockHeight, Round),
     #[error("Cannot confirm a block before its predecessors: {current_block_height:?}")]
     MissingEarlierBlocks { current_block_height: BlockHeight },
     #[error("Signatures in a certificate must be from different validators")]
@@ -149,13 +153,15 @@ pub enum ChainError {
     OwnerWeightError(#[from] WeightedError),
     #[error("Closed chains cannot have operations, accepted messages or empty blocks")]
     ClosedChain,
+    #[error("Empty blocks are not allowed")]
+    EmptyBlock,
     #[error("All operations on this chain must be from one of the following applications: {0:?}")]
     AuthorizedApplications(Vec<ApplicationId>),
     #[error("Missing operations or messages from mandatory applications: {0:?}")]
     MissingMandatoryApplications(Vec<ApplicationId>),
     #[error("Can't use grant across different broadcast messages")]
     GrantUseOnBroadcast,
-    #[error("ExecutedBlock contains fewer oracle responses than requests")]
+    #[error("Executed block contains fewer oracle responses than requests")]
     MissingOracleResponseList,
     #[error("Unexpected hash for CertificateValue! Expected: {expected:?}, Actual: {actual:?}")]
     CertificateValueHashMismatch {
@@ -176,6 +182,7 @@ impl From<ViewError> for ChainError {
 }
 
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(with_testing, derive(Eq, PartialEq))]
 pub enum ChainExecutionContext {
     Query,
     DescribeApplication,
@@ -184,7 +191,7 @@ pub enum ChainExecutionContext {
     Block,
 }
 
-trait ExecutionResultExt<T> {
+pub trait ExecutionResultExt<T> {
     fn with_execution_context(self, context: ChainExecutionContext) -> Result<T, ChainError>;
 }
 

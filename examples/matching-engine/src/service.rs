@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use async_graphql::{EmptySubscription, Request, Response, Schema};
 use linera_sdk::{
-    base::WithServiceAbi, graphql::GraphQLMutationRoot, views::View, Service, ServiceRuntime,
+    graphql::GraphQLMutationRoot, linera_base_types::WithServiceAbi, views::View, Service,
+    ServiceRuntime,
 };
 use matching_engine::{Operation, Parameters};
 
@@ -17,6 +18,7 @@ use crate::state::MatchingEngineState;
 
 pub struct MatchingEngineService {
     state: Arc<MatchingEngineState>,
+    runtime: Arc<ServiceRuntime<Self>>,
 }
 
 linera_sdk::service!(MatchingEngineService);
@@ -34,13 +36,14 @@ impl Service for MatchingEngineService {
             .expect("Failed to load state");
         MatchingEngineService {
             state: Arc::new(state),
+            runtime: Arc::new(runtime),
         }
     }
 
     async fn handle_query(&self, request: Request) -> Response {
         let schema = Schema::build(
             self.state.clone(),
-            Operation::mutation_root(),
+            Operation::mutation_root(self.runtime.clone()),
             EmptySubscription,
         )
         .finish();

@@ -26,6 +26,7 @@ anyhow.workspace = true
 async-lock.workspace = true
 bcs.workspace = true
 clap.workspace = true
+futures.workspace = true
 linera-base.workspace = true
 linera-version.workspace = true
 linera-views.workspace = true
@@ -39,10 +40,11 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["async_tokio"] }
-linera-storage-service = { path = ".", default-features = false, features = ["test"] }
+linera-storage-service = { path = ".", default-features = false, features = [
+    "test",
+] }
 proptest = { workspace = true, features = ["alloc"] }
 serde-reflection.workspace = true
-serde_yaml.workspace = true
 similar-asserts.workspace = true
 test-strategy.workspace = true
 

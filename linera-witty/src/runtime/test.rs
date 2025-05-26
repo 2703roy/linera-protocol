@@ -180,11 +180,13 @@ impl<UserData> MockInstance<UserData> {
 impl<UserData> Instance for MockInstance<UserData> {
     type Runtime = MockRuntime;
     type UserData = UserData;
-    type UserDataReference<'a> = MutexGuard<'a, UserData>
+    type UserDataReference<'a>
+        = MutexGuard<'a, UserData>
     where
         Self::UserData: 'a,
         Self: 'a;
-    type UserDataMutReference<'a> = MutexGuard<'a, UserData>
+    type UserDataMutReference<'a>
+        = MutexGuard<'a, UserData>
     where
         Self::UserData: 'a,
         Self: 'a;
@@ -359,7 +361,7 @@ where
     ///
     /// Every call to the exported function is called is forwarded to the `handler` and an internal
     /// counter is incremented. When the [`MockExportedFunction`] instance is dropped (which should
-    /// be done at the end of the test}, it asserts that the function was called `expected_calls`
+    /// be done at the end of the test), it asserts that the function was called `expected_calls`
     /// times.
     pub fn new(
         name: impl Into<String>,

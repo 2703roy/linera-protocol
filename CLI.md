@@ -9,6 +9,7 @@ This document contains the help content for the `linera` command-line program.
 * [`linera open-chain`↴](#linera-open-chain)
 * [`linera open-multi-owner-chain`↴](#linera-open-multi-owner-chain)
 * [`linera change-ownership`↴](#linera-change-ownership)
+* [`linera set-preferred-owner`↴](#linera-set-preferred-owner)
 * [`linera change-application-permissions`↴](#linera-change-application-permissions)
 * [`linera close-chain`↴](#linera-close-chain)
 * [`linera local-balance`↴](#linera-local-balance)
@@ -18,6 +19,7 @@ This document contains the help content for the `linera` command-line program.
 * [`linera process-inbox`↴](#linera-process-inbox)
 * [`linera query-validator`↴](#linera-query-validator)
 * [`linera query-validators`↴](#linera-query-validators)
+* [`linera sync-validator`↴](#linera-sync-validator)
 * [`linera set-validator`↴](#linera-set-validator)
 * [`linera remove-validator`↴](#linera-remove-validator)
 * [`linera finalize-committee`↴](#linera-finalize-committee)
@@ -26,12 +28,12 @@ This document contains the help content for the `linera` command-line program.
 * [`linera watch`↴](#linera-watch)
 * [`linera service`↴](#linera-service)
 * [`linera faucet`↴](#linera-faucet)
-* [`linera publish-bytecode`↴](#linera-publish-bytecode)
+* [`linera publish-module`↴](#linera-publish-module)
+* [`linera list-events-from-index`↴](#linera-list-events-from-index)
 * [`linera publish-data-blob`↴](#linera-publish-data-blob)
 * [`linera read-data-blob`↴](#linera-read-data-blob)
 * [`linera create-application`↴](#linera-create-application)
 * [`linera publish-and-create`↴](#linera-publish-and-create)
-* [`linera request-application`↴](#linera-request-application)
 * [`linera keygen`↴](#linera-keygen)
 * [`linera assign`↴](#linera-assign)
 * [`linera retry-pending-block`↴](#linera-retry-pending-block)
@@ -39,6 +41,8 @@ This document contains the help content for the `linera` command-line program.
 * [`linera wallet show`↴](#linera-wallet-show)
 * [`linera wallet set-default`↴](#linera-wallet-set-default)
 * [`linera wallet init`↴](#linera-wallet-init)
+* [`linera wallet request-chain`↴](#linera-wallet-request-chain)
+* [`linera wallet follow-chain`↴](#linera-wallet-follow-chain)
 * [`linera wallet forget-keys`↴](#linera-wallet-forget-keys)
 * [`linera wallet forget-chain`↴](#linera-wallet-forget-chain)
 * [`linera project`↴](#linera-project)
@@ -49,12 +53,13 @@ This document contains the help content for the `linera` command-line program.
 * [`linera net up`↴](#linera-net-up)
 * [`linera net helper`↴](#linera-net-helper)
 * [`linera storage`↴](#linera-storage)
-* [`linera storage delete_all`↴](#linera-storage-delete_all)
-* [`linera storage delete_namespace`↴](#linera-storage-delete_namespace)
-* [`linera storage check_existence`↴](#linera-storage-check_existence)
-* [`linera storage check_absence`↴](#linera-storage-check_absence)
+* [`linera storage delete-all`↴](#linera-storage-delete-all)
+* [`linera storage delete-namespace`↴](#linera-storage-delete-namespace)
+* [`linera storage check-existence`↴](#linera-storage-check-existence)
 * [`linera storage initialize`↴](#linera-storage-initialize)
-* [`linera storage list_namespaces`↴](#linera-storage-list_namespaces)
+* [`linera storage list-namespaces`↴](#linera-storage-list-namespaces)
+* [`linera storage list-blob-ids`↴](#linera-storage-list-blob-ids)
+* [`linera storage list-chain-ids`↴](#linera-storage-list-chain-ids)
 
 ## `linera`
 
@@ -68,6 +73,7 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `open-chain` — Open (i.e. activate) a new chain deriving the UID from an existing one
 * `open-multi-owner-chain` — Open (i.e. activate) a new multi-owner chain deriving the UID from an existing one
 * `change-ownership` — Change who owns the chain, and how the owners work together proposing blocks
+* `set-preferred-owner` — Change the preferred owner of a chain
 * `change-application-permissions` — Changes the application permissions configuration
 * `close-chain` — Close an existing chain
 * `local-balance` — Read the current native-token balance of the given account directly from the local state
@@ -77,6 +83,7 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `process-inbox` — Process all pending incoming messages from the inbox of the given chain by creating as many blocks as needed to execute all (non-failing) messages. Failing messages will be marked as rejected and may bounce to their sender depending on their configuration
 * `query-validator` — Show the version and genesis config hash of a new validator, and print a warning if it is incompatible. Also print some information about the given chain while we are at it
 * `query-validators` — Show the current set of validators for a chain. Also print some information about the given chain while we are at it
+* `sync-validator` — Synchronizes a validator with the local state of chains
 * `set-validator` — Add or modify a validator (admin only)
 * `remove-validator` — Remove a validator (admin only)
 * `finalize-committee` — Deprecates all committees except the last one
@@ -85,14 +92,14 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `watch` — Watch the network for notifications
 * `service` — Run a GraphQL service to explore and extend the chains of the wallet
 * `faucet` — Run a GraphQL service that exposes a faucet where users can claim tokens. This gives away the chain's tokens, and is mainly intended for testing
-* `publish-bytecode` — Publish bytecode
+* `publish-module` — Publish module
+* `list-events-from-index` — Print events from a specific chain and stream from a specified index
 * `publish-data-blob` — Publish a data blob of binary data
 * `read-data-blob` — Verify that a data blob is readable
 * `create-application` — Create an application
-* `publish-and-create` — Create an application, and publish the required bytecode
-* `request-application` — Request an application from another chain, so it can be used on this one
-* `keygen` — Create an unassigned key-pair
-* `assign` — Link a key owned by the wallet to a chain that was just created for that key
+* `publish-and-create` — Create an application, and publish the required module
+* `keygen` — Create an unassigned key pair
+* `assign` — Link the owner to the chain. Expects that the caller has a private key corresponding to the `public_key`, otherwise block proposals will fail when signing with it
 * `retry-pending-block` — Retry a block we unsuccessfully tried to propose earlier
 * `wallet` — Show the contents of the wallet
 * `project` — Manage Linera projects
@@ -101,9 +108,10 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 
 ###### **Options:**
 
-* `--wallet <WALLET_STATE_PATH>` — Sets the file storing the private state of user chains (an empty one will be created if missing)
 * `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
-* `-w`, `--with-wallet <WITH_WALLET>` — Given an integer value N, read the wallet state and the wallet storage config from the environment variables LINERA_WALLET_{N} and LINERA_STORAGE_{N} instead of LINERA_WALLET and LINERA_STORAGE
+* `--wallet <WALLET_STATE_PATH>` — Sets the file storing the private state of user chains (an empty one will be created if missing)
+* `--keystore <KEYSTORE_PATH>` — Sets the file storing the keystore state
+* `-w`, `--with-wallet <WITH_WALLET>` — Given an ASCII alphanumeric parameter `X`, read the wallet state and the wallet storage config from the environment variables `LINERA_WALLET_{X}` and `LINERA_STORAGE_{X}` instead of `LINERA_WALLET` and `LINERA_STORAGE`
 * `--send-timeout-ms <SEND_TIMEOUT>` — Timeout for sending queries (milliseconds)
 
   Default value: `4000`
@@ -113,17 +121,9 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `--max-pending-message-bundles <MAX_PENDING_MESSAGE_BUNDLES>` — The maximum number of incoming message bundles to include in a block proposal
 
   Default value: `10`
-* `--wasm-runtime <WASM_RUNTIME>` — The WebAssembly runtime to use
 * `--max-loaded-chains <MAX_LOADED_CHAINS>` — The maximal number of chains loaded in memory at a given time
 
   Default value: `40`
-* `--max-concurrent-queries <MAX_CONCURRENT_QUERIES>` — The maximal number of simultaneous queries to the database
-* `--max-stream-queries <MAX_STREAM_QUERIES>` — The maximal number of simultaneous stream queries to the database
-
-  Default value: `10`
-* `--cache-size <CACHE_SIZE>` — The maximal number of entries in the storage cache
-
-  Default value: `1000`
 * `--retry-delay-ms <RETRY_DELAY>` — Delay increment for retrying to connect to a validator
 
   Default value: `1000`
@@ -132,7 +132,6 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
   Default value: `10`
 * `--wait-for-outgoing-messages` — Whether to wait until a quorum of validators has confirmed that all sent cross-chain messages have been delivered
 * `--long-lived-services` — (EXPERIMENTAL) Whether application services can persist in some cases between queries
-* `--tokio-threads <TOKIO_THREADS>` — The number of Tokio worker threads to use
 * `--blanket-message-policy <BLANKET_MESSAGE_POLICY>` — The policy for handling incoming messages
 
   Default value: `accept`
@@ -149,6 +148,28 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `--grace-period <GRACE_PERIOD>` — An additional delay, after reaching a quorum, to wait for additional validator signatures, as a fraction of time taken to reach quorum
 
   Default value: `0.2`
+* `--blob-download-timeout-ms <BLOB_DOWNLOAD_TIMEOUT>` — The delay when downloading a blob, after which we try a second validator, in milliseconds
+
+  Default value: `1000`
+* `--max-concurrent-queries <MAX_CONCURRENT_QUERIES>` — The maximal number of simultaneous queries to the database
+* `--max-stream-queries <MAX_STREAM_QUERIES>` — The maximal number of simultaneous stream queries to the database
+
+  Default value: `10`
+* `--max-cache-size <MAX_CACHE_SIZE>` — The maximal memory used in the storage cache
+
+  Default value: `10000000`
+* `--max-entry-size <MAX_ENTRY_SIZE>` — The maximal size of an entry in the storage cache
+
+  Default value: `1000000`
+* `--max-cache-entries <MAX_CACHE_ENTRIES>` — The maximal number of entries in the storage cache
+
+  Default value: `1000`
+* `--wasm-runtime <WASM_RUNTIME>` — The WebAssembly runtime to use
+* `--tokio-threads <TOKIO_THREADS>` — The number of Tokio worker threads to use
+* `--tokio-blocking-threads <TOKIO_BLOCKING_THREADS>` — The number of Tokio blocking threads to use
+* `--storage-replication-factor <STORAGE_REPLICATION_FACTOR>` — The replication factor for the keyspace
+
+  Default value: `1`
 
 
 
@@ -178,7 +199,7 @@ Open (i.e. activate) a new chain deriving the UID from an existing one
 ###### **Options:**
 
 * `--from <CHAIN_ID>` — Chain ID (must be one of our chains)
-* `--to-public-key <PUBLIC_KEY>` — Public key of the new owner (otherwise create a key pair and remember it)
+* `--owner <OWNER>` — The new owner (otherwise create a key pair and remember it)
 * `--initial-balance <BALANCE>` — The initial balance of the new chain. This is subtracted from the parent chain's balance
 
   Default value: `0`
@@ -194,12 +215,13 @@ Open (i.e. activate) a new multi-owner chain deriving the UID from an existing o
 ###### **Options:**
 
 * `--from <CHAIN_ID>` — Chain ID (must be one of our chains)
-* `--super-owner-public-keys <SUPER_OWNER_PUBLIC_KEYS>` — Public keys of the new super owners
-* `--owner-public-keys <OWNER_PUBLIC_KEYS>` — Public keys of the new regular owners
+* `--super-owners <SUPER_OWNERS>` — The new super owners
+* `--owners <OWNERS>` — The new regular owners
 * `--owner-weights <OWNER_WEIGHTS>` — Weights for the new owners.
 
    If they are specified there must be exactly one weight for each owner. If no weights are given, every owner will have weight 100.
 * `--multi-leader-rounds <MULTI_LEADER_ROUNDS>` — The number of rounds in which every owner can propose blocks, i.e. the first round number in which only a single designated leader is allowed to propose blocks
+* `--open-multi-leader-rounds` — Whether the multi-leader rounds are unrestricted, i.e. not limited to chain owners. This should only be `true` on chains with restrictive application permissions and an application-based mechanism to select block proposers
 * `--fast-round-ms <FAST_ROUND_DURATION>` — The duration of the fast round, in milliseconds
 * `--base-timeout-ms <BASE_TIMEOUT>` — The duration of the first single-leader and all multi-leader rounds
 
@@ -213,6 +235,9 @@ Open (i.e. activate) a new multi-owner chain deriving the UID from an existing o
 * `--execute-operations <EXECUTE_OPERATIONS>` — If present, only operations from the specified applications are allowed, and no system operations. Otherwise all operations are allowed
 * `--mandatory-applications <MANDATORY_APPLICATIONS>` — At least one operation or incoming message from each of these applications must occur in every block
 * `--close-chain <CLOSE_CHAIN>` — These applications are allowed to close the current chain using the system API
+* `--change-application-permissions <CHANGE_APPLICATION_PERMISSIONS>` — These applications are allowed to change the application permissions on the current chain using the system API
+* `--call-service-as-oracle <CALL_SERVICE_AS_ORACLE>` — These applications are allowed to call services as oracles on the current chain using the system API
+* `--make-http-requests <MAKE_HTTP_REQUESTS>` — These applications are allowed to make HTTP requests on the current chain using the system API
 * `--initial-balance <BALANCE>` — The initial balance of the new chain. This is subtracted from the parent chain's balance
 
   Default value: `0`
@@ -230,12 +255,13 @@ Specify the complete set of new owners, by public key. Existing owners that are 
 ###### **Options:**
 
 * `--chain-id <CHAIN_ID>` — The ID of the chain whose owners will be changed
-* `--super-owner-public-keys <SUPER_OWNER_PUBLIC_KEYS>` — Public keys of the new super owners
-* `--owner-public-keys <OWNER_PUBLIC_KEYS>` — Public keys of the new regular owners
+* `--super-owners <SUPER_OWNERS>` — The new super owners
+* `--owners <OWNERS>` — The new regular owners
 * `--owner-weights <OWNER_WEIGHTS>` — Weights for the new owners.
 
    If they are specified there must be exactly one weight for each owner. If no weights are given, every owner will have weight 100.
 * `--multi-leader-rounds <MULTI_LEADER_ROUNDS>` — The number of rounds in which every owner can propose blocks, i.e. the first round number in which only a single designated leader is allowed to propose blocks
+* `--open-multi-leader-rounds` — Whether the multi-leader rounds are unrestricted, i.e. not limited to chain owners. This should only be `true` on chains with restrictive application permissions and an application-based mechanism to select block proposers
 * `--fast-round-ms <FAST_ROUND_DURATION>` — The duration of the fast round, in milliseconds
 * `--base-timeout-ms <BASE_TIMEOUT>` — The duration of the first single-leader and all multi-leader rounds
 
@@ -246,6 +272,19 @@ Specify the complete set of new owners, by public key. Existing owners that are 
 * `--fallback-duration-ms <FALLBACK_DURATION>` — The age of an incoming tracked or protected message after which the validators start transitioning the chain to fallback mode, in milliseconds
 
   Default value: `86400000`
+
+
+
+## `linera set-preferred-owner`
+
+Change the preferred owner of a chain
+
+**Usage:** `linera set-preferred-owner [OPTIONS] --owner <OWNER>`
+
+###### **Options:**
+
+* `--chain-id <CHAIN_ID>` — The ID of the chain whose preferred owner will be changed
+* `--owner <OWNER>` — The new preferred owner
 
 
 
@@ -261,6 +300,9 @@ Changes the application permissions configuration
 * `--execute-operations <EXECUTE_OPERATIONS>` — If present, only operations from the specified applications are allowed, and no system operations. Otherwise all operations are allowed
 * `--mandatory-applications <MANDATORY_APPLICATIONS>` — At least one operation or incoming message from each of these applications must occur in every block
 * `--close-chain <CLOSE_CHAIN>` — These applications are allowed to close the current chain using the system API
+* `--change-application-permissions <CHANGE_APPLICATION_PERMISSIONS>` — These applications are allowed to change the application permissions on the current chain using the system API
+* `--call-service-as-oracle <CALL_SERVICE_AS_ORACLE>` — These applications are allowed to call services as oracles on the current chain using the system API
+* `--make-http-requests <MAKE_HTTP_REQUESTS>` — These applications are allowed to make HTTP requests on the current chain using the system API
 
 
 
@@ -357,7 +399,7 @@ Show the version and genesis config hash of a new validator, and print a warning
 
 ###### **Options:**
 
-* `--name <NAME>` — The public key of the validator. If given, the signature of the chain query info will be checked
+* `--public-key <PUBLIC_KEY>` — The public key of the validator. If given, the signature of the chain query info will be checked
 
 
 
@@ -373,15 +415,32 @@ Show the current set of validators for a chain. Also print some information abou
 
 
 
+## `linera sync-validator`
+
+Synchronizes a validator with the local state of chains
+
+**Usage:** `linera sync-validator [OPTIONS] <ADDRESS>`
+
+###### **Arguments:**
+
+* `<ADDRESS>` — The public address of the validator to synchronize
+
+###### **Options:**
+
+* `--chains <CHAINS>` — The chains to synchronize, or the default chain if empty
+
+
+
 ## `linera set-validator`
 
 Add or modify a validator (admin only)
 
-**Usage:** `linera set-validator [OPTIONS] --name <NAME> --address <ADDRESS>`
+**Usage:** `linera set-validator [OPTIONS] --public-key <PUBLIC_KEY> --account-key <ACCOUNT_KEY> --address <ADDRESS>`
 
 ###### **Options:**
 
-* `--name <NAME>` — The public key of the validator
+* `--public-key <PUBLIC_KEY>` — The public key of the validator
+* `--account-key <ACCOUNT_KEY>` — The public key of the account controlled by the validator
 * `--address <ADDRESS>` — Network address
 * `--votes <VOTES>` — Voting power
 
@@ -394,11 +453,11 @@ Add or modify a validator (admin only)
 
 Remove a validator (admin only)
 
-**Usage:** `linera remove-validator --name <NAME>`
+**Usage:** `linera remove-validator --public-key <PUBLIC_KEY>`
 
 ###### **Options:**
 
-* `--name <NAME>` — The public key of the validator
+* `--public-key <PUBLIC_KEY>` — The public key of the validator
 
 
 
@@ -418,24 +477,37 @@ View or update the resource control policy
 
 ###### **Options:**
 
-* `--block <BLOCK>` — Set the base price for creating a block
-* `--fuel-unit <FUEL_UNIT>` — Set the price per unit of fuel
+* `--wasm-fuel-unit <WASM_FUEL_UNIT>` — Set the price per unit of Wasm fuel
+* `--evm-fuel-unit <EVM_FUEL_UNIT>` — Set the price per unit of EVM fuel
 * `--read-operation <READ_OPERATION>` — Set the price per read operation
 * `--write-operation <WRITE_OPERATION>` — Set the price per write operation
 * `--byte-read <BYTE_READ>` — Set the price per byte read
 * `--byte-written <BYTE_WRITTEN>` — Set the price per byte written
+* `--blob-read <BLOB_READ>` — Set the base price to read a blob
+* `--blob-published <BLOB_PUBLISHED>` — Set the base price to publish a blob
+* `--blob-byte-read <BLOB_BYTE_READ>` — Set the price to read a blob, per byte
+* `--blob-byte-published <BLOB_BYTE_PUBLISHED>` — The price to publish a blob, per byte
 * `--byte-stored <BYTE_STORED>` — Set the price per byte stored
 * `--operation <OPERATION>` — Set the base price of sending an operation from a block..
 * `--operation-byte <OPERATION_BYTE>` — Set the additional price for each byte in the argument of a user operation
 * `--message <MESSAGE>` — Set the base price of sending a message from a block..
 * `--message-byte <MESSAGE_BYTE>` — Set the additional price for each byte in the argument of a user message
-* `--maximum-fuel-per-block <MAXIMUM_FUEL_PER_BLOCK>` — Set the maximum amount of fuel per block
-* `--maximum-executed-block-size <MAXIMUM_EXECUTED_BLOCK_SIZE>` — Set the maximum size of an executed block, in bytes
+* `--service-as-oracle-query <SERVICE_AS_ORACLE_QUERY>` — Set the price per query to a service as an oracle
+* `--http-request <HTTP_REQUEST>` — Set the price for performing an HTTP request
+* `--maximum-wasm-fuel-per-block <MAXIMUM_WASM_FUEL_PER_BLOCK>` — Set the maximum amount of Wasm fuel per block
+* `--maximum-evm-fuel-per-block <MAXIMUM_EVM_FUEL_PER_BLOCK>` — Set the maximum amount of EVM fuel per block
+* `--maximum-service-oracle-execution-ms <MAXIMUM_SERVICE_ORACLE_EXECUTION_MS>` — Set the maximum time in milliseconds that a block can spend executing services as oracles
+* `--maximum-block-size <MAXIMUM_BLOCK_SIZE>` — Set the maximum size of a block, in bytes
 * `--maximum-blob-size <MAXIMUM_BLOB_SIZE>` — Set the maximum size of data blobs, compressed bytecode and other binary blobs, in bytes
+* `--maximum-published-blobs <MAXIMUM_PUBLISHED_BLOBS>` — Set the maximum number of published blobs per block
 * `--maximum-bytecode-size <MAXIMUM_BYTECODE_SIZE>` — Set the maximum size of decompressed contract or service bytecode, in bytes
 * `--maximum-block-proposal-size <MAXIMUM_BLOCK_PROPOSAL_SIZE>` — Set the maximum size of a block proposal, in bytes
 * `--maximum-bytes-read-per-block <MAXIMUM_BYTES_READ_PER_BLOCK>` — Set the maximum read data per block
 * `--maximum-bytes-written-per-block <MAXIMUM_BYTES_WRITTEN_PER_BLOCK>` — Set the maximum write data per block
+* `--maximum-oracle-response-bytes <MAXIMUM_ORACLE_RESPONSE_BYTES>` — Set the maximum size of oracle responses
+* `--maximum-http-response-bytes <MAXIMUM_HTTP_RESPONSE_BYTES>` — Set the maximum size in bytes of a received HTTP response
+* `--http-request-timeout-ms <HTTP_REQUEST_TIMEOUT_MS>` — Set the maximum amount of time allowed to wait for an HTTP response
+* `--http-request-allow-list <HTTP_REQUEST_ALLOW_LIST>` — Set the list of hosts that contracts and services can send HTTP requests to
 
 
 
@@ -453,53 +525,47 @@ Create genesis configuration for a Linera deployment. Create initial user chains
 
 * `--committee <COMMITTEE_CONFIG_PATH>` — Sets the file describing the public configurations of all validators
 * `--genesis <GENESIS_CONFIG_PATH>` — The output config path to be consumed by the server
-* `--admin-root <ADMIN_ROOT>` — Index of the admin chain in the genesis config
-
-  Default value: `0`
 * `--initial-funding <INITIAL_FUNDING>` — Known initial balance of the chain
 
   Default value: `0`
 * `--start-timestamp <START_TIMESTAMP>` — The start timestamp: no blocks can be created before this time
-* `--block-price <BLOCK_PRICE>` — Set the base price for creating a block
+* `--policy-config <POLICY_CONFIG>` — Configure the resource control policy (notably fees) according to pre-defined settings
 
-  Default value: `0`
-* `--fuel-unit-price <FUEL_UNIT_PRICE>` — Set the price per unit of fuel
+  Default value: `no-fees`
 
-  Default value: `0`
-* `--read-operation-price <READ_OPERATION_PRICE>` — Set the price per read operation
+  Possible values: `no-fees`, `testnet`
 
-  Default value: `0`
-* `--write-operation-price <WRITE_OPERATION_PRICE>` — Set the price per write operation
-
-  Default value: `0`
-* `--byte-read-price <BYTE_READ_PRICE>` — Set the price per byte read
-
-  Default value: `0`
-* `--byte-written-price <BYTE_WRITTEN_PRICE>` — Set the price per byte written
-
-  Default value: `0`
-* `--byte-stored-price <BYTE_STORED_PRICE>` — Set the price per byte stored
-
-  Default value: `0`
-* `--operation-price <OPERATION_PRICE>` — Set the base price of sending an operation from a block..
-
-  Default value: `0`
-* `--operation-byte-price <OPERATION_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user operation
-
-  Default value: `0`
-* `--message-price <MESSAGE_PRICE>` — Set the base price of sending a message from a block..
-
-  Default value: `0`
-* `--message-byte-price <MESSAGE_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user message
-
-  Default value: `0`
-* `--maximum-fuel-per-block <MAXIMUM_FUEL_PER_BLOCK>` — Set the maximum amount of fuel per block
-* `--maximum-executed-block-size <MAXIMUM_EXECUTED_BLOCK_SIZE>` — Set the maximum size of an executed block
-* `--maximum-bytecode-size <MAXIMUM_BYTECODE_SIZE>` — Set the maximum size of decompressed contract or service bytecode, in bytes
-* `--maximum-blob-size <MAXIMUM_BLOB_SIZE>` — Set the maximum size of data blobs, compressed bytecode and other binary blobs, in bytes
-* `--maximum-block-proposal-size <MAXIMUM_BLOCK_PROPOSAL_SIZE>` — Set the maximum size of a block proposal, in bytes
-* `--maximum-bytes-read-per-block <MAXIMUM_BYTES_READ_PER_BLOCK>` — Set the maximum read data per block
-* `--maximum-bytes-written-per-block <MAXIMUM_BYTES_WRITTEN_PER_BLOCK>` — Set the maximum write data per block
+* `--wasm-fuel-unit-price <WASM_FUEL_UNIT_PRICE>` — Set the price per unit of Wasm fuel. (This will overwrite value from `--policy-config`)
+* `--evm-fuel-unit-price <EVM_FUEL_UNIT_PRICE>` — Set the price per unit of EVM fuel. (This will overwrite value from `--policy-config`)
+* `--read-operation-price <READ_OPERATION_PRICE>` — Set the price per read operation. (This will overwrite value from `--policy-config`)
+* `--write-operation-price <WRITE_OPERATION_PRICE>` — Set the price per write operation. (This will overwrite value from `--policy-config`)
+* `--byte-read-price <BYTE_READ_PRICE>` — Set the price per byte read. (This will overwrite value from `--policy-config`)
+* `--byte-written-price <BYTE_WRITTEN_PRICE>` — Set the price per byte written. (This will overwrite value from `--policy-config`)
+* `--blob-read-price <BLOB_READ_PRICE>` — Set the base price to read a blob. (This will overwrite value from `--policy-config`)
+* `--blob-published-price <BLOB_PUBLISHED_PRICE>` — Set the base price to publish a blob. (This will overwrite value from `--policy-config`)
+* `--blob-byte-read-price <BLOB_BYTE_READ_PRICE>` — Set the price to read a blob, per byte. (This will overwrite value from `--policy-config`)
+* `--blob-byte-published-price <BLOB_BYTE_PUBLISHED_PRICE>` — Set the price to publish a blob, per byte. (This will overwrite value from `--policy-config`)
+* `--byte-stored-price <BYTE_STORED_PRICE>` — Set the price per byte stored. (This will overwrite value from `--policy-config`)
+* `--operation-price <OPERATION_PRICE>` — Set the base price of sending an operation from a block.. (This will overwrite value from `--policy-config`)
+* `--operation-byte-price <OPERATION_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user operation. (This will overwrite value from `--policy-config`)
+* `--message-price <MESSAGE_PRICE>` — Set the base price of sending a message from a block.. (This will overwrite value from `--policy-config`)
+* `--message-byte-price <MESSAGE_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user message. (This will overwrite value from `--policy-config`)
+* `--service-as-oracle-query-price <SERVICE_AS_ORACLE_QUERY_PRICE>` — Set the price per query to a service as an oracle
+* `--http-request-price <HTTP_REQUEST_PRICE>` — Set the price for performing an HTTP request
+* `--maximum-wasm-fuel-per-block <MAXIMUM_WASM_FUEL_PER_BLOCK>` — Set the maximum amount of Wasm fuel per block. (This will overwrite value from `--policy-config`)
+* `--maximum-evm-fuel-per-block <MAXIMUM_EVM_FUEL_PER_BLOCK>` — Set the maximum amount of EVM fuel per block. (This will overwrite value from `--policy-config`)
+* `--maximum-service-oracle-execution-ms <MAXIMUM_SERVICE_ORACLE_EXECUTION_MS>` — Set the maximum time in milliseconds that a block can spend executing services as oracles
+* `--maximum-block-size <MAXIMUM_BLOCK_SIZE>` — Set the maximum size of a block. (This will overwrite value from `--policy-config`)
+* `--maximum-bytecode-size <MAXIMUM_BYTECODE_SIZE>` — Set the maximum size of decompressed contract or service bytecode, in bytes. (This will overwrite value from `--policy-config`)
+* `--maximum-blob-size <MAXIMUM_BLOB_SIZE>` — Set the maximum size of data blobs, compressed bytecode and other binary blobs, in bytes. (This will overwrite value from `--policy-config`)
+* `--maximum-published-blobs <MAXIMUM_PUBLISHED_BLOBS>` — Set the maximum number of published blobs per block. (This will overwrite value from `--policy-config`)
+* `--maximum-block-proposal-size <MAXIMUM_BLOCK_PROPOSAL_SIZE>` — Set the maximum size of a block proposal, in bytes. (This will overwrite value from `--policy-config`)
+* `--maximum-bytes-read-per-block <MAXIMUM_BYTES_READ_PER_BLOCK>` — Set the maximum read data per block. (This will overwrite value from `--policy-config`)
+* `--maximum-bytes-written-per-block <MAXIMUM_BYTES_WRITTEN_PER_BLOCK>` — Set the maximum write data per block. (This will overwrite value from `--policy-config`)
+* `--maximum-oracle-response-bytes <MAXIMUM_ORACLE_RESPONSE_BYTES>` — Set the maximum size of oracle responses. (This will overwrite value from `--policy-config`)
+* `--maximum-http-response-bytes <MAXIMUM_HTTP_RESPONSE_BYTES>` — Set the maximum size in bytes of a received HTTP response
+* `--http-request-timeout-ms <HTTP_REQUEST_TIMEOUT_MS>` — Set the maximum amount of time allowed to wait for an HTTP response
+* `--http-request-allow-list <HTTP_REQUEST_ALLOW_LIST>` — Set the list of hosts that contracts and services can send HTTP requests to
 * `--testing-prng-seed <TESTING_PRNG_SEED>` — Force this wallet to generate keys using a PRNG and a given seed. USE FOR TESTING ONLY
 * `--network-name <NETWORK_NAME>` — A unique name to identify this network
 
@@ -525,7 +591,7 @@ Watch the network for notifications
 
 Run a GraphQL service to explore and extend the chains of the wallet
 
-**Usage:** `linera service [OPTIONS]`
+**Usage:** `linera service [OPTIONS] --port <PORT>`
 
 ###### **Options:**
 
@@ -537,8 +603,6 @@ Run a GraphQL service to explore and extend the chains of the wallet
 
   Default value: `0`
 * `--port <PORT>` — The port on which to run the server
-
-  Default value: `8080`
 
 
 
@@ -569,17 +633,42 @@ Run a GraphQL service that exposes a faucet where users can claim tokens. This g
 
 
 
-## `linera publish-bytecode`
+## `linera publish-module`
 
-Publish bytecode
+Publish module
 
-**Usage:** `linera publish-bytecode <CONTRACT> <SERVICE> [PUBLISHER]`
+**Usage:** `linera publish-module [OPTIONS] <CONTRACT> <SERVICE> [PUBLISHER]`
 
 ###### **Arguments:**
 
 * `<CONTRACT>` — Path to the Wasm file for the application "contract" bytecode
 * `<SERVICE>` — Path to the Wasm file for the application "service" bytecode
-* `<PUBLISHER>` — An optional chain ID to publish the bytecode. The default chain of the wallet is used otherwise
+* `<PUBLISHER>` — An optional chain ID to publish the module. The default chain of the wallet is used otherwise
+
+###### **Options:**
+
+* `--vm-runtime <VM_RUNTIME>` — The virtual machine runtime to use
+
+  Default value: `wasm`
+
+
+
+## `linera list-events-from-index`
+
+Print events from a specific chain and stream from a specified index
+
+**Usage:** `linera list-events-from-index [OPTIONS] --stream-id <STREAM_ID> [CHAIN_ID]`
+
+###### **Arguments:**
+
+* `<CHAIN_ID>` — The chain to query. If omitted, query the default chain of the wallet
+
+###### **Options:**
+
+* `--stream-id <STREAM_ID>` — The stream being considered
+* `--start-index <START_INDEX>` — Index of the message to start with
+
+  Default value: `0`
 
 
 
@@ -613,11 +702,11 @@ Verify that a data blob is readable
 
 Create an application
 
-**Usage:** `linera create-application [OPTIONS] <BYTECODE_ID> [CREATOR]`
+**Usage:** `linera create-application [OPTIONS] <MODULE_ID> [CREATOR]`
 
 ###### **Arguments:**
 
-* `<BYTECODE_ID>` — The bytecode ID of the application to create
+* `<MODULE_ID>` — The module ID of the application to create
 * `<CREATOR>` — An optional chain ID to host the application. The default chain of the wallet is used otherwise
 
 ###### **Options:**
@@ -632,7 +721,7 @@ Create an application
 
 ## `linera publish-and-create`
 
-Create an application, and publish the required bytecode
+Create an application, and publish the required module
 
 **Usage:** `linera publish-and-create [OPTIONS] <CONTRACT> <SERVICE> [PUBLISHER]`
 
@@ -640,10 +729,13 @@ Create an application, and publish the required bytecode
 
 * `<CONTRACT>` — Path to the Wasm file for the application "contract" bytecode
 * `<SERVICE>` — Path to the Wasm file for the application "service" bytecode
-* `<PUBLISHER>` — An optional chain ID to publish the bytecode. The default chain of the wallet is used otherwise
+* `<PUBLISHER>` — An optional chain ID to publish the module. The default chain of the wallet is used otherwise
 
 ###### **Options:**
 
+* `--vm-runtime <VM_RUNTIME>` — The virtual machine runtime to use
+
+  Default value: `wasm`
 * `--json-parameters <JSON_PARAMETERS>` — The shared parameters as JSON string
 * `--json-parameters-path <JSON_PARAMETERS_PATH>` — Path to a JSON file containing the shared parameters
 * `--json-argument <JSON_ARGUMENT>` — The instantiation argument as a JSON string
@@ -652,26 +744,9 @@ Create an application, and publish the required bytecode
 
 
 
-## `linera request-application`
-
-Request an application from another chain, so it can be used on this one
-
-**Usage:** `linera request-application [OPTIONS] <APPLICATION_ID>`
-
-###### **Arguments:**
-
-* `<APPLICATION_ID>` — The ID of the application to request
-
-###### **Options:**
-
-* `--target-chain-id <TARGET_CHAIN_ID>` — The target chain on which the application is already registered. If not specified, the chain on which the application was created is used
-* `--requester-chain-id <REQUESTER_CHAIN_ID>` — The owned chain on which the application is missing
-
-
-
 ## `linera keygen`
 
-Create an unassigned key-pair
+Create an unassigned key pair
 
 **Usage:** `linera keygen`
 
@@ -679,14 +754,14 @@ Create an unassigned key-pair
 
 ## `linera assign`
 
-Link a key owned by the wallet to a chain that was just created for that key
+Link the owner to the chain. Expects that the caller has a private key corresponding to the `public_key`, otherwise block proposals will fail when signing with it
 
-**Usage:** `linera assign --key <KEY> --message-id <MESSAGE_ID>`
+**Usage:** `linera assign --owner <OWNER> --chain-id <CHAIN_ID>`
 
 ###### **Options:**
 
-* `--key <KEY>` — The public key to assign
-* `--message-id <MESSAGE_ID>` — The ID of the message that created the chain. (This uniquely describes the chain and where it was created.)
+* `--owner <OWNER>` — The owner to assign
+* `--chain-id <CHAIN_ID>` — The ID of the chain
 
 
 
@@ -715,7 +790,9 @@ Show the contents of the wallet
 * `show` — Show the contents of the wallet
 * `set-default` — Change the wallet default chain
 * `init` — Initialize a wallet from the genesis configuration
-* `forget-keys` — Forgets the specified chain's keys
+* `request-chain` — Request a new chain from a faucet and add it to the wallet
+* `follow-chain` — Add a new followed chain (i.e. a chain without keypair) to the wallet
+* `forget-keys` — Forgets the specified chain's keys. The chain will still be followed by the wallet
 * `forget-chain` — Forgets the specified chain, including the associated key pair
 
 
@@ -759,15 +836,38 @@ Initialize a wallet from the genesis configuration
 
 * `--genesis <GENESIS_CONFIG_PATH>` — The path to the genesis configuration for a Linera deployment. Either this or `--faucet` must be specified
 * `--faucet <FAUCET>` — The address of a faucet
-* `--with-new-chain` — Request a new chain from the faucet, credited with tokens. This requires `--faucet`
-* `--with-other-chains <WITH_OTHER_CHAINS>` — Other chains to follow
 * `--testing-prng-seed <TESTING_PRNG_SEED>` — Force this wallet to generate keys using a PRNG and a given seed. USE FOR TESTING ONLY
+
+
+
+## `linera wallet request-chain`
+
+Request a new chain from a faucet and add it to the wallet
+
+**Usage:** `linera wallet request-chain [OPTIONS] --faucet <FAUCET>`
+
+###### **Options:**
+
+* `--faucet <FAUCET>` — The address of a faucet
+* `--set-default` — Whether this chain should become the default chain
+
+
+
+## `linera wallet follow-chain`
+
+Add a new followed chain (i.e. a chain without keypair) to the wallet
+
+**Usage:** `linera wallet follow-chain <CHAIN_ID>`
+
+###### **Arguments:**
+
+* `<CHAIN_ID>` — The chain ID
 
 
 
 ## `linera wallet forget-keys`
 
-Forgets the specified chain's keys
+Forgets the specified chain's keys. The chain will still be followed by the wallet
 
 **Usage:** `linera wallet forget-keys <CHAIN_ID>`
 
@@ -842,13 +942,16 @@ Build and publish a Linera project
 ###### **Arguments:**
 
 * `<PATH>` — The path of the root of the Linera project. Defaults to current working directory if unspecified
-* `<NAME>` — Specify the name of the Linera project. This is used to locate the generated bytecode. The generated bytecode should be of the form `<name>_{contract,service}.wasm`.
+* `<NAME>` — Specify the name of the Linera project. This is used to locate the generated bytecode files. The generated bytecode files should be of the form `<name>_{contract,service}.wasm`.
 
    Defaults to the package name in Cargo.toml, with dashes replaced by underscores.
-* `<PUBLISHER>` — An optional chain ID to publish the bytecode. The default chain of the wallet is used otherwise
+* `<PUBLISHER>` — An optional chain ID to publish the module. The default chain of the wallet is used otherwise
 
 ###### **Options:**
 
+* `--vm-runtime <VM_RUNTIME>` — The virtual machine runtime to use
+
+  Default value: `wasm`
 * `--json-parameters <JSON_PARAMETERS>` — The shared parameters as JSON string
 * `--json-parameters-path <JSON_PARAMETERS_PATH>` — Path to a JSON file containing the shared parameters
 * `--json-argument <JSON_ARGUMENT>` — The instantiation argument as a JSON string
@@ -878,38 +981,57 @@ Start a Local Linera Network
 
 ###### **Options:**
 
-* `--extra-wallets <EXTRA_WALLETS>` — The number of extra wallets and user chains to initialise. Default is 0
-* `--other-initial-chains <OTHER_INITIAL_CHAINS>` — The number of initial "root" chains created in the genesis config on top of the default "admin" chain. All initial chains belong to the first "admin" wallet
+* `--other-initial-chains <OTHER_INITIAL_CHAINS>` — The number of initial "root" chains created in the genesis config on top of the default "admin" chain. All initial chains belong to the first "admin" wallet. It is recommended to use at least one other initial chain for the faucet
 
   Default value: `2`
 * `--initial-amount <INITIAL_AMOUNT>` — The initial amount of native tokens credited in the initial "root" chains, including the default "admin" chain
 
   Default value: `1000000`
-* `--validators <VALIDATORS>` — The number of validators in the local test network. Default is 1
+* `--validators <VALIDATORS>` — The number of validators in the local test network
 
   Default value: `1`
-* `--shards <SHARDS>` — The number of shards per validator in the local test network. Default is 1
+* `--shards <SHARDS>` — The number of shards per validator in the local test network
 
   Default value: `1`
 * `--policy-config <POLICY_CONFIG>` — Configure the resource control policy (notably fees) according to pre-defined settings
 
-  Default value: `default`
+  Default value: `no-fees`
 
-  Possible values: `default`, `only-fuel`, `fuel-and-block`, `all-categories`, `devnet`
+  Possible values: `no-fees`, `testnet`
 
+* `--cross-chain-queue-size <QUEUE_SIZE>` — Number of cross-chain messages allowed before dropping them
+
+  Default value: `1000`
+* `--cross-chain-max-retries <MAX_RETRIES>` — Maximum number of retries for a cross-chain message
+
+  Default value: `10`
+* `--cross-chain-retry-delay-ms <RETRY_DELAY_MS>` — Delay before retrying of cross-chain message
+
+  Default value: `2000`
+* `--cross-chain-sender-delay-ms <SENDER_DELAY_MS>` — Introduce a delay before sending every cross-chain message (e.g. for testing purpose)
+
+  Default value: `0`
+* `--cross-chain-sender-failure-rate <SENDER_FAILURE_RATE>` — Drop cross-chain messages randomly at the given rate (0 <= rate < 1) (meant for testing)
+
+  Default value: `0.0`
 * `--testing-prng-seed <TESTING_PRNG_SEED>` — Force this wallet to generate keys using a PRNG and a given seed. USE FOR TESTING ONLY
 * `--path <PATH>` — Run with a specific path where the wallet and validator input files are. If none, then a temporary directory is created
-* `--storage <STORAGE>` — Run with a specific storage. If none, then a linera-storage-service is started on a random free port
-* `--external-protocol <EXTERNAL_PROTOCOL>` — External protocol used, either grpc or grpcs
+* `--external-protocol <EXTERNAL_PROTOCOL>` — External protocol used, either `grpc` or `grpcs`
 
   Default value: `grpc`
-* `--with-faucet-chain <WITH_FAUCET_CHAIN>` — If present, a faucet is started using the given chain root number (0 for the admin chain, 1 for the first non-admin initial chain, etc)
+* `--with-faucet` — If present, a faucet is started using the chain provided by --faucet-chain, or `ChainId::root(1)` if not provided, as root 0 is usually the admin chain
+
+  Default value: `false`
+* `--faucet-chain <FAUCET_CHAIN>` — When using --with-faucet, this specifies the chain on which the faucet will be started. The chain is specified by its root number (0 for the admin chain, 1 for the first non-admin initial chain, etc)
 * `--faucet-port <FAUCET_PORT>` — The port on which to run the faucet server
 
   Default value: `8080`
 * `--faucet-amount <FAUCET_AMOUNT>` — The number of tokens to send to each new chain created by the faucet
 
   Default value: `1000`
+* `--block-exporters <BLOCK_EXPORTERS>` — The number of block exporters per validator in the local test network. Default is 0
+
+  Default value: `0`
 
 
 
@@ -929,60 +1051,37 @@ Operation on the storage
 
 ###### **Subcommands:**
 
-* `delete_all` — Delete all the namespaces of the database
-* `delete_namespace` — Delete a single namespace from the database
-* `check_existence` — Check existence of a namespace in the database
-* `check_absence` — Check absence of a namespace in the database
+* `delete-all` — Delete all the namespaces in the database
+* `delete-namespace` — Delete a single namespace from the database
+* `check-existence` — Check existence of a namespace in the database
 * `initialize` — Initialize a namespace in the database
-* `list_namespaces` — List the namespaces of the database
+* `list-namespaces` — List the namespaces in the database
+* `list-blob-ids` — List the blob IDs in the database
+* `list-chain-ids` — List the chain IDs in the database
 
 
 
-## `linera storage delete_all`
+## `linera storage delete-all`
 
-Delete all the namespaces of the database
+Delete all the namespaces in the database
 
-**Usage:** `linera storage delete_all --storage <STORAGE_CONFIG>`
-
-###### **Options:**
-
-* `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
+**Usage:** `linera storage delete-all`
 
 
 
-## `linera storage delete_namespace`
+## `linera storage delete-namespace`
 
 Delete a single namespace from the database
 
-**Usage:** `linera storage delete_namespace --storage <STORAGE_CONFIG>`
-
-###### **Options:**
-
-* `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
+**Usage:** `linera storage delete-namespace`
 
 
 
-## `linera storage check_existence`
+## `linera storage check-existence`
 
 Check existence of a namespace in the database
 
-**Usage:** `linera storage check_existence --storage <STORAGE_CONFIG>`
-
-###### **Options:**
-
-* `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
-
-
-
-## `linera storage check_absence`
-
-Check absence of a namespace in the database
-
-**Usage:** `linera storage check_absence --storage <STORAGE_CONFIG>`
-
-###### **Options:**
-
-* `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
+**Usage:** `linera storage check-existence`
 
 
 
@@ -990,23 +1089,35 @@ Check absence of a namespace in the database
 
 Initialize a namespace in the database
 
-**Usage:** `linera storage initialize --storage <STORAGE_CONFIG>`
+**Usage:** `linera storage initialize --genesis <GENESIS_CONFIG_PATH>`
 
 ###### **Options:**
 
-* `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
+* `--genesis <GENESIS_CONFIG_PATH>`
 
 
 
-## `linera storage list_namespaces`
+## `linera storage list-namespaces`
 
-List the namespaces of the database
+List the namespaces in the database
 
-**Usage:** `linera storage list_namespaces --storage <STORAGE_CONFIG>`
+**Usage:** `linera storage list-namespaces`
 
-###### **Options:**
 
-* `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
+
+## `linera storage list-blob-ids`
+
+List the blob IDs in the database
+
+**Usage:** `linera storage list-blob-ids`
+
+
+
+## `linera storage list-chain-ids`
+
+List the chain IDs in the database
+
+**Usage:** `linera storage list-chain-ids`
 
 
 

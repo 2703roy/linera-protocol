@@ -7,7 +7,7 @@ mod state;
 
 use counter::CounterAbi;
 use linera_sdk::{
-    base::WithContractAbi,
+    linera_base_types::WithContractAbi,
     views::{RootView, View},
     Contract, ContractRuntime,
 };
@@ -29,6 +29,7 @@ impl Contract for CounterContract {
     type Message = ();
     type InstantiationArgument = u64;
     type Parameters = ();
+    type EventValue = ();
 
     async fn load(runtime: ContractRuntime<Self>) -> Self {
         let state = CounterState::load(runtime.root_view_storage_context())

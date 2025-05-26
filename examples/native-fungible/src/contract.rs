@@ -5,7 +5,7 @@
 
 use fungible::{FungibleResponse, FungibleTokenAbi, InitialState, Operation, Parameters};
 use linera_sdk::{
-    base::{Account, AccountOwner, ChainId, WithContractAbi},
+    linera_base_types::{Account, AccountOwner, ChainId, WithContractAbi},
     Contract, ContractRuntime,
 };
 use native_fungible::{Message, TICKER_SYMBOL};
@@ -24,6 +24,7 @@ impl Contract for NativeFungibleTokenContract {
     type Message = Message;
     type Parameters = Parameters;
     type InstantiationArgument = InitialState;
+    type EventValue = ();
 
     async fn load(runtime: ContractRuntime<Self>) -> Self {
         NativeFungibleTokenContract { runtime }
@@ -38,9 +39,9 @@ impl Contract for NativeFungibleTokenContract {
         for (owner, amount) in state.accounts {
             let account = Account {
                 chain_id: self.runtime.chain_id(),
-                owner: Some(owner),
+                owner,
             };
-            self.runtime.transfer(None, account, amount);
+            self.runtime.transfer(AccountOwner::CHAIN, account, amount);
         }
     }
 
@@ -58,12 +59,14 @@ impl Contract for NativeFungibleTokenContract {
                 amount,
                 target_account,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Transfer operation");
 
                 let fungible_target_account = target_account;
                 let target_account = self.normalize_account(target_account);
 
-                self.runtime.transfer(Some(owner), target_account, amount);
+                self.runtime.transfer(owner, target_account, amount);
 
                 self.transfer(fungible_target_account.chain_id);
                 FungibleResponse::Ok
@@ -74,7 +77,9 @@ impl Contract for NativeFungibleTokenContract {
                 amount,
                 target_account,
             } => {
-                self.check_account_authentication(source_account.owner);
+                self.runtime
+                    .check_account_permission(source_account.owner)
+                    .expect("Permission for Claim operation");
 
                 let fungible_source_account = source_account;
                 let fungible_target_account = target_account;
@@ -129,21 +134,7 @@ impl NativeFungibleTokenContract {
     fn normalize_account(&self, account: fungible::Account) -> Account {
         Account {
             chain_id: account.chain_id,
-            owner: Some(account.owner),
-        }
-    }
-
-    /// Verifies that a transfer is authenticated for this local account.
-    fn check_account_authentication(&mut self, owner: AccountOwner) {
-        match owner {
-            AccountOwner::User(address) => {
-                assert_eq!(
-                    self.runtime.authenticated_signer(),
-                    Some(address),
-                    "The requested transfer is not correctly authenticated."
-                );
-            }
-            AccountOwner::Application(_) => panic!("Applications not supported yet"),
+            owner: account.owner,
         }
     }
 }

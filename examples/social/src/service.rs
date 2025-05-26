@@ -9,13 +9,15 @@ use std::sync::Arc;
 
 use async_graphql::{EmptySubscription, Request, Response, Schema};
 use linera_sdk::{
-    base::WithServiceAbi, graphql::GraphQLMutationRoot, views::View, Service, ServiceRuntime,
+    graphql::GraphQLMutationRoot, linera_base_types::WithServiceAbi, views::View, Service,
+    ServiceRuntime,
 };
 use social::Operation;
 use state::SocialState;
 
 pub struct SocialService {
     state: Arc<SocialState>,
+    runtime: Arc<ServiceRuntime<Self>>,
 }
 
 linera_sdk::service!(SocialService);
@@ -33,13 +35,14 @@ impl Service for SocialService {
             .expect("Failed to load state");
         SocialService {
             state: Arc::new(state),
+            runtime: Arc::new(runtime),
         }
     }
 
     async fn handle_query(&self, request: Request) -> Response {
         let schema = Schema::build(
             self.state.clone(),
-            Operation::mutation_root(),
+            Operation::mutation_root(self.runtime.clone()),
             EmptySubscription,
         )
         .finish();

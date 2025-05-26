@@ -48,7 +48,7 @@ macro_rules! contract {
                     unsafe { &mut CONTRACT },
                     move |contract| {
                         let argument = $crate::serde_json::from_slice(&argument)
-                            .expect("Failed to deserialize instantiation argument");
+                            .unwrap_or_else(|_| panic!("Failed to deserialize instantiation argument {argument:?}"));
 
                         contract.instantiate(argument).blocking_wait()
                     },
@@ -60,14 +60,13 @@ macro_rules! contract {
                 $crate::contract::run_async_entrypoint::<$contract, _, _>(
                     unsafe { &mut CONTRACT },
                     move |contract| {
-                        let operation: <$contract as $crate::abi::ContractAbi>::Operation =
-                            $crate::bcs::from_bytes(&operation)
-                                .expect("Failed to deserialize operation");
+                        let operation = <$contract as $crate::abi::ContractAbi>::deserialize_operation(operation)
+                            .expect("Failed to deserialize `Operation` in execute_operation");
 
                         let response = contract.execute_operation(operation).blocking_wait();
 
-                        $crate::bcs::to_bytes(&response)
-                            .expect("Failed to serialize contract's `Response`")
+                        <$contract as $crate::abi::ContractAbi>::serialize_response(response)
+                            .expect("Failed to serialize `Response` in execute_operation")
                     },
                 )
             }
@@ -82,6 +81,19 @@ macro_rules! contract {
                                 .expect("Failed to deserialize message");
 
                         contract.execute_message(message).blocking_wait()
+                    },
+                )
+            }
+
+            fn process_streams(updates: Vec<
+                $crate::contract::wit::exports::linera::app::contract_entrypoints::StreamUpdate,
+            >) {
+                use $crate::util::BlockingWait;
+                $crate::contract::run_async_entrypoint::<$contract, _, _>(
+                    unsafe { &mut CONTRACT },
+                    move |contract| {
+                        let updates = updates.into_iter().map(Into::into).collect();
+                        contract.process_streams(updates).blocking_wait()
                     },
                 )
             }

@@ -4,31 +4,27 @@
 use std::collections::BTreeMap;
 
 use linera_base::{
-    data_types::{Amount, Timestamp},
+    crypto::ValidatorPublicKey,
+    data_types::{Amount, ChainDescription, Epoch, Timestamp},
     doc_scalar,
-    identifiers::{AccountOwner, ChainDescription, ChainId},
+    identifiers::{AccountOwner, ChainId},
     ownership::ChainOwnership,
 };
 use linera_views::{context::Context, map_view::MapView};
 
 use crate::{
-    committee::{Committee, Epoch, ValidatorName, ValidatorState},
+    committee::{Committee, ValidatorState},
     system::{Recipient, UserData},
-    ChannelSubscription, ExecutionStateView, SystemExecutionStateView,
+    ExecutionStateView, SystemExecutionStateView,
 };
 
-doc_scalar!(
-    Epoch,
-    "A number identifying the configuration of the chain (aka the committee)"
-);
 doc_scalar!(Recipient, "The recipient of a transfer");
 doc_scalar!(UserData, "Optional user message attached to a transfer");
-doc_scalar!(ValidatorName, "The identity of a validator");
 
 #[async_graphql::Object(cache_control(no_cache))]
 impl Committee {
     #[graphql(derived(name = "validators"))]
-    async fn _validators(&self) -> &BTreeMap<ValidatorName, ValidatorState> {
+    async fn _validators(&self) -> &BTreeMap<ValidatorPublicKey, ValidatorState> {
         self.validators()
     }
 
@@ -64,18 +60,13 @@ impl<C: Send + Sync + Context> SystemExecutionStateView<C> {
     }
 
     #[graphql(derived(name = "epoch"))]
-    async fn _epoch(&self) -> &Option<Epoch> {
+    async fn _epoch(&self) -> &Epoch {
         self.epoch.get()
     }
 
     #[graphql(derived(name = "admin_id"))]
     async fn _admin_id(&self) -> &Option<ChainId> {
         self.admin_id.get()
-    }
-
-    #[graphql(derived(name = "subscription"))]
-    async fn _subscriptions(&self) -> Result<Vec<ChannelSubscription>, async_graphql::Error> {
-        Ok(self.subscriptions.indices().await?)
     }
 
     #[graphql(derived(name = "committees"))]

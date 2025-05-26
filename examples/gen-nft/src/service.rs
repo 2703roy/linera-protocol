@@ -10,7 +10,7 @@ mod token;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use async_graphql::{Context, EmptySubscription, Object, Request, Response, Schema};
@@ -18,7 +18,8 @@ use base64::engine::{general_purpose::STANDARD_NO_PAD, Engine as _};
 use fungible::Account;
 use gen_nft::{NftOutput, Operation, TokenId};
 use linera_sdk::{
-    base::{AccountOwner, WithServiceAbi},
+    http,
+    linera_base_types::{AccountOwner, WithServiceAbi},
     views::View,
     Service, ServiceRuntime,
 };
@@ -29,7 +30,7 @@ use crate::model::ModelContext;
 
 pub struct GenNftService {
     state: Arc<GenNftState>,
-    runtime: Arc<Mutex<ServiceRuntime<Self>>>,
+    runtime: Arc<ServiceRuntime<Self>>,
 }
 
 linera_sdk::service!(GenNftService);
@@ -47,7 +48,7 @@ impl Service for GenNftService {
             .expect("Failed to load state");
         GenNftService {
             state: Arc::new(state),
-            runtime: Arc::new(Mutex::new(runtime)),
+            runtime: Arc::new(runtime),
         }
     }
 
@@ -57,7 +58,9 @@ impl Service for GenNftService {
             QueryRoot {
                 non_fungible_token: self.state.clone(),
             },
-            MutationRoot,
+            MutationRoot {
+                runtime: self.runtime.clone(),
+            },
             EmptySubscription,
         )
         .data(runtime)
@@ -162,14 +165,14 @@ impl QueryRoot {
     }
 
     async fn prompt(&self, ctx: &Context<'_>, prompt: String) -> String {
-        let runtime = ctx
-            .data::<Arc<Mutex<ServiceRuntime<GenNftService>>>>()
-            .unwrap();
-        let runtime = runtime.lock().unwrap();
+        let runtime = ctx.data::<Arc<ServiceRuntime<GenNftService>>>().unwrap();
         info!("prompt: {}", prompt);
-        let raw_weights = runtime.fetch_url("http://localhost:10001/model.bin");
+        let response = runtime.http_request(http::Request::get("http://localhost:10001/model.bin"));
+        let raw_weights = response.body;
         info!("got weights: {}B", raw_weights.len());
-        let tokenizer_bytes = runtime.fetch_url("http://localhost:10001/tokenizer.json");
+        let response =
+            runtime.http_request(http::Request::get("http://localhost:10001/tokenizer.json"));
+        let tokenizer_bytes = response.body;
         let model_context = ModelContext {
             model: raw_weights,
             tokenizer: tokenizer_bytes,
@@ -178,12 +181,16 @@ impl QueryRoot {
     }
 }
 
-struct MutationRoot;
+struct MutationRoot {
+    runtime: Arc<ServiceRuntime<GenNftService>>,
+}
 
 #[Object]
 impl MutationRoot {
-    async fn mint(&self, minter: AccountOwner, prompt: String) -> Vec<u8> {
-        bcs::to_bytes(&Operation::Mint { minter, prompt }).unwrap()
+    async fn mint(&self, minter: AccountOwner, prompt: String) -> [u8; 0] {
+        let operation = Operation::Mint { minter, prompt };
+        self.runtime.schedule_operation(&operation);
+        []
     }
 
     async fn transfer(
@@ -191,15 +198,16 @@ impl MutationRoot {
         source_owner: AccountOwner,
         token_id: String,
         target_account: Account,
-    ) -> Vec<u8> {
-        bcs::to_bytes(&Operation::Transfer {
+    ) -> [u8; 0] {
+        let operation = Operation::Transfer {
             source_owner,
             token_id: TokenId {
                 id: STANDARD_NO_PAD.decode(token_id).unwrap(),
             },
             target_account,
-        })
-        .unwrap()
+        };
+        self.runtime.schedule_operation(&operation);
+        []
     }
 
     async fn claim(
@@ -207,14 +215,15 @@ impl MutationRoot {
         source_account: Account,
         token_id: String,
         target_account: Account,
-    ) -> Vec<u8> {
-        bcs::to_bytes(&Operation::Claim {
+    ) -> [u8; 0] {
+        let operation = Operation::Claim {
             source_account,
             token_id: TokenId {
                 id: STANDARD_NO_PAD.decode(token_id).unwrap(),
             },
             target_account,
-        })
-        .unwrap()
+        };
+        self.runtime.schedule_operation(&operation);
+        []
     }
 }

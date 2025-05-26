@@ -3,11 +3,11 @@
 
 use linera_views::{
     batch::Batch,
-    context::{create_test_memory_context, Context as _},
+    context::{Context as _, MemoryContext},
     key_value_store_view::ViewContainer,
     memory::MemoryStore,
     random::make_deterministic_rng,
-    store::TestKeyValueStore as _,
+    store::{ReadableKeyValueStore as _, TestKeyValueStore as _, WritableKeyValueStore as _},
     test_utils::{
         big_read_multi_values, get_random_test_scenarios, run_big_write_read, run_reads,
         run_writes_from_blank, run_writes_from_state,
@@ -19,6 +19,9 @@ use wasm_bindgen_test::wasm_bindgen_test;
 
 #[cfg(web)]
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+#[cfg(any(with_dynamodb, with_scylladb))]
+use linera_views::test_utils::access_admin_test;
 
 #[ignore]
 #[tokio::test]
@@ -75,10 +78,13 @@ async fn test_reads_rocks_db() {
 #[cfg(with_dynamodb)]
 #[tokio::test]
 async fn test_reads_dynamo_db() {
+    use linera_views::store::AdminKeyValueStore as _;
+
     for scenario in get_random_test_scenarios() {
         let store = linera_views::dynamo_db::DynamoDbStore::new_test_store()
             .await
             .unwrap();
+        let store = store.clone_with_root_key(&[]).unwrap();
         run_reads(store, scenario).await;
     }
 }
@@ -86,6 +92,20 @@ async fn test_reads_dynamo_db() {
 #[cfg(with_scylladb)]
 #[tokio::test]
 async fn test_reads_scylla_db() {
+    use linera_views::store::AdminKeyValueStore as _;
+
+    for scenario in get_random_test_scenarios() {
+        let store = linera_views::scylla_db::ScyllaDbStore::new_test_store()
+            .await
+            .unwrap();
+        let store = store.clone_with_root_key(&[]).unwrap();
+        run_reads(store, scenario).await;
+    }
+}
+
+#[cfg(with_scylladb)]
+#[tokio::test]
+async fn test_reads_scylla_db_no_root_key() {
     for scenario in get_random_test_scenarios() {
         let store = linera_views::scylla_db::ScyllaDbStore::new_test_store()
             .await
@@ -106,7 +126,7 @@ async fn test_reads_indexed_db() {
 #[tokio::test]
 async fn test_reads_key_value_store_view_memory() {
     for scenario in get_random_test_scenarios() {
-        let context = create_test_memory_context();
+        let context = MemoryContext::new_for_testing(());
         let key_value_store = ViewContainer::new(context).await.unwrap();
         run_reads(key_value_store, scenario).await;
     }
@@ -138,7 +158,7 @@ async fn test_memory_writes_from_blank() {
 
 #[tokio::test]
 async fn test_key_value_store_view_memory_writes_from_blank() {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let key_value_store = ViewContainer::new(context).await.unwrap();
     run_writes_from_blank(&key_value_store).await;
 }
@@ -180,7 +200,7 @@ async fn test_indexed_db_writes_from_blank() {
 #[tokio::test]
 async fn test_big_value_read_write() {
     use rand::{distributions::Alphanumeric, Rng};
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     for count in [50, 1024] {
         let rng = make_deterministic_rng();
         let test_string = rng
@@ -191,8 +211,13 @@ async fn test_big_value_read_write() {
         let mut batch = Batch::new();
         let key = vec![43, 23, 56];
         batch.put_key_value(key.clone(), &test_string).unwrap();
-        context.write_batch(batch).await.unwrap();
-        let read_string = context.read_value::<String>(&key).await.unwrap().unwrap();
+        context.store().write_batch(batch).await.unwrap();
+        let read_string = context
+            .store()
+            .read_value::<String>(&key)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(read_string, test_string);
     }
 }
@@ -200,7 +225,19 @@ async fn test_big_value_read_write() {
 #[cfg(with_scylladb)]
 #[tokio::test]
 async fn scylla_db_tombstone_triggering_test() {
+    use linera_views::store::AdminKeyValueStore as _;
+
     let store = linera_views::scylla_db::ScyllaDbStore::new_test_store()
+        .await
+        .unwrap();
+    let store = store.clone_with_root_key(&[]).unwrap();
+    linera_views::test_utils::tombstone_triggering_test(store).await;
+}
+
+#[cfg(with_rocksdb)]
+#[tokio::test]
+async fn rocks_db_tombstone_triggering_test() {
+    let store = linera_views::rocks_db::RocksDbStore::new_test_store()
         .await
         .unwrap();
     linera_views::test_utils::tombstone_triggering_test(store).await;
@@ -209,9 +246,12 @@ async fn scylla_db_tombstone_triggering_test() {
 #[cfg(with_scylladb)]
 #[tokio::test]
 async fn test_scylla_db_big_write_read() {
+    use linera_views::store::AdminKeyValueStore as _;
+
     let store = linera_views::scylla_db::ScyllaDbStore::new_test_store()
         .await
         .unwrap();
+    let store = store.clone_with_root_key(&[]).unwrap();
     let value_sizes = vec![100, 1000, 200000, 5000000];
     let target_size = 20000000;
     run_big_write_read(store, target_size, value_sizes).await;
@@ -248,9 +288,12 @@ async fn test_indexed_db_big_write_read() {
 #[cfg(with_dynamodb)]
 #[tokio::test]
 async fn test_dynamo_db_big_write_read() {
+    use linera_views::store::AdminKeyValueStore as _;
+
     let store = linera_views::dynamo_db::DynamoDbStore::new_test_store()
         .await
         .unwrap();
+    let store = store.clone_with_root_key(&[]).unwrap();
     let value_sizes = vec![100, 1000, 200000, 5000000];
     let target_size = 20000000;
     run_big_write_read(store, target_size, value_sizes).await;
@@ -294,4 +337,16 @@ async fn test_scylla_db_writes_from_state() {
         .await
         .unwrap();
     run_writes_from_state(&store).await;
+}
+
+#[cfg(with_scylladb)]
+#[tokio::test]
+async fn test_scylladb_access() {
+    access_admin_test::<linera_views::scylla_db::ScyllaDbStore>().await
+}
+
+#[cfg(with_dynamodb)]
+#[tokio::test]
+async fn test_dynamodb_access() {
+    access_admin_test::<linera_views::dynamo_db::DynamoDbStore>().await
 }

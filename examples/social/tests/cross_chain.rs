@@ -5,7 +5,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use linera_sdk::test::TestValidator;
+use linera_sdk::test::{QueryOutcome, TestValidator};
 use social::Operation;
 
 /// Test posting messages across microchains.
@@ -14,12 +14,12 @@ use social::Operation;
 /// send a message to chain2 and see it received on chain1.
 #[tokio::test]
 async fn test_cross_chain_posting() {
-    let (validator, bytecode_id) =
-        TestValidator::with_current_bytecode::<social::SocialAbi, (), ()>().await;
+    let (validator, module_id) =
+        TestValidator::with_current_module::<social::SocialAbi, (), ()>().await;
     let mut chain1 = validator.new_chain().await;
 
     // Initialization is trivial for the social app
-    let application_id = chain1.create_application(bytecode_id, (), (), vec![]).await;
+    let application_id = chain1.create_application(module_id, (), (), vec![]).await;
 
     let chain2 = validator.new_chain().await;
 
@@ -35,9 +35,6 @@ async fn test_cross_chain_posting() {
         })
         .await;
 
-    // Make chain2 handle that fact.
-    chain2.handle_received_messages().await;
-
     // Post on chain2
     chain2
         .add_block(|block| {
@@ -51,18 +48,18 @@ async fn test_cross_chain_posting() {
         })
         .await;
 
-    // Now make chain1 handle that fact.
-    chain1.handle_received_messages().await;
+    // Now make chain1 handle the post.
+    chain1.handle_new_events().await;
 
     // Querying the own posts
     let query = "query { ownPosts { entries(start: 0, end: 1) { timestamp, text } } }";
-    let response = chain2.graphql_query(application_id, query).await;
+    let QueryOutcome { response, .. } = chain2.graphql_query(application_id, query).await;
     let value = response["ownPosts"]["entries"][0]["text"].clone();
     assert_eq!(value, "Linera is the new Mastodon".to_string());
 
     // Now handling the received messages
     let query = "query { receivedPosts { keys { timestamp, author, index } } }";
-    let response = chain1.graphql_query(application_id, query).await;
+    let QueryOutcome { response, .. } = chain1.graphql_query(application_id, query).await;
     let author = response["receivedPosts"]["keys"][0]["author"].clone();
     assert_eq!(author, chain2.id().to_string());
 }

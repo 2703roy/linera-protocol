@@ -12,21 +12,23 @@ repository.workspace = true
 version.workspace = true
 
 [features]
-default = ["fs"]
 test = ["linera-views/test", "linera-execution/test"]
-benchmark = ["linera-base/test", "dep:linera-sdk"]
+benchmark = [
+    "linera-base/test",
+    "dep:linera-sdk",
+    "dep:crossbeam-channel",
+    "dep:num-format",
+    "dep:reqwest",
+    "dep:anyhow",
+    "dep:prometheus-parse",
+]
 wasmer = [
     "linera-core/wasmer",
     "linera-execution/wasmer",
     "linera-storage/wasmer",
 ]
 wasmtime = ["linera-execution/wasmtime", "linera-storage/wasmtime"]
-rocksdb = ["linera-views/rocksdb"]
-dynamodb = ["linera-views/dynamodb"]
-scylladb = ["linera-views/scylladb"]
-storage-service = ["linera-storage-service"]
-kubernetes = []
-fs = ["fs-err", "fs4", "linera-execution/fs"]
+fs = ["fs-err", "fs4", "linera-execution/fs", "linera-persistent/fs"]
 metrics = [
     "linera-base/metrics",
     "linera-chain/metrics",
@@ -39,43 +41,43 @@ web = [
     "dep:web-sys",
     "dep:wasm-bindgen-futures",
     "linera-base/web",
-    "linera-storage/web",
+    "linera-execution/web",
     "linera-chain/web",
     "linera-client/web",
     "linera-core/web",
-    "linera-views/web",
-    "linera-execution/web",
+    "linera-persistent/indexed-db",
     "linera-rpc/web",
+    "linera-storage/web",
+    "linera-views/web",
 ]
 indexed-db = ["web", "indexed_db_futures", "serde-wasm-bindgen", "gloo-utils"]
 web-default = ["web", "wasmer", "indexed-db"]
 
 [dependencies]
-async-trait.workspace = true
+anyhow = { workspace = true, optional = true }
 bcs.workspace = true
-cfg-if.workspace = true
-chrono = { workspace = true, features = ["clock"] }
 clap.workspace = true
-derive_more = { workspace = true, features = ["deref", "deref_mut"] }
-dirs.workspace = true
+crossbeam-channel = { workspace = true, optional = true }
 futures.workspace = true
 linera-base.workspace = true
 linera-chain.workspace = true
 linera-core.workspace = true
 linera-execution.workspace = true
+linera-persistent = { version = "0.15.0", path = "../linera-persistent" }
 linera-rpc.workspace = true
 linera-sdk = { workspace = true, optional = true }
 linera-storage.workspace = true
-linera-storage-service = { workspace = true, optional = true }
-linera-version.workspace = true
+linera-version = { workspace = true }
 linera-views.workspace = true
-rand.workspace = true
+num-format = { workspace = true, optional = true }
+prometheus-parse = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 thiserror-context.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 trait-variant.workspace = true
 
@@ -97,7 +99,6 @@ linera-rpc = { workspace = true, features = ["server", "simple-network"] }
 cfg_aliases.workspace = true
 
 [dev-dependencies]
-alloy = { workspace = true, default-features = false, features = [ "rpc-types-eth" ] }
 amm.workspace = true
 anyhow.workspace = true
 base64.workspace = true

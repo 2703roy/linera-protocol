@@ -3,6 +3,7 @@
 
 //! Implements [`crate::store::KeyValueStore`] by combining two existing stores.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(with_testing)]
@@ -16,7 +17,7 @@ use crate::{
 };
 
 /// The initial configuration of the system.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DualStoreConfig<C1, C2> {
     /// The first config.
     pub first_config: C1,
@@ -33,7 +34,7 @@ pub enum StoreInUse {
     Second,
 }
 
-/// The trait for a (static) root key assignement.
+/// The trait for a (static) root key assignment.
 pub trait DualStoreRootKeyAssignment {
     /// Obtains the store assigned to this root key.
     fn assigned_store(root_key: &[u8]) -> Result<StoreInUse, bcs::Error>;
@@ -48,7 +49,7 @@ pub struct DualStore<S1, S2, A> {
     second_store: S2,
     /// Which store is currently in use given the root key. (The root key in the other store will be set arbitrarily.)
     store_in_use: StoreInUse,
-    /// Marker for the static root key assignement.
+    /// Marker for the static root key assignment.
     _marker: std::marker::PhantomData<A>,
 }
 
@@ -243,18 +244,14 @@ where
         format!("dual {} and {}", S1::get_name(), S2::get_name())
     }
 
-    async fn connect(
-        config: &Self::Config,
-        namespace: &str,
-        root_key: &[u8],
-    ) -> Result<Self, Self::Error> {
-        let first_store = S1::connect(&config.first_config, namespace, root_key)
+    async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, Self::Error> {
+        let first_store = S1::connect(&config.first_config, namespace)
             .await
             .map_err(DualStoreError::First)?;
-        let second_store = S2::connect(&config.second_config, namespace, root_key)
+        let second_store = S2::connect(&config.second_config, namespace)
             .await
             .map_err(DualStoreError::Second)?;
-        let store_in_use = A::assigned_store(root_key)?;
+        let store_in_use = A::assigned_store(&[])?;
         Ok(Self {
             first_store,
             second_store,
@@ -299,6 +296,21 @@ where
         Ok(namespaces)
     }
 
+    async fn list_root_keys(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<Vec<Vec<u8>>, Self::Error> {
+        let mut root_keys = S1::list_root_keys(&config.first_config, namespace)
+            .await
+            .map_err(DualStoreError::First)?;
+        root_keys.extend(
+            S2::list_root_keys(&config.second_config, namespace)
+                .await
+                .map_err(DualStoreError::Second)?,
+        );
+        Ok(root_keys)
+    }
+
     async fn exists(config: &Self::Config, namespace: &str) -> Result<bool, Self::Error> {
         Ok(S1::exists(&config.first_config, namespace)
             .await
@@ -309,12 +321,25 @@ where
     }
 
     async fn create(config: &Self::Config, namespace: &str) -> Result<(), Self::Error> {
-        S1::create(&config.first_config, namespace)
+        let exists1 = S1::exists(&config.first_config, namespace)
             .await
             .map_err(DualStoreError::First)?;
-        S2::create(&config.second_config, namespace)
+        let exists2 = S2::exists(&config.second_config, namespace)
             .await
             .map_err(DualStoreError::Second)?;
+        if exists1 && exists2 {
+            return Err(DualStoreError::StoreAlreadyExists);
+        }
+        if !exists1 {
+            S1::create(&config.first_config, namespace)
+                .await
+                .map_err(DualStoreError::First)?;
+        }
+        if !exists2 {
+            S2::create(&config.second_config, namespace)
+                .await
+                .map_err(DualStoreError::Second)?;
+        }
         Ok(())
     }
 
@@ -351,6 +376,10 @@ where
 /// The error type for [`DualStore`].
 #[derive(Error, Debug)]
 pub enum DualStoreError<E1, E2> {
+    /// Store already exists during a create operation
+    #[error("Store already exists during a create operation")]
+    StoreAlreadyExists,
+
     /// Serialization error with BCS.
     #[error(transparent)]
     BcsError(#[from] bcs::Error),

@@ -6,8 +6,8 @@
 use async_graphql::{scalar, InputObject, Request, Response, SimpleObject};
 use fungible::FungibleTokenAbi;
 use linera_sdk::{
-    base::{AccountOwner, Amount, ApplicationId, ContractAbi, ServiceAbi},
     graphql::GraphQLMutationRoot,
+    linera_base_types::{AccountOwner, Amount, ApplicationId, ContractAbi, ServiceAbi},
     views::{CustomSerialize, ViewError},
 };
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ impl PriceBid {
     }
 }
 
-/// We use the custom serialization for the PriceAsk so that the order of the serialization
+/// We use the custom serialization for the PriceBid so that the order of the serialization
 /// corresponds to the order of the Prices.
 impl CustomSerialize for PriceBid {
     fn to_custom_bytes(&self) -> Result<Vec<u8>, ViewError> {

@@ -4,7 +4,7 @@
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
 use linera_sdk::{
-    base::{ApplicationId, StreamName, WithContractAbi},
+    linera_base_types::{ApplicationId, StreamName, WithContractAbi},
     Contract, ContractRuntime, Resources,
 };
 use meta_counter::{Message, MetaCounterAbi, Operation};
@@ -29,6 +29,7 @@ impl Contract for MetaCounterContract {
     type Message = Message;
     type InstantiationArgument = ();
     type Parameters = ApplicationId<counter::CounterAbi>;
+    type EventValue = String;
 
     async fn load(runtime: ContractRuntime<Self>) -> Self {
         MetaCounterContract { runtime }
@@ -42,8 +43,7 @@ impl Contract for MetaCounterContract {
         let this_chain = self.runtime.chain_id();
         self.runtime.emit(
             StreamName(b"announcements".to_vec()),
-            b"updates",
-            b"instantiated",
+            &"instantiated".to_string(),
         );
         self.runtime.send_message(this_chain, Message::Increment(0));
     }
@@ -60,7 +60,7 @@ impl Contract for MetaCounterContract {
         } = operation;
 
         let mut message = self.runtime.prepare_message(message).with_grant(Resources {
-            fuel: fuel_grant,
+            wasm_fuel: fuel_grant,
             ..Resources::default()
         });
         if authenticated {
@@ -70,7 +70,7 @@ impl Contract for MetaCounterContract {
             message = message.with_tracking();
         }
         if query_service {
-            // Make a service query: The result will be logged in the executed block.
+            // Make a service query: The result will be logged in the block.
             let counter_id = self.counter_id();
             let _ = self
                 .runtime

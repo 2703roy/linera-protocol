@@ -3,7 +3,7 @@
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
 
 The application (contract/service) must be deployed on the network, and a Node Service must be running
-on port 8000. Also make sure you have performed the operations mentoined in this [README](../README.md)
+on port 8000. Also make sure you have performed the operations mentioned in this [README](../README.md)
 
 ### Note
 
@@ -18,7 +18,7 @@ To access the social app for a given Chain and Application Id, append the Chain,
 ```
 http://localhost:3000/$CHAIN_1/$APP_ID/$OWNER_1/$PORT"
 
-http://localhost:3000/e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65?app=e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65000000000000000000000000e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65020000000000000000000000&owner=019d0849200869c4c88493db9966afad44194714cf76ed5d0639a7cdc37cb286&port=8080
+http://localhost:3000/aee928d4bf3880353b4a3cd9b6f88e6cc6e5ed050860abae439e7782e9b2dfe8?app=aee928d4bf3880353b4a3cd9b6f88e6cc6e5ed050860abae439e7782e9b2dfe8000000000000000000000000aee928d4bf3880353b4a3cd9b6f88e6cc6e5ed050860abae439e7782e9b2dfe8020000000000000000000000&owner=019d0849200869c4c88493db9966afad44194714cf76ed5d0639a7cdc37cb286&port=8080
 ```
 
 ## Available Scripts

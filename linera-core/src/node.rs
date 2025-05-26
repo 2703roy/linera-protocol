@@ -8,22 +8,19 @@ use futures::stream::BoxStream;
 use futures::stream::LocalBoxStream as BoxStream;
 use futures::stream::Stream;
 use linera_base::{
-    crypto::{CryptoError, CryptoHash},
-    data_types::{ArithmeticError, Blob, BlobContent, BlockHeight},
+    crypto::{CryptoError, CryptoHash, ValidatorPublicKey},
+    data_types::{ArithmeticError, BlobContent, BlockHeight, NetworkDescription},
     identifiers::{BlobId, ChainId},
 };
 use linera_chain::{
-    data_types::{BlockProposal, Origin},
+    data_types::BlockProposal,
     types::{
         ConfirmedBlock, ConfirmedBlockCertificate, GenericCertificate, LiteCertificate, Timeout,
         ValidatedBlock,
     },
     ChainError,
 };
-use linera_execution::{
-    committee::{Committee, ValidatorName},
-    ExecutionError,
-};
+use linera_execution::{committee::Committee, ExecutionError};
 use linera_version::VersionInfo;
 use linera_views::views::ViewError;
 use serde::{Deserialize, Serialize};
@@ -78,7 +75,6 @@ pub trait ValidatorNode {
     async fn handle_validated_certificate(
         &self,
         certificate: GenericCertificate<ValidatedBlock>,
-        blobs: Vec<Blob>,
     ) -> Result<ChainInfoResponse, NodeError>;
 
     /// Processes a timeout certificate.
@@ -96,8 +92,8 @@ pub trait ValidatorNode {
     /// Gets the version info for this validator node.
     async fn get_version_info(&self) -> Result<VersionInfo, NodeError>;
 
-    /// Gets the network's genesis config hash.
-    async fn get_genesis_config_hash(&self) -> Result<CryptoHash, NodeError>;
+    /// Gets the network's description.
+    async fn get_network_description(&self) -> Result<NetworkDescription, NodeError>;
 
     /// Subscribes to receiving notifications for a collection of chains.
     async fn subscribe(&self, chains: Vec<ChainId>) -> Result<Self::NotificationStream, NodeError>;
@@ -109,12 +105,19 @@ pub trait ValidatorNode {
     /// Downloads a blob. Returns an error if the validator does not have the blob.
     async fn download_blob(&self, blob_id: BlobId) -> Result<BlobContent, NodeError>;
 
-    /// Downloads a blob that belongs to a pending proposal or the locked block on a chain.
+    /// Downloads a blob that belongs to a pending proposal or the locking block on a chain.
     async fn download_pending_blob(
         &self,
         chain_id: ChainId,
         blob_id: BlobId,
     ) -> Result<BlobContent, NodeError>;
+
+    /// Handles a blob that belongs to a pending proposal or validated block certificate.
+    async fn handle_pending_blob(
+        &self,
+        chain_id: ChainId,
+        blob: BlobContent,
+    ) -> Result<ChainInfoResponse, NodeError>;
 
     async fn download_certificate(
         &self,
@@ -130,7 +133,7 @@ pub trait ValidatorNode {
     /// Returns the hash of the `Certificate` that last used a blob.
     async fn blob_last_used_by(&self, blob_id: BlobId) -> Result<CryptoHash, NodeError>;
 
-    /// Returns the missing `Blob`s. by their ids.
+    /// Returns the missing `Blob`s by their IDs.
     async fn missing_blob_ids(&self, blob_ids: Vec<BlobId>) -> Result<Vec<BlobId>, NodeError>;
 }
 
@@ -147,7 +150,7 @@ pub trait ValidatorNodeProvider: 'static {
     fn make_nodes(
         &self,
         committee: &Committee,
-    ) -> Result<impl Iterator<Item = (ValidatorName, Self::Node)> + '_, NodeError> {
+    ) -> Result<impl Iterator<Item = (ValidatorPublicKey, Self::Node)> + '_, NodeError> {
         let validator_addresses: Vec<_> = committee
             .validator_addresses()
             .map(|(node, name)| (node, name.to_owned()))
@@ -157,8 +160,8 @@ pub trait ValidatorNodeProvider: 'static {
 
     fn make_nodes_from_list<A>(
         &self,
-        validators: impl IntoIterator<Item = (ValidatorName, A)>,
-    ) -> Result<impl Iterator<Item = (ValidatorName, Self::Node)>, NodeError>
+        validators: impl IntoIterator<Item = (ValidatorPublicKey, A)>,
+    ) -> Result<impl Iterator<Item = (ValidatorPublicKey, Self::Node)>, NodeError>
     where
         A: AsRef<str>,
     {
@@ -202,7 +205,7 @@ pub enum NodeError {
     )]
     MissingCrossChainUpdate {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         height: BlockHeight,
     },
 
@@ -213,7 +216,7 @@ pub enum NodeError {
     #[error("We don't have the value for the certificate.")]
     MissingCertificateValue,
 
-    #[error("Response doesn't contain requested ceritifcates: {0:?}")]
+    #[error("Response doesn't contain requested certificates: {0:?}")]
     MissingCertificates(Vec<CryptoHash>),
 
     #[error("Validator's response to block proposal failed to include a vote")]

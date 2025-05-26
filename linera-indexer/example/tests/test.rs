@@ -9,7 +9,11 @@
 
 use std::{str::FromStr, sync::LazyLock, time::Duration};
 
-use linera_base::{command::resolve_binary, data_types::Amount, identifiers::ChainId};
+use linera_base::{
+    command::resolve_binary,
+    data_types::Amount,
+    identifiers::{Account, AccountOwner, ChainId},
+};
 use linera_indexer_graphql_client::{
     indexer::{plugins, state, Plugins, State},
     operations::{get_operation, GetOperation, OperationKey},
@@ -69,10 +73,12 @@ fn indexer_running(child: &mut Child) {
     }
 }
 
-async fn transfer(client: &reqwest::Client, from: ChainId, to: ChainId, amount: &str) {
+async fn transfer(client: &reqwest::Client, from: ChainId, to: Account, amount: &str) {
     let variables = transfer::Variables {
         chain_id: from,
-        recipient: to,
+        owner: AccountOwner::CHAIN,
+        recipient_chain: to.chain_id,
+        recipient_account: to.owner,
         amount: Amount::from_str(amount).unwrap(),
     };
     request::<Transfer, _>(client, "http://localhost:8080", variables)
@@ -114,8 +120,12 @@ async fn test_end_to_end_operations_indexer(config: impl LineraNetConfig) {
     );
 
     // making a few transfers
-    let chain0 = ChainId::root(0);
-    let chain1 = ChainId::root(1);
+    let node_chains = {
+        let wallet = client.load_wallet().unwrap();
+        wallet.chain_ids()
+    };
+    let chain0 = node_chains[0];
+    let chain1 = Account::chain(node_chains[1]);
     for _ in 0..10 {
         transfer(&req_client, chain0, chain1, "0.1").await;
         linera_base::time::timer::sleep(Duration::from_millis(TRANSFER_DELAY_MILLIS)).await;
@@ -149,8 +159,7 @@ async fn test_end_to_end_operations_indexer(config: impl LineraNetConfig) {
     );
 
     // checking indexer operation
-    let executed_block = last_block.value.executed_block;
-    let last_operation = executed_block.block.operations[0].clone();
+    let last_operation = last_block.block.body.operations[0].clone();
     let variables = get_operation::Variables {
         key: get_operation::OperationKeyKind::Last(chain0),
     };
@@ -172,7 +181,7 @@ async fn test_end_to_end_operations_indexer(config: impl LineraNetConfig) {
                 (
                     OperationKey {
                         chain_id: chain0,
-                        height: executed_block.block.height,
+                        height: last_block.block.header.height,
                         index: 0
                     },
                     last_hash,

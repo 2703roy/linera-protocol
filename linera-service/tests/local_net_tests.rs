@@ -9,56 +9,40 @@
 ))]
 
 mod common;
+mod guard;
 
-use std::{env, path::PathBuf, process::Command, time::Duration};
+use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use common::INTEGRATION_TEST_GUARD;
+use guard::INTEGRATION_TEST_GUARD;
+#[cfg(any(feature = "benchmark", feature = "ethereum"))]
+use linera_base::vm::VmRuntime;
 use linera_base::{
-    data_types::Amount,
-    identifiers::{Account, AccountOwner, ChainId},
+    crypto::Secp256k1SecretKey,
+    data_types::{Amount, BlockHeight, Epoch},
+    identifiers::{Account, AccountOwner},
 };
+use linera_core::{data_types::ChainInfoQuery, node::ValidatorNode};
+use linera_sdk::linera_base_types::AccountSecretKey;
 use linera_service::{
     cli_wrappers::{
-        local_net::{
-            get_node_port, Database, LocalNet, LocalNetConfig, PathProvider, ProcessInbox,
-        },
-        ClientWrapper, FaucetOption, LineraNet, LineraNetConfig, Network, OnClientDrop,
+        local_net::{get_node_port, Database, LocalNet, LocalNetConfig, ProcessInbox},
+        ClientWrapper, LineraNet, LineraNetConfig, Network,
     },
-    faucet::ClaimOutcome,
     test_name,
+    util::eventually,
 };
 use test_case::test_case;
+#[cfg(feature = "ethereum")]
+use {alloy_primitives::U256, linera_service::cli_wrappers::ApplicationWrapper};
 #[cfg(feature = "storage-service")]
-use {linera_base::port::get_free_port, linera_service::cli_wrappers::Faucet};
+use {
+    linera_base::port::get_free_port, linera_service::cli_wrappers::Faucet, std::process::Command,
+};
 
 #[cfg(feature = "benchmark")]
 fn get_fungible_account_owner(client: &ClientWrapper) -> AccountOwner {
-    let owner = client.get_owner().unwrap();
-    AccountOwner::User(owner)
-}
-
-/// Clears the `RUSTFLAGS` environment variable, if it was configured to make warnings fail as
-/// errors.
-///
-/// The returned [`RestoreVarOnDrop`] restores the environment variable to its original value when
-/// it is dropped.
-fn override_disable_warnings_as_errors() -> Option<RestoreVarOnDrop> {
-    if matches!(env::var("RUSTFLAGS"), Ok(value) if value == "-D warnings") {
-        env::set_var("RUSTFLAGS", "");
-        Some(RestoreVarOnDrop)
-    } else {
-        None
-    }
-}
-
-/// Restores the `RUSTFLAGS` environment variable to make warnings fail as errors.
-struct RestoreVarOnDrop;
-
-impl Drop for RestoreVarOnDrop {
-    fn drop(&mut self) {
-        env::set_var("RUSTFLAGS", "-D warnings");
-    }
+    client.get_owner().unwrap()
 }
 
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Udp) ; "scylladb_udp"))]
@@ -71,15 +55,14 @@ impl Drop for RestoreVarOnDrop {
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Udp) ; "aws_udp"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
-    use linera_base::{crypto::KeyPair, identifiers::Owner};
-    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    let _guard: tokio::sync::MutexGuard<'_, ()> = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
     let network = config.network.external;
     let (mut net, client) = config.instantiate().await?;
 
     let faucet_client = net.make_client().await;
-    faucet_client.wallet_init(&[], FaucetOption::None).await?;
+    faucet_client.wallet_init(None).await?;
 
     let faucet_chain = client
         .open_and_assign(&faucet_client, Amount::from_tokens(1_000u128))
@@ -96,8 +79,11 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     assert_eq!(faucet.current_validators().await?.len(), 4);
 
     let client_2 = net.make_client().await;
-    client_2.wallet_init(&[], FaucetOption::None).await?;
-    let chain_1 = ChainId::root(0);
+    client_2.wallet_init(None).await?;
+    let chain_1 = client
+        .load_wallet()?
+        .default_chain()
+        .expect("should have a default chain");
 
     let chain_2 = client
         .open_and_assign(&client_2, Amount::from_tokens(3))
@@ -111,6 +97,12 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     };
 
     client.query_validators(None).await?;
+
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(0));
+    assert_eq!(
+        client.query_validator(&address).await?,
+        net.genesis_config()?.hash()
+    );
 
     // Restart the first shard for the 4th validator.
     // TODO(#2286): The proxy currently only re-establishes the connection with gRPC.
@@ -127,7 +119,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     net.start_validator(4).await?;
     net.start_validator(5).await?;
 
-    let address = format!("{}:localhost:{}", network.short(), LocalNet::proxy_port(4));
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(4));
     assert_eq!(
         client.query_validator(&address).await?,
         net.genesis_config()?.hash()
@@ -135,9 +127,8 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
 
     // Add 5th validator
     client
-        .set_validator(net.validator_name(4).unwrap(), LocalNet::proxy_port(4), 100)
+        .set_validator(net.validator_keys(4).unwrap(), LocalNet::proxy_port(4), 100)
         .await?;
-    client.finalize_committee().await?;
 
     client.query_validators(None).await?;
     client.query_validators(Some(chain_1)).await?;
@@ -148,54 +139,70 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
 
     // Add 6th validator
     client
-        .set_validator(net.validator_name(5).unwrap(), LocalNet::proxy_port(5), 100)
+        .set_validator(net.validator_keys(5).unwrap(), LocalNet::proxy_port(5), 100)
         .await?;
-    client.finalize_committee().await?;
     if matches!(network, Network::Grpc) {
-        assert_eq!(faucet.current_validators().await?.len(), 6);
+        assert!(
+            eventually(|| async { faucet.current_validators().await.unwrap().len() == 6 }).await
+        );
     }
 
     // Remove 5th validator
     client
-        .remove_validator(net.validator_name(4).unwrap())
+        .remove_validator(&net.validator_keys(4).unwrap().0)
         .await?;
-    client.finalize_committee().await?;
     net.remove_validator(4)?;
     if matches!(network, Network::Grpc) {
-        assert_eq!(faucet.current_validators().await?.len(), 5);
+        assert!(
+            eventually(|| async { faucet.current_validators().await.unwrap().len() == 5 }).await
+        )
     }
     client.query_validators(None).await?;
     client.query_validators(Some(chain_1)).await?;
     if let Some(service) = &node_service_2 {
         service.process_inbox(&chain_2).await?;
+        client.finalize_committee().await?;
+        service.process_inbox(&chain_2).await?;
+        let committees = service.query_committees(&chain_2).await?;
+        let epochs = committees.into_keys().collect::<Vec<_>>();
+        assert_eq!(&epochs, &[Epoch(3)]);
     } else {
+        client_2.process_inbox(chain_2).await?;
+        client.finalize_committee().await?;
         client_2.process_inbox(chain_2).await?;
     }
 
     // Remove the first 4 validators, so only the last one remains.
     for i in 0..4 {
-        let name = net.validator_name(i).unwrap();
-        client.remove_validator(name).await?;
-        client.finalize_committee().await?;
+        let validator_key = net.validator_keys(i).unwrap();
+        client.remove_validator(&validator_key.0).await?;
         if let Some(service) = &node_service_2 {
             service.process_inbox(&chain_2).await?;
+            client.finalize_committee().await?;
+            service.process_inbox(&chain_2).await?;
+            let committees = service.query_committees(&chain_2).await?;
+            let epochs = committees.into_keys().collect::<Vec<_>>();
+            assert_eq!(&epochs, &[Epoch(4 + i as u32)]);
         } else {
+            client_2.process_inbox(chain_2).await?;
+            client.finalize_committee().await?;
             client_2.process_inbox(chain_2).await?;
         }
         net.remove_validator(i)?;
     }
 
-    let recipient = AccountOwner::User(Owner::from(KeyPair::generate().public()));
+    let recipient =
+        AccountOwner::from(AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate()).public());
     client
         .transfer_with_accounts(
             Amount::from_tokens(5),
             Account::chain(chain_1),
-            Account::owner(chain_2, recipient),
+            Account::new(chain_2, recipient),
         )
         .await?;
 
-    if let Some(mut node_service_2) = node_service_2 {
-        node_service_2.process_inbox(&chain_2).await?;
+    if let Some(mut service) = node_service_2 {
+        service.process_inbox(&chain_2).await?;
         let query = format!(
             "query {{ chain(chainId:\"{chain_2}\") {{
                 executionState {{ system {{ balances {{
@@ -203,27 +210,20 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
                 }} }} }}
             }} }}"
         );
-        let response = node_service_2.query_node(query.clone()).await?;
+        let response = service.query_node(query).await?;
         let balances = &response["chain"]["executionState"]["system"]["balances"];
         assert_eq!(balances["entry"]["value"].as_str(), Some("5."));
+        let committees = service.query_committees(&chain_2).await?;
+        let epochs = committees.into_keys().collect::<Vec<_>>();
+        assert_eq!(&epochs, &[Epoch(7)]);
 
-        let query = format!(
-            "query {{ chain(chainId:\"{chain_2}\") {{
-                executionState {{ system {{ committees }} }}
-            }} }}"
-        );
-        let response = node_service_2.query_node(query.clone()).await?;
-        let committees = &response["chain"]["executionState"]["system"]["committees"];
-        let epochs = committees.as_object().unwrap().keys().collect::<Vec<_>>();
-        assert_eq!(&epochs, &["7"]);
-
-        node_service_2.ensure_is_running()?;
+        service.ensure_is_running()?;
     } else {
         client_2.sync(chain_2).await?;
         client_2.process_inbox(chain_2).await?;
         assert_eq!(
             client_2
-                .local_balance(Account::owner(chain_2, recipient))
+                .local_balance(Account::new(chain_2, recipient))
                 .await?,
             Amount::from_tokens(5),
         );
@@ -255,7 +255,7 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
     let (mut net, client) = config.instantiate().await?;
 
     let faucet_client = net.make_client().await;
-    faucet_client.wallet_init(&[], FaucetOption::None).await?;
+    faucet_client.wallet_init(None).await?;
 
     let faucet_chain = client
         .open_and_assign(&faucet_client, Amount::from_tokens(1_000u128))
@@ -280,7 +280,7 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
     net.generate_validator_config(4).await?;
     net.start_validator(4).await?;
 
-    let address = format!("{}:localhost:{}", network.short(), LocalNet::proxy_port(4));
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(4));
     assert_eq!(
         client.query_validator(&address).await?,
         net.genesis_config()?.hash()
@@ -288,7 +288,7 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
 
     // Add 5th validator to the network
     client
-        .set_validator(net.validator_name(4).unwrap(), LocalNet::proxy_port(4), 100)
+        .set_validator(net.validator_keys(4).unwrap(), LocalNet::proxy_port(4), 100)
         .await?;
 
     client.query_validators(None).await?;
@@ -309,13 +309,9 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
     }
 
     // Create a new chain starting on the new epoch
-    let new_owner_key = client.keygen().await?;
-    let ClaimOutcome {
-        chain_id,
-        message_id,
-        ..
-    } = faucet.claim(&new_owner_key).await?;
-    client.assign(new_owner_key, message_id).await?;
+    let new_owner = client.keygen().await?;
+    let chain_id = faucet.claim(&new_owner).await?.id();
+    client.assign(new_owner, chain_id).await?;
 
     // Attempt to receive the existing epoch change message
     client.process_inbox(chain_id).await?;
@@ -347,7 +343,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     let (mut net, client) = config.instantiate().await?;
 
     let faucet_client = net.make_client().await;
-    faucet_client.wallet_init(&[], FaucetOption::None).await?;
+    faucet_client.wallet_init(None).await?;
 
     let faucet_chain = client
         .open_and_assign(&faucet_client, Amount::from_tokens(1_000u128))
@@ -372,7 +368,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     net.generate_validator_config(4).await?;
     net.start_validator(4).await?;
 
-    let address = format!("{}:localhost:{}", network.short(), LocalNet::proxy_port(4));
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(4));
     assert_eq!(
         client.query_validator(&address).await?,
         net.genesis_config()?.hash()
@@ -380,13 +376,14 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
 
     // Add 5th validator to the network
     client
-        .set_validator(net.validator_name(4).unwrap(), LocalNet::proxy_port(4), 100)
+        .set_validator(net.validator_keys(4).unwrap(), LocalNet::proxy_port(4), 100)
         .await?;
-    client.finalize_committee().await?;
 
     client.query_validators(None).await?;
 
-    // Ensure the faucet is on the new epoch
+    // Ensure the faucet is on the new epoch before removing the old ones.
+    faucet_client.process_inbox(faucet_chain).await?;
+    client.finalize_committee().await?;
     faucet_client.process_inbox(faucet_chain).await?;
 
     if matches!(network, Network::Grpc) {
@@ -410,7 +407,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     net.generate_validator_config(5).await?;
     net.start_validator(5).await?;
 
-    let address = format!("{}:localhost:{}", network.short(), LocalNet::proxy_port(5));
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(5));
     assert_eq!(
         client.query_validator(&address).await?,
         net.genesis_config()?.hash()
@@ -418,7 +415,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
 
     // Add 6th validator to the network
     client
-        .set_validator(net.validator_name(5).unwrap(), LocalNet::proxy_port(5), 100)
+        .set_validator(net.validator_keys(5).unwrap(), LocalNet::proxy_port(5), 100)
         .await?;
 
     client.query_validators(None).await?;
@@ -439,13 +436,9 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     }
 
     // Create a new chain starting on the new epoch
-    let new_owner_key = client.keygen().await?;
-    let ClaimOutcome {
-        chain_id,
-        message_id,
-        ..
-    } = faucet.claim(&new_owner_key).await?;
-    client.assign(new_owner_key, message_id).await?;
+    let new_owner = client.keygen().await?;
+    let chain_id = faucet.claim(&new_owner).await?.id();
+    client.assign(new_owner, chain_id).await?;
 
     // Attempt to receive the existing epoch change messages
     client.process_inbox(chain_id).await?;
@@ -466,10 +459,16 @@ async fn test_end_to_end_retry_notification_stream(config: LocalNetConfig) -> Re
 
     let (mut net, client1) = config.instantiate().await?;
 
+    let (chain, chain1) = {
+        let wallet = client1.load_wallet()?;
+        let chains = wallet.chain_ids();
+        (chains[0], chains[1])
+    };
+
     let client2 = net.make_client().await;
-    let chain = ChainId::root(0);
     let mut height = 0;
-    client2.wallet_init(&[chain], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
+    client2.follow_chain(chain).await?;
 
     // Listen for updates on root chain 0. There are no blocks on that chain yet.
     let port = get_node_port().await;
@@ -486,14 +485,14 @@ async fn test_end_to_end_retry_notification_stream(config: LocalNetConfig) -> Re
 
     // Oh no! The first validator has an outage and gets restarted!
     net.remove_validator(0)?;
-    net.start_validator(0).await?;
+    net.restart_validator(0).await?;
 
     // The node service should try to reconnect.
     'success: {
         for i in 0..10 {
             // Add a new block on the chain, triggering a notification.
             client1
-                .transfer(Amount::from_tokens(1), chain, ChainId::root(1))
+                .transfer(Amount::from_tokens(1), chain, chain1)
                 .await?;
             linera_base::time::timer::sleep(Duration::from_secs(i)).await;
             height += 1;
@@ -527,7 +526,11 @@ async fn test_end_to_end_retry_pending_block(config: LocalNetConfig) -> Result<(
 
     // Create runner and client.
     let (mut net, client) = config.instantiate().await?;
-    let chain_id = client.load_wallet()?.default_chain().unwrap();
+    let (chain_id, chain1) = {
+        let wallet = client.load_wallet()?;
+        let chains = wallet.chain_ids();
+        (chains[0], chains[1])
+    };
     let account = Account::chain(chain_id);
     let balance = client.local_balance(account).await?;
     // Stop validators.
@@ -535,14 +538,14 @@ async fn test_end_to_end_retry_pending_block(config: LocalNetConfig) -> Result<(
         net.remove_validator(i)?;
     }
     let result = client
-        .transfer_with_silent_logs(Amount::from_tokens(2), chain_id, ChainId::root(1))
+        .transfer_with_silent_logs(Amount::from_tokens(2), chain_id, chain1)
         .await;
     assert!(result.is_err());
     // The transfer didn't get confirmed.
     assert_eq!(client.local_balance(account).await?, balance);
     // Restart validators.
     for i in 0..4 {
-        net.start_validator(i).await?;
+        net.restart_validator(i).await?;
     }
     let result = client.retry_pending_block(Some(chain_id)).await;
     assert!(result?.is_some());
@@ -566,7 +569,7 @@ async fn test_project_publish(database: Database, network: Network) -> Result<()
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
-    let _rustflags_override = override_disable_warnings_as_errors();
+    let _rustflags_override = common::override_disable_warnings_as_errors();
     let config = LocalNetConfig {
         num_initial_validators: 1,
         num_shards: 1,
@@ -585,15 +588,9 @@ async fn test_project_publish(database: Database, network: Network) -> Result<()
     client
         .project_publish(project_dir, vec![], None, &0)
         .await?;
-    let chain = client.load_wallet()?.default_chain().unwrap();
 
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
-
-    assert_eq!(
-        node_service.try_get_applications_uri(&chain).await?.len(),
-        1
-    );
 
     node_service.ensure_is_running()?;
 
@@ -622,75 +619,14 @@ async fn test_example_publish(database: Database, network: Network) -> Result<()
     client
         .project_publish(example_dir, vec![], None, &0)
         .await?;
-    let chain = client.load_wallet()?.default_chain().unwrap();
 
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
-
-    assert_eq!(
-        node_service.try_get_applications_uri(&chain).await?.len(),
-        1
-    );
 
     node_service.ensure_is_running()?;
 
     net.ensure_is_running().await?;
     net.terminate().await?;
-
-    Ok(())
-}
-
-#[test_log::test(tokio::test)]
-async fn test_project_new() -> Result<()> {
-    let _rustflags_override = override_disable_warnings_as_errors();
-    let path_provider = PathProvider::create_temporary_directory()?;
-    let id = 0;
-    let client = ClientWrapper::new(
-        path_provider,
-        Network::Grpc,
-        None,
-        id,
-        OnClientDrop::LeakChains,
-    );
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let linera_root = manifest_dir
-        .parent()
-        .expect("CARGO_MANIFEST_DIR should not be at the root");
-    let tmp_dir = client.project_new("init-test", linera_root).await?;
-    let project_dir = tmp_dir.path().join("init-test");
-    client
-        .build_application(project_dir.as_path(), "init-test", false)
-        .await?;
-
-    let mut child = Command::new("cargo")
-        .args(["fmt", "--check"])
-        .current_dir(project_dir.as_path())
-        .spawn()?;
-    assert!(child.wait()?.success());
-
-    let mut child = Command::new("cargo")
-        .arg("test")
-        .current_dir(project_dir.as_path())
-        .spawn()?;
-    assert!(child.wait()?.success());
-
-    Ok(())
-}
-
-#[test_log::test(tokio::test)]
-async fn test_project_test() -> Result<()> {
-    let path_provider = PathProvider::create_temporary_directory()?;
-    let id = 0;
-    let client = ClientWrapper::new(
-        path_provider,
-        Network::Grpc,
-        None,
-        id,
-        OnClientDrop::LeakChains,
-    );
-    client
-        .project_test(&ClientWrapper::example_path("counter")?)
-        .await?;
 
     Ok(())
 }
@@ -701,14 +637,16 @@ async fn test_project_test() -> Result<()> {
 async fn test_storage_service_wallet_lock() -> Result<()> {
     use std::mem::drop;
 
-    use linera_client::config::WalletState;
+    use linera_client::wallet::Wallet;
+
     let config = LocalNetConfig::new_test(Database::Service, Network::Grpc);
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
     let (mut net, client) = config.instantiate().await?;
 
-    let wallet_state = WalletState::read_from_file(client.wallet_path().as_path())?;
+    let wallet_state = linera_persistent::File::<Wallet>::read(client.wallet_path().as_path())?;
+
     let chain_id = wallet_state.default_chain().unwrap();
 
     let lock = wallet_state;
@@ -740,7 +678,8 @@ async fn test_storage_service_linera_net_up_simple() -> Result<()> {
     command.args([
         "net",
         "up",
-        "--with-faucet-chain",
+        "--with-faucet",
+        "--faucet-chain",
         "1",
         "--faucet-port",
         &port.to_string(),
@@ -780,6 +719,10 @@ async fn test_storage_service_linera_net_up_simple() -> Result<()> {
     assert!(exports
         .next()
         .unwrap()?
+        .starts_with("export LINERA_KEYSTORE="));
+    assert!(exports
+        .next()
+        .unwrap()?
         .starts_with("export LINERA_STORAGE="));
     assert_eq!(exports.next().unwrap()?, "");
 
@@ -809,6 +752,7 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
 
     use fungible::{FungibleTokenAbi, InitialState, Parameters};
+    use linera_service::cli::command::BenchmarkCommand;
 
     config.num_other_initial_chains = 2;
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -818,7 +762,13 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
 
     assert_eq!(client.load_wallet()?.num_chains(), 3);
     // Launch local benchmark using some additional chains.
-    client.benchmark(2, 4, 10, None).await?;
+    client
+        .benchmark(BenchmarkCommand {
+            num_chains: 4,
+            transactions_per_block: 10,
+            ..Default::default()
+        })
+        .await?;
     assert_eq!(client.load_wallet()?.num_chains(), 7);
 
     // Now we run the benchmark again, with the fungible token application instead of the
@@ -832,16 +782,257 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
         .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
             contract,
             service,
+            VmRuntime::Wasm,
             &params,
             &state,
             &[],
             None,
         )
         .await?;
-    client.benchmark(2, 5, 10, Some(application_id)).await?;
+    client
+        .benchmark(BenchmarkCommand {
+            num_chains: 5,
+            transactions_per_block: 10,
+            fungible_application_id: Some(application_id.forget_abi()),
+            ..Default::default()
+        })
+        .await?;
 
     net.ensure_is_running().await?;
     net.terminate().await?;
 
     Ok(())
+}
+
+/// Tests if the `sync-validator` command uploads missing certificates to a validator.
+// TODO(#3258): Fix test for simple-net
+// #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Udp) ; "scylladb_udp"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
+// #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+// #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
+// #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Tcp) ; "aws_tcp"))]
+// #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Udp) ; "aws_udp"))]
+#[test_log::test(tokio::test)]
+async fn test_sync_validator(config: LocalNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    const BLOCKS_TO_CREATE: usize = 5;
+    const LAGGING_VALIDATOR_INDEX: usize = 0;
+
+    let (mut net, client) = config.instantiate().await?;
+
+    // Stop a validator to force it to lag behind the others
+    net.stop_validator(LAGGING_VALIDATOR_INDEX).await?;
+
+    // Create some blocks
+    let sender_chain = client.default_chain().expect("Client has no default chain");
+    let (receiver_chain, _) = client
+        .open_chain(sender_chain, None, Amount::from_tokens(1_000))
+        .await?;
+
+    for amount in 1..=BLOCKS_TO_CREATE {
+        client
+            .transfer(
+                Amount::from_tokens(amount as u128),
+                sender_chain,
+                receiver_chain,
+            )
+            .await?;
+    }
+
+    // Restart the stopped validator
+    net.restart_validator(LAGGING_VALIDATOR_INDEX).await?;
+
+    let lagging_validator = net.validator_client(LAGGING_VALIDATOR_INDEX).await?;
+
+    let state_before_sync = lagging_validator
+        .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
+        .await?;
+    assert_eq!(state_before_sync.info.next_block_height, BlockHeight::ZERO);
+
+    // Synchronize the validator
+    let validator_address = net.validator_address(LAGGING_VALIDATOR_INDEX);
+    client
+        .sync_validator([&sender_chain], validator_address)
+        .await
+        .expect("Missing lagging validator name");
+
+    let state_after_sync = lagging_validator
+        .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
+        .await?;
+    assert_eq!(
+        state_after_sync.info.next_block_height,
+        BlockHeight(BLOCKS_TO_CREATE as u64 + 1)
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "ethereum")]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_wasm_end_to_end_ethereum_tracker(config: impl LineraNetConfig) -> Result<()> {
+    use ethereum_tracker::{EthereumTrackerAbi, InstantiationArgument};
+    use linera_ethereum::{
+        client::EthereumQueries,
+        provider::EthereumClientSimplified,
+        test_utils::{get_anvil, SimpleTokenContractFunction},
+    };
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    // Setting up the Ethereum smart contract
+    let anvil_test = get_anvil().await?;
+    let address0 = anvil_test.get_address(0);
+    let address1 = anvil_test.get_address(1);
+    let ethereum_endpoint = anvil_test.endpoint.clone();
+    let ethereum_client_simp = EthereumClientSimplified::new(ethereum_endpoint.clone());
+
+    let simple_token = SimpleTokenContractFunction::new(anvil_test).await?;
+    let contract_address = simple_token.contract_address.clone();
+    let event_name_expanded = "Initial(address,uint256)";
+    let events = ethereum_client_simp
+        .read_events(&contract_address, event_name_expanded, 0, 2)
+        .await?;
+    let start_block = events.first().unwrap().block_number;
+    let argument = InstantiationArgument {
+        ethereum_endpoint,
+        contract_address,
+        start_block,
+    };
+
+    // Setting up the validators
+    let (mut net, client) = config.instantiate().await?;
+    let chain = client.load_wallet()?.default_chain().unwrap();
+
+    // Change the ownership so that the blocks inserted are not
+    // fast blocks. Fast blocks are not allowed for the oracles.
+    let owner1 = {
+        let wallet = client.load_wallet()?;
+        let user_chain = wallet.get(chain).unwrap();
+        *user_chain.owner.as_ref().unwrap()
+    };
+
+    client.change_ownership(chain, vec![], vec![owner1]).await?;
+    let (contract, service) = client.build_example("ethereum-tracker").await?;
+
+    tracing::info!("Publishing Ethereum tracker contract");
+    let application_id = client
+        .publish_and_create::<EthereumTrackerAbi, (), InstantiationArgument>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    tracing::info!("Application ID: {:?}", application_id);
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let app = EthereumTrackerApp(
+        node_service
+            .make_application(&chain, &application_id)
+            .await?,
+    );
+
+    // Check after the initialization
+
+    app.assert_balances([
+        (address0.clone(), U256::from(1000)),
+        (address1.clone(), U256::from(0)),
+    ])
+    .await;
+
+    // Doing a transfer and updating the smart contract
+    // First await gets you the pending transaction, second gets it mined.
+
+    let value = U256::from(10);
+    simple_token.transfer(&address0, &address1, value).await?;
+    let last_block = ethereum_client_simp.get_block_number().await?;
+    // increment by 1 since the read_events is exclusive in the last block.
+    app.update(last_block + 1).await;
+
+    // Now checking the balances after the operations.
+
+    app.assert_balances([
+        (address0.clone(), U256::from(990)),
+        (address1.clone(), U256::from(10)),
+    ])
+    .await;
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "ethereum")]
+struct EthereumTrackerApp(ApplicationWrapper<ethereum_tracker::EthereumTrackerAbi>);
+
+#[cfg(feature = "ethereum")]
+impl EthereumTrackerApp {
+    async fn get_amount(&self, account_owner: &str) -> U256 {
+        use ethereum_tracker::U256Cont;
+        let query = format!(
+            "accounts {{ entry(key: \"{}\") {{ value }} }}",
+            account_owner
+        );
+        let response_body = self.0.query(&query).await.unwrap();
+        let amount_option = serde_json::from_value::<Option<U256Cont>>(
+            response_body["accounts"]["entry"]["value"].clone(),
+        )
+        .unwrap();
+        match amount_option {
+            None => U256::from(0),
+            Some(value) => {
+                let U256Cont { value } = value;
+                value
+            }
+        }
+    }
+
+    async fn assert_balances(&self, accounts: impl IntoIterator<Item = (String, U256)>) {
+        for (account_owner, amount) in accounts {
+            let value = self.get_amount(&account_owner).await;
+            assert_eq!(value, amount);
+        }
+    }
+
+    async fn update(&self, to_block: u64) {
+        let mutation = format!("update(toBlock: {})", to_block);
+        self.0.mutate(mutation).await.unwrap();
+    }
+}
+
+#[cfg_attr(feature = "storage-service", test_case(Database::Service, Network::Grpc ; "storage_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(Database::ScyllaDb, Network::Grpc ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(Database::DynamoDb, Network::Grpc ; "aws_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_linera_exporter(database: Database, network: Network) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let config = LocalNetConfig {
+        num_initial_validators: 1,
+        num_shards: 1,
+        num_block_exporters: 1,
+        ..LocalNetConfig::new_test(database, network)
+    };
+
+    let (_net, client) = config.instantiate().await?;
+    let chain = client.default_chain().expect("Client has no default chain");
+    client
+        .transfer_with_silent_logs(1.into(), chain, chain)
+        .await
 }

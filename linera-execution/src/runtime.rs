@@ -6,21 +6,23 @@ use std::{
     mem,
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use custom_debug_derive::Debug;
 use linera_base::{
     crypto::CryptoHash,
     data_types::{
-        Amount, ApplicationPermissions, ArithmeticError, BlockHeight, OracleResponse, Resources,
+        Amount, ApplicationPermissions, ArithmeticError, BlockHeight, OracleResponse,
         SendMessageRequest, Timestamp,
     },
-    ensure,
+    ensure, http,
     identifiers::{
-        Account, AccountOwner, ApplicationId, BlobId, BlobType, ChainId, ChannelName, MessageId,
-        Owner, StreamName,
+        Account, AccountOwner, BlobId, BlobType, ChainId, EventId, GenericApplicationId, MessageId,
+        StreamId, StreamName,
     },
     ownership::ChainOwnership,
+    vm::VmRuntime,
 };
 use linera_views::batch::Batch;
 use oneshot::Receiver;
@@ -31,18 +33,36 @@ use crate::{
     resources::ResourceController,
     system::CreateApplicationResult,
     util::{ReceiverExt, UnboundedSenderExt},
-    BaseRuntime, BytecodeId, ContractRuntime, ExecutionError, FinalizeContext, MessageContext,
-    OperationContext, QueryContext, RawExecutionOutcome, ServiceRuntime, TransactionTracker,
-    UserApplicationDescription, UserApplicationId, UserContractCode, UserContractInstance,
-    UserServiceCode, UserServiceInstance, MAX_EVENT_KEY_LEN, MAX_STREAM_NAME_LEN,
+    ApplicationDescription, ApplicationId, BaseRuntime, ContractRuntime, ExecutionError,
+    FinalizeContext, Message, MessageContext, MessageKind, ModuleId, Operation, OperationContext,
+    OutgoingMessage, QueryContext, QueryOutcome, ServiceRuntime, TransactionTracker,
+    UserContractCode, UserContractInstance, UserServiceCode, UserServiceInstance,
+    MAX_STREAM_NAME_LEN,
 };
 
 #[cfg(test)]
 #[path = "unit_tests/runtime_tests.rs"]
 mod tests;
 
+pub trait WithContext {
+    type UserContext;
+}
+
+impl WithContext for UserContractInstance {
+    type UserContext = Timestamp;
+}
+
+impl WithContext for UserServiceInstance {
+    type UserContext = ();
+}
+
+#[cfg(test)]
+impl WithContext for Arc<dyn std::any::Any + Send + Sync> {
+    type UserContext = ();
+}
+
 #[derive(Debug)]
-pub struct SyncRuntime<UserInstance>(Option<SyncRuntimeHandle<UserInstance>>);
+pub struct SyncRuntime<UserInstance: WithContext>(Option<SyncRuntimeHandle<UserInstance>>);
 
 pub type ContractSyncRuntime = SyncRuntime<UserContractInstance>;
 
@@ -52,24 +72,26 @@ pub struct ServiceSyncRuntime {
 }
 
 #[derive(Debug)]
-pub struct SyncRuntimeHandle<UserInstance>(Arc<Mutex<SyncRuntimeInternal<UserInstance>>>);
+pub struct SyncRuntimeHandle<UserInstance: WithContext>(
+    Arc<Mutex<SyncRuntimeInternal<UserInstance>>>,
+);
 
 pub type ContractSyncRuntimeHandle = SyncRuntimeHandle<UserContractInstance>;
 pub type ServiceSyncRuntimeHandle = SyncRuntimeHandle<UserServiceInstance>;
 
 /// Runtime data tracked during the execution of a transaction on the synchronous thread.
 #[derive(Debug)]
-pub struct SyncRuntimeInternal<UserInstance> {
+pub struct SyncRuntimeInternal<UserInstance: WithContext> {
     /// The current chain ID.
     chain_id: ChainId,
     /// The height of the next block that will be added to this chain. During operations
     /// and messages, this is the current block height.
     height: BlockHeight,
-    /// The current local time.
-    local_time: Timestamp,
+    /// The current consensus round. Only available during block validation in multi-leader rounds.
+    round: Option<u32>,
     /// The authenticated signer of the operation or message, if any.
     #[debug(skip_if = Option::is_none)]
-    authenticated_signer: Option<Owner>,
+    authenticated_signer: Option<AccountOwner>,
     /// The current message being executed, if there is one.
     #[debug(skip_if = Option::is_none)]
     executing_message: Option<ExecutingMessage>,
@@ -82,55 +104,62 @@ pub struct SyncRuntimeInternal<UserInstance> {
     /// If [`true`], disables cross-application calls.
     is_finalizing: bool,
     /// Applications that need to be finalized.
-    applications_to_finalize: Vec<UserApplicationId>,
+    applications_to_finalize: Vec<ApplicationId>,
 
     /// Application instances loaded in this transaction.
-    loaded_applications: HashMap<UserApplicationId, LoadedApplication<UserInstance>>,
+    loaded_applications: HashMap<ApplicationId, LoadedApplication<UserInstance>>,
     /// The current stack of application descriptions.
     call_stack: Vec<ApplicationStatus>,
     /// The set of the IDs of the applications that are in the `call_stack`.
-    active_applications: HashSet<UserApplicationId>,
+    active_applications: HashSet<ApplicationId>,
     /// The tracking information for this transaction.
     transaction_tracker: TransactionTracker,
+    /// The operations scheduled during this query.
+    scheduled_operations: Vec<Operation>,
 
     /// Track application states based on views.
-    view_user_states: BTreeMap<UserApplicationId, ViewUserState>,
+    view_user_states: BTreeMap<ApplicationId, ViewUserState>,
+
+    /// The deadline this runtime should finish executing.
+    ///
+    /// Used to limit the execution time of services running as oracles.
+    deadline: Option<Instant>,
 
     /// Where to send a refund for the unused part of the grant after execution, if any.
     #[debug(skip_if = Option::is_none)]
     refund_grant_to: Option<Account>,
     /// Controller to track fuel and storage consumption.
     resource_controller: ResourceController,
+    /// Additional context for the runtime.
+    user_context: UserInstance::UserContext,
 }
 
 /// The runtime status of an application.
 #[derive(Debug)]
 struct ApplicationStatus {
     /// The caller application ID, if forwarded during the call.
-    caller_id: Option<UserApplicationId>,
+    caller_id: Option<ApplicationId>,
     /// The application ID.
-    id: UserApplicationId,
-    /// The parameters from the application description.
-    parameters: Vec<u8>,
+    id: ApplicationId,
+    /// The application description.
+    description: ApplicationDescription,
     /// The authenticated signer for the execution thread, if any.
-    signer: Option<Owner>,
-    /// The current execution outcome of the application.
-    outcome: RawExecutionOutcome<Vec<u8>>,
+    signer: Option<AccountOwner>,
 }
 
 /// A loaded application instance.
 #[derive(Debug)]
 struct LoadedApplication<Instance> {
     instance: Arc<Mutex<Instance>>,
-    parameters: Vec<u8>,
+    description: ApplicationDescription,
 }
 
 impl<Instance> LoadedApplication<Instance> {
     /// Creates a new [`LoadedApplication`] entry from the `instance` and its `description`.
-    fn new(instance: Instance, description: UserApplicationDescription) -> Self {
+    fn new(instance: Instance, description: ApplicationDescription) -> Self {
         LoadedApplication {
             instance: Arc::new(Mutex::new(instance)),
-            parameters: description.parameters,
+            description,
         }
     }
 }
@@ -141,7 +170,7 @@ impl<Instance> Clone for LoadedApplication<Instance> {
     fn clone(&self) -> Self {
         LoadedApplication {
             instance: self.instance.clone(),
-            parameters: self.parameters.clone(),
+            description: self.description.clone(),
         }
     }
 }
@@ -250,7 +279,7 @@ impl ViewUserState {
     }
 }
 
-impl<UserInstance> Deref for SyncRuntime<UserInstance> {
+impl<UserInstance: WithContext> Deref for SyncRuntime<UserInstance> {
     type Target = SyncRuntimeHandle<UserInstance>;
 
     fn deref(&self) -> &Self::Target {
@@ -260,7 +289,7 @@ impl<UserInstance> Deref for SyncRuntime<UserInstance> {
     }
 }
 
-impl<UserInstance> DerefMut for SyncRuntime<UserInstance> {
+impl<UserInstance: WithContext> DerefMut for SyncRuntime<UserInstance> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.as_mut().expect(
             "`SyncRuntime` should not be used after its `inner` contents have been moved out",
@@ -268,7 +297,7 @@ impl<UserInstance> DerefMut for SyncRuntime<UserInstance> {
     }
 }
 
-impl<UserInstance> Drop for SyncRuntime<UserInstance> {
+impl<UserInstance: WithContext> Drop for SyncRuntime<UserInstance> {
     fn drop(&mut self) {
         // Ensure the `loaded_applications` are cleared to prevent circular references in
         // the runtime
@@ -278,23 +307,25 @@ impl<UserInstance> Drop for SyncRuntime<UserInstance> {
     }
 }
 
-impl<UserInstance> SyncRuntimeInternal<UserInstance> {
+impl<UserInstance: WithContext> SyncRuntimeInternal<UserInstance> {
     #[expect(clippy::too_many_arguments)]
     fn new(
         chain_id: ChainId,
         height: BlockHeight,
-        local_time: Timestamp,
-        authenticated_signer: Option<Owner>,
+        round: Option<u32>,
+        authenticated_signer: Option<AccountOwner>,
         executing_message: Option<ExecutingMessage>,
         execution_state_sender: ExecutionStateSender,
+        deadline: Option<Instant>,
         refund_grant_to: Option<Account>,
         resource_controller: ResourceController,
         transaction_tracker: TransactionTracker,
+        user_context: UserInstance::UserContext,
     ) -> Self {
         Self {
             chain_id,
             height,
-            local_time,
+            round,
             authenticated_signer,
             executing_message,
             execution_state_sender,
@@ -304,9 +335,12 @@ impl<UserInstance> SyncRuntimeInternal<UserInstance> {
             call_stack: Vec::new(),
             active_applications: HashSet::new(),
             view_user_states: BTreeMap::new(),
+            deadline,
             refund_grant_to,
             resource_controller,
             transaction_tracker,
+            scheduled_operations: Vec::new(),
+            user_context,
         }
     }
 
@@ -317,22 +351,9 @@ impl<UserInstance> SyncRuntimeInternal<UserInstance> {
     /// # Panics
     ///
     /// If the call stack is empty.
-    fn current_application(&mut self) -> &ApplicationStatus {
+    fn current_application(&self) -> &ApplicationStatus {
         self.call_stack
             .last()
-            .expect("Call stack is unexpectedly empty")
-    }
-
-    /// Returns a mutable refernce to the [`ApplicationStatus`] of the current application.
-    ///
-    /// The current application is the last to be pushed to the `call_stack`.
-    ///
-    /// # Panics
-    ///
-    /// If the call stack is empty.
-    fn current_application_mut(&mut self) -> &mut ApplicationStatus {
-        self.call_stack
-            .last_mut()
             .expect("Call stack is unexpectedly empty")
     }
 
@@ -365,7 +386,7 @@ impl<UserInstance> SyncRuntimeInternal<UserInstance> {
     /// Returns an error if there already is an entry for `application_id` in the call stack.
     fn check_for_reentrancy(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
     ) -> Result<(), ExecutionError> {
         ensure!(
             !self.active_applications.contains(&application_id),
@@ -380,7 +401,7 @@ impl SyncRuntimeInternal<UserContractInstance> {
     fn load_contract_instance(
         &mut self,
         this: SyncRuntimeHandle<UserContractInstance>,
-        id: UserApplicationId,
+        id: ApplicationId,
     ) -> Result<LoadedApplication<UserContractInstance>, ExecutionError> {
         match self.loaded_applications.entry(id) {
             // TODO(#2927): support dynamic loading of modules on the Web
@@ -393,10 +414,16 @@ impl SyncRuntimeInternal<UserContractInstance> {
             }
             #[cfg(not(web))]
             hash_map::Entry::Vacant(entry) => {
-                let (code, description) = self
+                let txn_tracker_moved = mem::take(&mut self.transaction_tracker);
+                let (code, description, txn_tracker_moved) = self
                     .execution_state_sender
-                    .send_request(|callback| ExecutionRequest::LoadContract { id, callback })?
+                    .send_request(move |callback| ExecutionRequest::LoadContract {
+                        id,
+                        callback,
+                        txn_tracker: txn_tracker_moved,
+                    })?
                     .recv_response()?;
+                self.transaction_tracker = txn_tracker_moved;
 
                 let instance = code.instantiate(this)?;
 
@@ -414,7 +441,7 @@ impl SyncRuntimeInternal<UserContractInstance> {
         &mut self,
         this: ContractSyncRuntimeHandle,
         authenticated: bool,
-        callee_id: UserApplicationId,
+        callee_id: ApplicationId,
     ) -> Result<(Arc<Mutex<UserContractInstance>>, OperationContext), ExecutionError> {
         self.check_for_reentrancy(callee_id)?;
 
@@ -438,61 +465,73 @@ impl SyncRuntimeInternal<UserContractInstance> {
             _ => None,
         };
         let authenticated_caller_id = authenticated.then_some(caller_id);
+        let timestamp = self.user_context;
         let callee_context = OperationContext {
             chain_id: self.chain_id,
             authenticated_signer,
             authenticated_caller_id,
             height: self.height,
-            index: None,
+            round: self.round,
+            timestamp,
         };
         self.push_application(ApplicationStatus {
             caller_id: authenticated_caller_id,
             id: callee_id,
-            parameters: application.parameters,
+            description: application.description,
             // Allow further nested calls to be authenticated if this one is.
             signer: authenticated_signer,
-            outcome: RawExecutionOutcome::default(),
         });
         Ok((application.instance, callee_context))
     }
 
     /// Cleans up the runtime after the execution of a call to a different contract.
     fn finish_call(&mut self) -> Result<(), ExecutionError> {
-        let ApplicationStatus {
-            id: callee_id,
-            signer,
-            outcome,
-            ..
-        } = self.pop_application();
-
-        self.handle_outcome(outcome, signer, callee_id)?;
-
+        self.pop_application();
         Ok(())
     }
 
-    /// Handles a newly produced [`RawExecutionOutcome`], conditioning and adding it to the stack
-    /// of outcomes.
-    ///
-    /// Calculates the fees, charges for the grants and attaches the authenticated `signer` and the
-    /// destination of grant refunds.
-    fn handle_outcome(
+    /// Runs the service in a separate thread as an oracle.
+    fn run_service_oracle_query(
         &mut self,
-        raw_outcome: RawExecutionOutcome<Vec<u8>, Resources>,
-        signer: Option<Owner>,
-        application_id: UserApplicationId,
-    ) -> Result<(), ExecutionError> {
-        let outcome = raw_outcome
-            .with_refund_grant_to(self.refund_grant_to)
-            .with_authenticated_signer(signer)
-            .into_priced(&self.resource_controller.policy)?;
+        application_id: ApplicationId,
+        query: Vec<u8>,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        let context = QueryContext {
+            chain_id: self.chain_id,
+            next_block_height: self.height,
+            local_time: self.transaction_tracker.local_time(),
+        };
+        let sender = self.execution_state_sender.clone();
 
-        for message in &outcome.messages {
-            self.resource_controller.track_grant(message.grant)?;
-        }
+        let txn_tracker = TransactionTracker::default()
+            .with_blobs(self.transaction_tracker.created_blobs().clone());
 
-        self.transaction_tracker
-            .add_user_outcome(application_id, outcome)?;
-        Ok(())
+        let timeout = self
+            .resource_controller
+            .remaining_service_oracle_execution_time()?;
+        let execution_start = Instant::now();
+        let deadline = Some(execution_start + timeout);
+
+        let mut service_runtime =
+            ServiceSyncRuntime::new_with_txn_tracker(sender, context, deadline, txn_tracker);
+
+        let result = service_runtime.run_query(application_id, query);
+
+        // Always track the execution time, irrespective to whether the service ran successfully or
+        // timed out
+        self.resource_controller
+            .track_service_oracle_execution(execution_start.elapsed())?;
+
+        let QueryOutcome {
+            response,
+            operations,
+        } = result?;
+
+        self.resource_controller
+            .track_service_oracle_response(response.len())?;
+
+        self.scheduled_operations.extend(operations);
+        Ok(response)
     }
 }
 
@@ -501,7 +540,7 @@ impl SyncRuntimeInternal<UserServiceInstance> {
     fn load_service_instance(
         &mut self,
         this: ServiceSyncRuntimeHandle,
-        id: UserApplicationId,
+        id: ApplicationId,
     ) -> Result<LoadedApplication<UserServiceInstance>, ExecutionError> {
         match self.loaded_applications.entry(id) {
             // TODO(#2927): support dynamic loading of modules on the Web
@@ -514,10 +553,16 @@ impl SyncRuntimeInternal<UserServiceInstance> {
             }
             #[cfg(not(web))]
             hash_map::Entry::Vacant(entry) => {
-                let (code, description) = self
+                let txn_tracker_moved = mem::take(&mut self.transaction_tracker);
+                let (code, description, txn_tracker_moved) = self
                     .execution_state_sender
-                    .send_request(|callback| ExecutionRequest::LoadService { id, callback })?
+                    .send_request(move |callback| ExecutionRequest::LoadService {
+                        id,
+                        callback,
+                        txn_tracker: txn_tracker_moved,
+                    })?
                     .recv_response()?;
+                self.transaction_tracker = txn_tracker_moved;
 
                 let instance = code.instantiate(this)?;
                 Ok(entry
@@ -529,7 +574,7 @@ impl SyncRuntimeInternal<UserServiceInstance> {
     }
 }
 
-impl<UserInstance> SyncRuntime<UserInstance> {
+impl<UserInstance: WithContext> SyncRuntime<UserInstance> {
     fn into_inner(mut self) -> Option<SyncRuntimeInternal<UserInstance>> {
         let handle = self.0.take().expect(
             "`SyncRuntime` should not be used after its `inner` contents have been moved out",
@@ -541,13 +586,15 @@ impl<UserInstance> SyncRuntime<UserInstance> {
     }
 }
 
-impl<UserInstance> From<SyncRuntimeInternal<UserInstance>> for SyncRuntimeHandle<UserInstance> {
+impl<UserInstance: WithContext> From<SyncRuntimeInternal<UserInstance>>
+    for SyncRuntimeHandle<UserInstance>
+{
     fn from(runtime: SyncRuntimeInternal<UserInstance>) -> Self {
         SyncRuntimeHandle(Arc::new(Mutex::new(runtime)))
     }
 }
 
-impl<UserInstance> SyncRuntimeHandle<UserInstance> {
+impl<UserInstance: WithContext> SyncRuntimeHandle<UserInstance> {
     fn inner(&self) -> std::sync::MutexGuard<'_, SyncRuntimeInternal<UserInstance>> {
         self.0
             .try_lock()
@@ -555,170 +602,10 @@ impl<UserInstance> SyncRuntimeHandle<UserInstance> {
     }
 }
 
-impl<UserInstance> BaseRuntime for SyncRuntimeHandle<UserInstance> {
-    type Read = <SyncRuntimeInternal<UserInstance> as BaseRuntime>::Read;
-    type ReadValueBytes = <SyncRuntimeInternal<UserInstance> as BaseRuntime>::ReadValueBytes;
-    type ContainsKey = <SyncRuntimeInternal<UserInstance> as BaseRuntime>::ContainsKey;
-    type ContainsKeys = <SyncRuntimeInternal<UserInstance> as BaseRuntime>::ContainsKeys;
-    type ReadMultiValuesBytes =
-        <SyncRuntimeInternal<UserInstance> as BaseRuntime>::ReadMultiValuesBytes;
-    type FindKeysByPrefix = <SyncRuntimeInternal<UserInstance> as BaseRuntime>::FindKeysByPrefix;
-    type FindKeyValuesByPrefix =
-        <SyncRuntimeInternal<UserInstance> as BaseRuntime>::FindKeyValuesByPrefix;
-
-    fn chain_id(&mut self) -> Result<ChainId, ExecutionError> {
-        self.inner().chain_id()
-    }
-
-    fn block_height(&mut self) -> Result<BlockHeight, ExecutionError> {
-        self.inner().block_height()
-    }
-
-    fn application_id(&mut self) -> Result<UserApplicationId, ExecutionError> {
-        self.inner().application_id()
-    }
-
-    fn application_creator_chain_id(&mut self) -> Result<ChainId, ExecutionError> {
-        self.inner().application_creator_chain_id()
-    }
-
-    fn application_parameters(&mut self) -> Result<Vec<u8>, ExecutionError> {
-        self.inner().application_parameters()
-    }
-
-    fn read_system_timestamp(&mut self) -> Result<Timestamp, ExecutionError> {
-        self.inner().read_system_timestamp()
-    }
-
-    fn read_chain_balance(&mut self) -> Result<Amount, ExecutionError> {
-        self.inner().read_chain_balance()
-    }
-
-    fn read_owner_balance(&mut self, owner: AccountOwner) -> Result<Amount, ExecutionError> {
-        self.inner().read_owner_balance(owner)
-    }
-
-    fn read_owner_balances(&mut self) -> Result<Vec<(AccountOwner, Amount)>, ExecutionError> {
-        self.inner().read_owner_balances()
-    }
-
-    fn read_balance_owners(&mut self) -> Result<Vec<AccountOwner>, ExecutionError> {
-        self.inner().read_balance_owners()
-    }
-
-    fn chain_ownership(&mut self) -> Result<ChainOwnership, ExecutionError> {
-        self.inner().chain_ownership()
-    }
-
-    fn contains_key_new(&mut self, key: Vec<u8>) -> Result<Self::ContainsKey, ExecutionError> {
-        self.inner().contains_key_new(key)
-    }
-
-    fn contains_key_wait(&mut self, promise: &Self::ContainsKey) -> Result<bool, ExecutionError> {
-        self.inner().contains_key_wait(promise)
-    }
-
-    fn contains_keys_new(
-        &mut self,
-        keys: Vec<Vec<u8>>,
-    ) -> Result<Self::ContainsKeys, ExecutionError> {
-        self.inner().contains_keys_new(keys)
-    }
-
-    fn contains_keys_wait(
-        &mut self,
-        promise: &Self::ContainsKeys,
-    ) -> Result<Vec<bool>, ExecutionError> {
-        self.inner().contains_keys_wait(promise)
-    }
-
-    fn read_multi_values_bytes_new(
-        &mut self,
-        keys: Vec<Vec<u8>>,
-    ) -> Result<Self::ReadMultiValuesBytes, ExecutionError> {
-        self.inner().read_multi_values_bytes_new(keys)
-    }
-
-    fn read_multi_values_bytes_wait(
-        &mut self,
-        promise: &Self::ReadMultiValuesBytes,
-    ) -> Result<Vec<Option<Vec<u8>>>, ExecutionError> {
-        self.inner().read_multi_values_bytes_wait(promise)
-    }
-
-    fn read_value_bytes_new(
-        &mut self,
-        key: Vec<u8>,
-    ) -> Result<Self::ReadValueBytes, ExecutionError> {
-        self.inner().read_value_bytes_new(key)
-    }
-
-    fn read_value_bytes_wait(
-        &mut self,
-        promise: &Self::ReadValueBytes,
-    ) -> Result<Option<Vec<u8>>, ExecutionError> {
-        self.inner().read_value_bytes_wait(promise)
-    }
-
-    fn find_keys_by_prefix_new(
-        &mut self,
-        key_prefix: Vec<u8>,
-    ) -> Result<Self::FindKeysByPrefix, ExecutionError> {
-        self.inner().find_keys_by_prefix_new(key_prefix)
-    }
-
-    fn find_keys_by_prefix_wait(
-        &mut self,
-        promise: &Self::FindKeysByPrefix,
-    ) -> Result<Vec<Vec<u8>>, ExecutionError> {
-        self.inner().find_keys_by_prefix_wait(promise)
-    }
-
-    fn find_key_values_by_prefix_new(
-        &mut self,
-        key_prefix: Vec<u8>,
-    ) -> Result<Self::FindKeyValuesByPrefix, ExecutionError> {
-        self.inner().find_key_values_by_prefix_new(key_prefix)
-    }
-
-    fn find_key_values_by_prefix_wait(
-        &mut self,
-        promise: &Self::FindKeyValuesByPrefix,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ExecutionError> {
-        self.inner().find_key_values_by_prefix_wait(promise)
-    }
-
-    fn query_service(
-        &mut self,
-        application_id: ApplicationId,
-        query: Vec<u8>,
-    ) -> Result<Vec<u8>, ExecutionError> {
-        self.inner().query_service(application_id, query)
-    }
-
-    fn http_post(
-        &mut self,
-        url: &str,
-        content_type: String,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>, ExecutionError> {
-        self.inner().http_post(url, content_type, payload)
-    }
-
-    fn assert_before(&mut self, timestamp: Timestamp) -> Result<(), ExecutionError> {
-        self.inner().assert_before(timestamp)
-    }
-
-    fn read_data_blob(&mut self, hash: &CryptoHash) -> Result<Vec<u8>, ExecutionError> {
-        self.inner().read_data_blob(hash)
-    }
-
-    fn assert_data_blob_exists(&mut self, hash: &CryptoHash) -> Result<(), ExecutionError> {
-        self.inner().assert_data_blob_exists(hash)
-    }
-}
-
-impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
+impl<UserInstance: WithContext> BaseRuntime for SyncRuntimeHandle<UserInstance>
+where
+    Self: ContractOrServiceRuntime,
+{
     type Read = ();
     type ReadValueBytes = u32;
     type ContainsKey = u32;
@@ -728,74 +615,91 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
     type FindKeyValuesByPrefix = u32;
 
     fn chain_id(&mut self) -> Result<ChainId, ExecutionError> {
-        Ok(self.chain_id)
+        Ok(self.inner().chain_id)
     }
 
     fn block_height(&mut self) -> Result<BlockHeight, ExecutionError> {
-        Ok(self.height)
+        Ok(self.inner().height)
     }
 
-    fn application_id(&mut self) -> Result<UserApplicationId, ExecutionError> {
-        Ok(self.current_application().id)
+    fn application_id(&mut self) -> Result<ApplicationId, ExecutionError> {
+        Ok(self.inner().current_application().id)
     }
 
     fn application_creator_chain_id(&mut self) -> Result<ChainId, ExecutionError> {
-        Ok(self.current_application().id.creation.chain_id)
+        Ok(self
+            .inner()
+            .current_application()
+            .description
+            .creator_chain_id)
     }
 
     fn application_parameters(&mut self) -> Result<Vec<u8>, ExecutionError> {
-        Ok(self.current_application().parameters.clone())
+        Ok(self
+            .inner()
+            .current_application()
+            .description
+            .parameters
+            .clone())
     }
 
     fn read_system_timestamp(&mut self) -> Result<Timestamp, ExecutionError> {
-        self.execution_state_sender
+        self.inner()
+            .execution_state_sender
             .send_request(|callback| ExecutionRequest::SystemTimestamp { callback })?
             .recv_response()
     }
 
     fn read_chain_balance(&mut self) -> Result<Amount, ExecutionError> {
-        self.execution_state_sender
+        self.inner()
+            .execution_state_sender
             .send_request(|callback| ExecutionRequest::ChainBalance { callback })?
             .recv_response()
     }
 
     fn read_owner_balance(&mut self, owner: AccountOwner) -> Result<Amount, ExecutionError> {
-        self.execution_state_sender
+        self.inner()
+            .execution_state_sender
             .send_request(|callback| ExecutionRequest::OwnerBalance { owner, callback })?
             .recv_response()
     }
 
     fn read_owner_balances(&mut self) -> Result<Vec<(AccountOwner, Amount)>, ExecutionError> {
-        self.execution_state_sender
+        self.inner()
+            .execution_state_sender
             .send_request(|callback| ExecutionRequest::OwnerBalances { callback })?
             .recv_response()
     }
 
     fn read_balance_owners(&mut self) -> Result<Vec<AccountOwner>, ExecutionError> {
-        self.execution_state_sender
+        self.inner()
+            .execution_state_sender
             .send_request(|callback| ExecutionRequest::BalanceOwners { callback })?
             .recv_response()
     }
 
     fn chain_ownership(&mut self) -> Result<ChainOwnership, ExecutionError> {
-        self.execution_state_sender
+        self.inner()
+            .execution_state_sender
             .send_request(|callback| ExecutionRequest::ChainOwnership { callback })?
             .recv_response()
     }
 
     fn contains_key_new(&mut self, key: Vec<u8>) -> Result<Self::ContainsKey, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
-        self.resource_controller.track_read_operations(1)?;
-        let receiver = self
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        this.resource_controller.track_read_operation()?;
+        let receiver = this
             .execution_state_sender
             .send_request(move |callback| ExecutionRequest::ContainsKey { id, key, callback })?;
+        let state = this.view_user_states.entry(id).or_default();
         state.contains_key_queries.register(receiver)
     }
 
     fn contains_key_wait(&mut self, promise: &Self::ContainsKey) -> Result<bool, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        let state = this.view_user_states.entry(id).or_default();
         let value = state.contains_key_queries.wait(*promise)?;
         Ok(value)
     }
@@ -804,12 +708,13 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         keys: Vec<Vec<u8>>,
     ) -> Result<Self::ContainsKeys, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
-        self.resource_controller.track_read_operations(1)?;
-        let receiver = self
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        this.resource_controller.track_read_operation()?;
+        let receiver = this
             .execution_state_sender
             .send_request(move |callback| ExecutionRequest::ContainsKeys { id, keys, callback })?;
+        let state = this.view_user_states.entry(id).or_default();
         state.contains_keys_queries.register(receiver)
     }
 
@@ -817,8 +722,9 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         promise: &Self::ContainsKeys,
     ) -> Result<Vec<bool>, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        let state = this.view_user_states.entry(id).or_default();
         let value = state.contains_keys_queries.wait(*promise)?;
         Ok(value)
     }
@@ -827,12 +733,13 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         keys: Vec<Vec<u8>>,
     ) -> Result<Self::ReadMultiValuesBytes, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
-        self.resource_controller.track_read_operations(1)?;
-        let receiver = self.execution_state_sender.send_request(move |callback| {
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        this.resource_controller.track_read_operation()?;
+        let receiver = this.execution_state_sender.send_request(move |callback| {
             ExecutionRequest::ReadMultiValuesBytes { id, keys, callback }
         })?;
+        let state = this.view_user_states.entry(id).or_default();
         state.read_multi_values_queries.register(receiver)
     }
 
@@ -840,12 +747,13 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         promise: &Self::ReadMultiValuesBytes,
     ) -> Result<Vec<Option<Vec<u8>>>, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        let state = this.view_user_states.entry(id).or_default();
         let values = state.read_multi_values_queries.wait(*promise)?;
         for value in &values {
             if let Some(value) = &value {
-                self.resource_controller
+                this.resource_controller
                     .track_bytes_read(value.len() as u64)?;
             }
         }
@@ -856,12 +764,13 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         key: Vec<u8>,
     ) -> Result<Self::ReadValueBytes, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
-        self.resource_controller.track_read_operations(1)?;
-        let receiver = self
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        this.resource_controller.track_read_operation()?;
+        let receiver = this
             .execution_state_sender
             .send_request(move |callback| ExecutionRequest::ReadValueBytes { id, key, callback })?;
+        let state = this.view_user_states.entry(id).or_default();
         state.read_value_queries.register(receiver)
     }
 
@@ -869,11 +778,14 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         promise: &Self::ReadValueBytes,
     ) -> Result<Option<Vec<u8>>, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
-        let value = state.read_value_queries.wait(*promise)?;
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        let value = {
+            let state = this.view_user_states.entry(id).or_default();
+            state.read_value_queries.wait(*promise)?
+        };
         if let Some(value) = &value {
-            self.resource_controller
+            this.resource_controller
                 .track_bytes_read(value.len() as u64)?;
         }
         Ok(value)
@@ -883,16 +795,17 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         key_prefix: Vec<u8>,
     ) -> Result<Self::FindKeysByPrefix, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
-        self.resource_controller.track_read_operations(1)?;
-        let receiver = self.execution_state_sender.send_request(move |callback| {
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        this.resource_controller.track_read_operation()?;
+        let receiver = this.execution_state_sender.send_request(move |callback| {
             ExecutionRequest::FindKeysByPrefix {
                 id,
                 key_prefix,
                 callback,
             }
         })?;
+        let state = this.view_user_states.entry(id).or_default();
         state.find_keys_queries.register(receiver)
     }
 
@@ -900,14 +813,17 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         promise: &Self::FindKeysByPrefix,
     ) -> Result<Vec<Vec<u8>>, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
-        let keys = state.find_keys_queries.wait(*promise)?;
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        let keys = {
+            let state = this.view_user_states.entry(id).or_default();
+            state.find_keys_queries.wait(*promise)?
+        };
         let mut read_size = 0;
         for key in &keys {
             read_size += key.len();
         }
-        self.resource_controller
+        this.resource_controller
             .track_bytes_read(read_size as u64)?;
         Ok(keys)
     }
@@ -916,16 +832,17 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         key_prefix: Vec<u8>,
     ) -> Result<Self::FindKeyValuesByPrefix, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
-        self.resource_controller.track_read_operations(1)?;
-        let receiver = self.execution_state_sender.send_request(move |callback| {
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        this.resource_controller.track_read_operation()?;
+        let receiver = this.execution_state_sender.send_request(move |callback| {
             ExecutionRequest::FindKeyValuesByPrefix {
                 id,
                 key_prefix,
                 callback,
             }
         })?;
+        let state = this.view_user_states.entry(id).or_default();
         state.find_key_values_queries.register(receiver)
     }
 
@@ -933,90 +850,71 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
         &mut self,
         promise: &Self::FindKeyValuesByPrefix,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ExecutionError> {
-        let id = self.application_id()?;
-        let state = self.view_user_states.entry(id).or_default();
+        let mut this = self.inner();
+        let id = this.current_application().id;
+        let state = this.view_user_states.entry(id).or_default();
         let key_values = state.find_key_values_queries.wait(*promise)?;
         let mut read_size = 0;
         for (key, value) in &key_values {
             read_size += key.len() + value.len();
         }
-        self.resource_controller
+        this.resource_controller
             .track_bytes_read(read_size as u64)?;
         Ok(key_values)
     }
 
-    fn query_service(
+    fn perform_http_request(
         &mut self,
-        application_id: ApplicationId,
-        query: Vec<u8>,
-    ) -> Result<Vec<u8>, ExecutionError> {
-        ensure!(
-            cfg!(feature = "unstable-oracles"),
-            ExecutionError::UnstableOracle
-        );
-        let response =
-            if let Some(response) = self.transaction_tracker.next_replayed_oracle_response()? {
-                match response {
-                    OracleResponse::Service(bytes) => bytes,
-                    _ => return Err(ExecutionError::OracleResponseMismatch),
-                }
-            } else {
-                let context = QueryContext {
-                    chain_id: self.chain_id,
-                    next_block_height: self.height,
-                    local_time: self.local_time,
-                };
-                let sender = self.execution_state_sender.clone();
-                ServiceSyncRuntime::new(sender, context).run_query(application_id, query)?
-            };
-        self.transaction_tracker
-            .add_oracle_response(OracleResponse::Service(response.clone()));
-        Ok(response)
-    }
+        request: http::Request,
+    ) -> Result<http::Response, ExecutionError> {
+        let mut this = self.inner();
+        let app_permissions = this
+            .execution_state_sender
+            .send_request(|callback| ExecutionRequest::GetApplicationPermissions { callback })?
+            .recv_response()?;
 
-    fn http_post(
-        &mut self,
-        url: &str,
-        content_type: String,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>, ExecutionError> {
+        let app_id = this.current_application().id;
         ensure!(
-            cfg!(feature = "unstable-oracles"),
-            ExecutionError::UnstableOracle
+            app_permissions.can_make_http_requests(&app_id),
+            ExecutionError::UnauthorizedApplication(app_id)
         );
-        let bytes =
-            if let Some(response) = self.transaction_tracker.next_replayed_oracle_response()? {
+
+        this.resource_controller.track_http_request()?;
+
+        let response =
+            if let Some(response) = this.transaction_tracker.next_replayed_oracle_response()? {
                 match response {
-                    OracleResponse::Post(bytes) => bytes,
+                    OracleResponse::Http(response) => response,
                     _ => return Err(ExecutionError::OracleResponseMismatch),
                 }
             } else {
-                let url = url.to_string();
-                self.execution_state_sender
-                    .send_request(|callback| ExecutionRequest::HttpPost {
-                        url,
-                        content_type,
-                        payload,
+                this.execution_state_sender
+                    .send_request(|callback| ExecutionRequest::PerformHttpRequest {
+                        request,
+                        http_responses_are_oracle_responses:
+                            Self::LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE,
                         callback,
                     })?
                     .recv_response()?
             };
-        self.transaction_tracker
-            .add_oracle_response(OracleResponse::Post(bytes.clone()));
-        Ok(bytes)
+        this.transaction_tracker
+            .add_oracle_response(OracleResponse::Http(response.clone()));
+        Ok(response)
     }
 
     fn assert_before(&mut self, timestamp: Timestamp) -> Result<(), ExecutionError> {
-        if !self
+        let mut this = self.inner();
+        if !this
             .transaction_tracker
             .replay_oracle_response(OracleResponse::Assert)?
         {
             // There are no recorded oracle responses, so we check the local time.
+            let local_time = this.transaction_tracker.local_time();
             ensure!(
-                self.local_time < timestamp,
+                local_time < timestamp,
                 ExecutionError::AssertBefore {
                     timestamp,
-                    local_time: self.local_time,
+                    local_time,
                 }
             );
         }
@@ -1024,33 +922,54 @@ impl<UserInstance> BaseRuntime for SyncRuntimeInternal<UserInstance> {
     }
 
     fn read_data_blob(&mut self, hash: &CryptoHash) -> Result<Vec<u8>, ExecutionError> {
+        let mut this = self.inner();
         let blob_id = BlobId::new(*hash, BlobType::Data);
-        let (blob_content, is_new) = self
+        let (blob_content, is_new) = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::ReadBlobContent { blob_id, callback })?
             .recv_response()?;
         if is_new {
-            self.transaction_tracker
+            this.transaction_tracker
                 .replay_oracle_response(OracleResponse::Blob(blob_id))?;
         }
         Ok(blob_content.into_bytes().into_vec())
     }
 
     fn assert_data_blob_exists(&mut self, hash: &CryptoHash) -> Result<(), ExecutionError> {
+        let mut this = self.inner();
         let blob_id = BlobId::new(*hash, BlobType::Data);
-        let is_new = self
+        let is_new = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::AssertBlobExists { blob_id, callback })?
             .recv_response()?;
         if is_new {
-            self.transaction_tracker
+            this.transaction_tracker
                 .replay_oracle_response(OracleResponse::Blob(blob_id))?;
         }
         Ok(())
     }
 }
 
-impl<UserInstance> Clone for SyncRuntimeHandle<UserInstance> {
+/// An extension trait to determine in compile time the different behaviors between contract and
+/// services in the implementation of [`BaseRuntime`].
+trait ContractOrServiceRuntime {
+    /// Configured to `true` if the HTTP response size should be limited to the oracle response
+    /// size.
+    ///
+    /// This is `false` for services, potentially allowing them to receive a larger HTTP response
+    /// and only storing in the block a shorter oracle response.
+    const LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE: bool;
+}
+
+impl ContractOrServiceRuntime for ContractSyncRuntimeHandle {
+    const LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE: bool = true;
+}
+
+impl ContractOrServiceRuntime for ServiceSyncRuntimeHandle {
+    const LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE: bool = false;
+}
+
+impl<UserInstance: WithContext> Clone for SyncRuntimeHandle<UserInstance> {
     fn clone(&self) -> Self {
         SyncRuntimeHandle(self.0.clone())
     }
@@ -1060,7 +979,6 @@ impl ContractSyncRuntime {
     pub(crate) fn new(
         execution_state_sender: ExecutionStateSender,
         chain_id: ChainId,
-        local_time: Timestamp,
         refund_grant_to: Option<Account>,
         resource_controller: ResourceController,
         action: &UserAction,
@@ -1070,7 +988,7 @@ impl ContractSyncRuntime {
             SyncRuntimeInternal::new(
                 chain_id,
                 action.height(),
-                local_time,
+                action.round(),
                 action.signer(),
                 if let UserAction::Message(context, _) = action {
                     Some(context.into())
@@ -1078,18 +996,20 @@ impl ContractSyncRuntime {
                     None
                 },
                 execution_state_sender,
+                None,
                 refund_grant_to,
                 resource_controller,
                 txn_tracker,
+                action.timestamp(),
             ),
         )))
     }
 
     pub(crate) fn preload_contract(
         &self,
-        id: UserApplicationId,
+        id: ApplicationId,
         code: UserContractCode,
-        description: UserApplicationDescription,
+        description: ApplicationDescription,
     ) -> Result<(), ExecutionError> {
         let this = self
             .0
@@ -1112,30 +1032,36 @@ impl ContractSyncRuntime {
     /// Main entry point to start executing a user action.
     pub(crate) fn run_action(
         mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         chain_id: ChainId,
         action: UserAction,
-    ) -> Result<(ResourceController, TransactionTracker), ExecutionError> {
-        self.deref_mut()
+    ) -> Result<(Option<Vec<u8>>, ResourceController, TransactionTracker), ExecutionError> {
+        let result = self
+            .deref_mut()
             .run_action(application_id, chain_id, action)?;
         let runtime = self
             .into_inner()
             .expect("Runtime clones should have been freed by now");
-        Ok((runtime.resource_controller, runtime.transaction_tracker))
+        Ok((
+            result,
+            runtime.resource_controller,
+            runtime.transaction_tracker,
+        ))
     }
 }
 
 impl ContractSyncRuntimeHandle {
     fn run_action(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         chain_id: ChainId,
         action: UserAction,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<Option<Vec<u8>>, ExecutionError> {
         let finalize_context = FinalizeContext {
             authenticated_signer: action.signer(),
             chain_id,
             height: action.height(),
+            round: action.round(),
         };
 
         {
@@ -1144,15 +1070,24 @@ impl ContractSyncRuntimeHandle {
             assert_eq!(runtime.chain_id, chain_id);
             assert_eq!(runtime.height, action.height());
         }
-        self.execute(application_id, action.signer(), move |code| match action {
-            UserAction::Instantiate(context, argument) => code.instantiate(context, argument),
-            UserAction::Operation(context, operation) => {
-                code.execute_operation(context, operation).map(|_| ())
+
+        let signer = action.signer();
+        let closure = move |code: &mut UserContractInstance| match action {
+            UserAction::Instantiate(_context, argument) => {
+                code.instantiate(argument).map(|()| None)
             }
-            UserAction::Message(context, message) => code.execute_message(context, message),
-        })?;
+            UserAction::Operation(_context, operation) => {
+                code.execute_operation(operation).map(Option::Some)
+            }
+            UserAction::Message(_context, message) => code.execute_message(message).map(|()| None),
+            UserAction::ProcessStreams(_context, updates) => {
+                code.process_streams(updates).map(|()| None)
+            }
+        };
+
+        let result = self.execute(application_id, signer, closure)?;
         self.finalize(finalize_context)?;
-        Ok(())
+        Ok(result)
     }
 
     /// Notifies all loaded applications that execution is finalizing.
@@ -1165,7 +1100,7 @@ impl ContractSyncRuntimeHandle {
 
         for application in applications {
             self.execute(application, context.authenticated_signer, |contract| {
-                contract.finalize(context)
+                contract.finalize().map(|_| None)
             })?;
             self.inner().loaded_applications.remove(&application);
         }
@@ -1176,10 +1111,10 @@ impl ContractSyncRuntimeHandle {
     /// Executes a `closure` with the contract code for the `application_id`.
     fn execute(
         &mut self,
-        application_id: UserApplicationId,
-        signer: Option<Owner>,
-        closure: impl FnOnce(&mut UserContractInstance) -> Result<(), ExecutionError>,
-    ) -> Result<(), ExecutionError> {
+        application_id: ApplicationId,
+        signer: Option<AccountOwner>,
+        closure: impl FnOnce(&mut UserContractInstance) -> Result<Option<Vec<u8>>, ExecutionError>,
+    ) -> Result<Option<Vec<u8>>, ExecutionError> {
         let contract = {
             let mut runtime = self.inner();
             let application = runtime.load_contract_instance(self.clone(), application_id)?;
@@ -1187,9 +1122,8 @@ impl ContractSyncRuntimeHandle {
             let status = ApplicationStatus {
                 caller_id: None,
                 id: application_id,
-                parameters: application.parameters.clone(),
+                description: application.description.clone(),
                 signer,
-                outcome: RawExecutionOutcome::default(),
             };
 
             runtime.push_application(status);
@@ -1197,7 +1131,7 @@ impl ContractSyncRuntimeHandle {
             application
         };
 
-        closure(
+        let result = closure(
             &mut contract
                 .instance
                 .try_lock()
@@ -1208,18 +1142,16 @@ impl ContractSyncRuntimeHandle {
         let application_status = runtime.pop_application();
         assert_eq!(application_status.caller_id, None);
         assert_eq!(application_status.id, application_id);
-        assert_eq!(application_status.parameters, contract.parameters);
+        assert_eq!(application_status.description, contract.description);
         assert_eq!(application_status.signer, signer);
         assert!(runtime.call_stack.is_empty());
 
-        runtime.handle_outcome(application_status.outcome, signer, application_id)?;
-
-        Ok(())
+        Ok(result)
     }
 }
 
 impl ContractRuntime for ContractSyncRuntimeHandle {
-    fn authenticated_signer(&mut self) -> Result<Option<Owner>, ExecutionError> {
+    fn authenticated_signer(&mut self) -> Result<Option<AccountOwner>, ExecutionError> {
         Ok(self.inner().authenticated_signer)
     }
 
@@ -1234,53 +1166,81 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             .map(|metadata| metadata.is_bouncing))
     }
 
-    fn authenticated_caller_id(&mut self) -> Result<Option<UserApplicationId>, ExecutionError> {
-        let mut this = self.inner();
+    fn authenticated_caller_id(&mut self) -> Result<Option<ApplicationId>, ExecutionError> {
+        let this = self.inner();
         if this.call_stack.len() <= 1 {
             return Ok(None);
         }
         Ok(this.current_application().caller_id)
     }
 
-    fn remaining_fuel(&mut self) -> Result<u64, ExecutionError> {
-        Ok(self.inner().resource_controller.remaining_fuel())
+    fn maximum_fuel_per_block(&mut self, vm_runtime: VmRuntime) -> Result<u64, ExecutionError> {
+        Ok(match vm_runtime {
+            VmRuntime::Wasm => {
+                self.inner()
+                    .resource_controller
+                    .policy()
+                    .maximum_wasm_fuel_per_block
+            }
+            VmRuntime::Evm => {
+                self.inner()
+                    .resource_controller
+                    .policy()
+                    .maximum_evm_fuel_per_block
+            }
+        })
     }
 
-    fn consume_fuel(&mut self, fuel: u64) -> Result<(), ExecutionError> {
+    fn remaining_fuel(&mut self, vm_runtime: VmRuntime) -> Result<u64, ExecutionError> {
+        Ok(self.inner().resource_controller.remaining_fuel(vm_runtime))
+    }
+
+    fn consume_fuel(&mut self, fuel: u64, vm_runtime: VmRuntime) -> Result<(), ExecutionError> {
         let mut this = self.inner();
-        this.resource_controller.track_fuel(fuel)
+        this.resource_controller.track_fuel(fuel, vm_runtime)
     }
 
     fn send_message(&mut self, message: SendMessageRequest<Vec<u8>>) -> Result<(), ExecutionError> {
         let mut this = self.inner();
-        let application = this.current_application_mut();
+        let application = this.current_application();
+        let application_id = application.id;
+        let authenticated_signer = application.signer;
+        let mut refund_grant_to = this.refund_grant_to;
 
-        application.outcome.messages.push(message.into());
+        let grant = this
+            .resource_controller
+            .policy()
+            .total_price(&message.grant)?;
+        if grant.is_zero() {
+            refund_grant_to = None;
+        } else {
+            this.resource_controller.track_grant(grant)?;
+        }
+        let kind = if message.is_tracked {
+            MessageKind::Tracked
+        } else {
+            MessageKind::Simple
+        };
 
-        Ok(())
-    }
-
-    fn subscribe(&mut self, chain: ChainId, channel: ChannelName) -> Result<(), ExecutionError> {
-        let mut this = self.inner();
-        let application = this.current_application_mut();
-
-        application.outcome.subscribe.push((channel, chain));
-
-        Ok(())
-    }
-
-    fn unsubscribe(&mut self, chain: ChainId, channel: ChannelName) -> Result<(), ExecutionError> {
-        let mut this = self.inner();
-        let application = this.current_application_mut();
-
-        application.outcome.unsubscribe.push((channel, chain));
+        this.transaction_tracker
+            .add_outgoing_message(OutgoingMessage {
+                destination: message.destination,
+                authenticated_signer,
+                refund_grant_to,
+                grant,
+                kind,
+                message: Message::User {
+                    application_id,
+                    bytes: message.message,
+                },
+            })?;
 
         Ok(())
     }
 
     fn transfer(
         &mut self,
-        source: Option<AccountOwner>,
+        source: AccountOwner,
         destination: Account,
         amount: Amount,
     ) -> Result<(), ExecutionError> {
@@ -1289,7 +1249,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         let application_id = current_application.id;
         let signer = current_application.signer;
 
-        let execution_outcome = this
+        let maybe_message = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::Transfer {
                 source,
@@ -1302,7 +1262,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             .recv_response()?;
 
         this.transaction_tracker
-            .add_system_outcome(execution_outcome)?;
+            .add_outgoing_messages(maybe_message)?;
         Ok(())
     }
 
@@ -1317,7 +1277,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         let application_id = current_application.id;
         let signer = current_application.signer;
 
-        let execution_outcome = this
+        let message = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::Claim {
                 source,
@@ -1327,51 +1287,189 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
                 application_id,
                 callback,
             })?
-            .recv_response()?
-            .with_authenticated_signer(signer);
-        this.transaction_tracker
-            .add_system_outcome(execution_outcome)?;
+            .recv_response()?;
+        this.transaction_tracker.add_outgoing_message(message)?;
         Ok(())
     }
 
     fn try_call_application(
         &mut self,
         authenticated: bool,
-        callee_id: UserApplicationId,
+        callee_id: ApplicationId,
         argument: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError> {
-        let (contract, context) =
+        let (contract, _context) =
             self.inner()
                 .prepare_for_call(self.clone(), authenticated, callee_id)?;
 
         let value = contract
             .try_lock()
             .expect("Applications should not have reentrant calls")
-            .execute_operation(context, argument)?;
+            .execute_operation(argument)?;
 
         self.inner().finish_call()?;
 
         Ok(value)
     }
 
-    fn emit(
+    fn emit(&mut self, stream_name: StreamName, value: Vec<u8>) -> Result<u32, ExecutionError> {
+        let mut this = self.inner();
+        ensure!(
+            stream_name.0.len() <= MAX_STREAM_NAME_LEN,
+            ExecutionError::StreamNameTooLong
+        );
+        let application_id = GenericApplicationId::User(this.current_application().id);
+        let stream_id = StreamId {
+            stream_name,
+            application_id,
+        };
+        let index = this
+            .execution_state_sender
+            .send_request(|callback| ExecutionRequest::NextEventIndex {
+                stream_id: stream_id.clone(),
+                callback,
+            })?
+            .recv_response()?;
+        // TODO(#365): Consider separate event fee categories.
+        this.resource_controller
+            .track_bytes_written(value.len() as u64)?;
+        this.transaction_tracker.add_event(stream_id, index, value);
+        Ok(index)
+    }
+
+    fn read_event(
         &mut self,
-        name: StreamName,
-        key: Vec<u8>,
-        value: Vec<u8>,
+        chain_id: ChainId,
+        stream_name: StreamName,
+        index: u32,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        let mut this = self.inner();
+        ensure!(
+            stream_name.0.len() <= MAX_STREAM_NAME_LEN,
+            ExecutionError::StreamNameTooLong
+        );
+        let application_id = GenericApplicationId::User(this.current_application().id);
+        let stream_id = StreamId {
+            stream_name,
+            application_id,
+        };
+        let event_id = EventId {
+            stream_id,
+            index,
+            chain_id,
+        };
+        let event = this
+            .execution_state_sender
+            .send_request(|callback| ExecutionRequest::ReadEvent {
+                event_id: event_id.clone(),
+                callback,
+            })?
+            .recv_response()?;
+        // TODO(#365): Consider separate event fee categories.
+        this.resource_controller
+            .track_bytes_read(event.len() as u64)?;
+        this.transaction_tracker
+            .replay_oracle_response(OracleResponse::Event(event_id, event.clone()))?;
+        Ok(event)
+    }
+
+    fn subscribe_to_events(
+        &mut self,
+        chain_id: ChainId,
+        application_id: ApplicationId,
+        stream_name: StreamName,
     ) -> Result<(), ExecutionError> {
         let mut this = self.inner();
         ensure!(
-            key.len() <= MAX_EVENT_KEY_LEN,
-            ExecutionError::EventKeyTooLong
-        );
-        ensure!(
-            name.0.len() <= MAX_STREAM_NAME_LEN,
+            stream_name.0.len() <= MAX_STREAM_NAME_LEN,
             ExecutionError::StreamNameTooLong
         );
-        let application = this.current_application_mut();
-        application.outcome.events.push((name, key, value));
+        let stream_id = StreamId {
+            stream_name,
+            application_id: application_id.into(),
+        };
+        let subscriber_app_id = this.current_application().id;
+        let next_index = this
+            .execution_state_sender
+            .send_request(|callback| ExecutionRequest::SubscribeToEvents {
+                chain_id,
+                stream_id: stream_id.clone(),
+                subscriber_app_id,
+                callback,
+            })?
+            .recv_response()?;
+        this.transaction_tracker.add_stream_to_process(
+            subscriber_app_id,
+            chain_id,
+            stream_id,
+            0,
+            next_index,
+        );
         Ok(())
+    }
+
+    fn unsubscribe_from_events(
+        &mut self,
+        chain_id: ChainId,
+        application_id: ApplicationId,
+        stream_name: StreamName,
+    ) -> Result<(), ExecutionError> {
+        let mut this = self.inner();
+        ensure!(
+            stream_name.0.len() <= MAX_STREAM_NAME_LEN,
+            ExecutionError::StreamNameTooLong
+        );
+        let stream_id = StreamId {
+            stream_name,
+            application_id: application_id.into(),
+        };
+        let subscriber_app_id = this.current_application().id;
+        this.execution_state_sender
+            .send_request(|callback| ExecutionRequest::UnsubscribeFromEvents {
+                chain_id,
+                stream_id: stream_id.clone(),
+                subscriber_app_id,
+                callback,
+            })?
+            .recv_response()?;
+        this.transaction_tracker
+            .remove_stream_to_process(application_id, chain_id, stream_id);
+        Ok(())
+    }
+
+    fn query_service(
+        &mut self,
+        application_id: ApplicationId,
+        query: Vec<u8>,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        let mut this = self.inner();
+
+        let app_permissions = this
+            .execution_state_sender
+            .send_request(|callback| ExecutionRequest::GetApplicationPermissions { callback })?
+            .recv_response()?;
+
+        let app_id = this.current_application().id;
+        ensure!(
+            app_permissions.can_call_services(&app_id),
+            ExecutionError::UnauthorizedApplication(app_id)
+        );
+
+        this.resource_controller.track_service_oracle_call()?;
+        let response =
+            if let Some(response) = this.transaction_tracker.next_replayed_oracle_response()? {
+                match response {
+                    OracleResponse::Service(bytes) => bytes,
+                    _ => return Err(ExecutionError::OracleResponseMismatch),
+                }
+            } else {
+                this.run_service_oracle_query(application_id, query)?
+            };
+
+        this.transaction_tracker
+            .add_oracle_response(OracleResponse::Service(response.clone()));
+
+        Ok(response)
     }
 
     fn open_chain(
@@ -1379,33 +1477,35 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         ownership: ChainOwnership,
         application_permissions: ApplicationPermissions,
         balance: Amount,
-    ) -> Result<(MessageId, ChainId), ExecutionError> {
-        let mut this = self.inner();
-        let message_id = MessageId {
-            chain_id: this.chain_id,
-            height: this.height,
-            index: this.transaction_tracker.next_message_index(),
-        };
-        let chain_id = ChainId::child(message_id);
-        let [open_chain_message, subscribe_message] = this
+    ) -> Result<ChainId, ExecutionError> {
+        let parent_id = self.inner().chain_id;
+        let block_height = self.block_height()?;
+
+        let txn_tracker_moved = mem::take(&mut self.inner().transaction_tracker);
+        let timestamp = self.inner().user_context;
+
+        let (chain_id, txn_tracker_moved) = self
+            .inner()
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::OpenChain {
                 ownership,
                 balance,
-                next_message_id: message_id,
+                parent_id,
+                block_height,
+                timestamp,
                 application_permissions,
                 callback,
+                txn_tracker: txn_tracker_moved,
             })?
             .recv_response()?;
-        let outcome = RawExecutionOutcome::default()
-            .with_message(open_chain_message)
-            .with_message(subscribe_message);
-        this.transaction_tracker.add_system_outcome(outcome)?;
-        Ok((message_id, chain_id))
+
+        self.inner().transaction_tracker = txn_tracker_moved;
+
+        Ok(chain_id)
     }
 
     fn close_chain(&mut self) -> Result<(), ExecutionError> {
-        let mut this = self.inner();
+        let this = self.inner();
         let application_id = this.current_application().id;
         this.execution_state_sender
             .send_request(|callback| ExecutionRequest::CloseChain {
@@ -1415,60 +1515,83 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             .recv_response()?
     }
 
+    fn change_application_permissions(
+        &mut self,
+        application_permissions: ApplicationPermissions,
+    ) -> Result<(), ExecutionError> {
+        let this = self.inner();
+        let application_id = this.current_application().id;
+        this.execution_state_sender
+            .send_request(|callback| ExecutionRequest::ChangeApplicationPermissions {
+                application_id,
+                application_permissions,
+                callback,
+            })?
+            .recv_response()?
+    }
+
     fn create_application(
         &mut self,
-        bytecode_id: BytecodeId,
+        module_id: ModuleId,
         parameters: Vec<u8>,
         argument: Vec<u8>,
-        required_application_ids: Vec<UserApplicationId>,
-    ) -> Result<UserApplicationId, ExecutionError> {
+        required_application_ids: Vec<ApplicationId>,
+    ) -> Result<ApplicationId, ExecutionError> {
         let chain_id = self.inner().chain_id;
-        let context = OperationContext {
-            chain_id,
-            authenticated_signer: self.authenticated_signer()?,
-            authenticated_caller_id: self.authenticated_caller_id()?,
-            height: self.block_height()?,
-            index: None,
-        };
+        let block_height = self.block_height()?;
 
-        let mut this = self.inner();
-        let message_id = MessageId {
-            chain_id: context.chain_id,
-            height: context.height,
-            index: this.transaction_tracker.next_message_index(),
-        };
+        let txn_tracker_moved = mem::take(&mut self.inner().transaction_tracker);
+
         let CreateApplicationResult {
             app_id,
-            message,
-            blobs_to_register,
-        } = this
+            txn_tracker: txn_tracker_moved,
+        } = self
+            .inner()
             .execution_state_sender
-            .send_request(|callback| ExecutionRequest::CreateApplication {
-                next_message_id: message_id,
-                bytecode_id,
+            .send_request(move |callback| ExecutionRequest::CreateApplication {
+                chain_id,
+                block_height,
+                module_id,
                 parameters,
                 required_application_ids,
                 callback,
+                txn_tracker: txn_tracker_moved,
             })?
             .recv_response()??;
-        for blob_id in blobs_to_register {
-            this.transaction_tracker
-                .replay_oracle_response(OracleResponse::Blob(blob_id))?;
-        }
-        let outcome = RawExecutionOutcome::default().with_message(message);
-        this.transaction_tracker.add_system_outcome(outcome)?;
 
-        drop(this);
+        self.inner().transaction_tracker = txn_tracker_moved;
 
-        let user_action = UserAction::Instantiate(context, argument);
-        self.run_action(app_id, chain_id, user_action)?;
+        let (contract, _context) = self.inner().prepare_for_call(self.clone(), true, app_id)?;
+
+        contract
+            .try_lock()
+            .expect("Applications should not have reentrant calls")
+            .instantiate(argument)?;
+
+        self.inner().finish_call()?;
 
         Ok(app_id)
     }
 
+    fn validation_round(&mut self) -> Result<Option<u32>, ExecutionError> {
+        let mut this = self.inner();
+        let round =
+            if let Some(response) = this.transaction_tracker.next_replayed_oracle_response()? {
+                match response {
+                    OracleResponse::Round(round) => round,
+                    _ => return Err(ExecutionError::OracleResponseMismatch),
+                }
+            } else {
+                this.round
+            };
+        this.transaction_tracker
+            .add_oracle_response(OracleResponse::Round(round));
+        Ok(round)
+    }
+
     fn write_batch(&mut self, batch: Batch) -> Result<(), ExecutionError> {
         let mut this = self.inner();
-        let id = this.application_id()?;
+        let id = this.current_application().id;
         let state = this.view_user_states.entry(id).or_default();
         state.force_all_pending_queries()?;
         this.resource_controller.track_write_operations(
@@ -1493,17 +1616,31 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
 impl ServiceSyncRuntime {
     /// Creates a new [`ServiceSyncRuntime`] ready to execute using a provided [`QueryContext`].
     pub fn new(execution_state_sender: ExecutionStateSender, context: QueryContext) -> Self {
+        let mut txn_tracker = TransactionTracker::default();
+        txn_tracker.set_local_time(context.local_time);
+        Self::new_with_txn_tracker(execution_state_sender, context, None, txn_tracker)
+    }
+
+    /// Creates a new [`ServiceSyncRuntime`] ready to execute using a provided [`QueryContext`].
+    pub fn new_with_txn_tracker(
+        execution_state_sender: ExecutionStateSender,
+        context: QueryContext,
+        deadline: Option<Instant>,
+        txn_tracker: TransactionTracker,
+    ) -> Self {
         let runtime = SyncRuntime(Some(
             SyncRuntimeInternal::new(
                 context.chain_id,
                 context.next_block_height,
-                context.local_time,
+                None,
                 None,
                 None,
                 execution_state_sender,
+                deadline,
                 None,
                 ResourceController::default(),
-                TransactionTracker::default(),
+                txn_tracker,
+                (),
             )
             .into(),
         ));
@@ -1517,9 +1654,9 @@ impl ServiceSyncRuntime {
     /// Loads a service into the runtime's memory.
     pub(crate) fn preload_service(
         &self,
-        id: UserApplicationId,
+        id: ApplicationId,
         code: UserServiceCode,
-        description: UserApplicationDescription,
+        description: ApplicationDescription,
     ) -> Result<(), ExecutionError> {
         let this = self
             .runtime
@@ -1567,18 +1704,27 @@ impl ServiceSyncRuntime {
             let execution_state_sender = self.handle_mut().inner().execution_state_sender.clone();
             *self = ServiceSyncRuntime::new(execution_state_sender, new_context);
         } else {
-            self.handle_mut().inner().local_time = new_context.local_time;
+            self.handle_mut()
+                .inner()
+                .transaction_tracker
+                .set_local_time(new_context.local_time);
         }
     }
 
-    /// Queries an application specified by its [`UserApplicationId`].
+    /// Queries an application specified by its [`ApplicationId`].
     pub(crate) fn run_query(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         query: Vec<u8>,
-    ) -> Result<Vec<u8>, ExecutionError> {
-        self.handle_mut()
-            .try_query_application(application_id, query)
+    ) -> Result<QueryOutcome<Vec<u8>>, ExecutionError> {
+        let this = self.handle_mut();
+        let response = this.try_query_application(application_id, query)?;
+        let operations = mem::take(&mut this.inner().scheduled_operations);
+
+        Ok(QueryOutcome {
+            response,
+            operations,
+        })
     }
 
     /// Obtains the [`SyncRuntimeHandle`] stored in this [`ServiceSyncRuntime`].
@@ -1593,54 +1739,60 @@ impl ServiceRuntime for ServiceSyncRuntimeHandle {
     /// Note that queries are not available from writable contexts.
     fn try_query_application(
         &mut self,
-        queried_id: UserApplicationId,
+        queried_id: ApplicationId,
         argument: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError> {
-        let (query_context, service) = {
+        let service = {
             let mut this = self.inner();
 
             // Load the application.
             let application = this.load_service_instance(self.clone(), queried_id)?;
             // Make the call to user code.
-            let query_context = QueryContext {
-                chain_id: this.chain_id,
-                next_block_height: this.height,
-                local_time: this.local_time,
-            };
             this.push_application(ApplicationStatus {
                 caller_id: None,
                 id: queried_id,
-                parameters: application.parameters,
+                description: application.description,
                 signer: None,
-                outcome: RawExecutionOutcome::default(),
             });
-            (query_context, application.instance)
+            application.instance
         };
         let response = service
             .try_lock()
             .expect("Applications should not have reentrant calls")
-            .handle_query(query_context, argument)?;
+            .handle_query(argument)?;
         self.inner().pop_application();
         Ok(response)
     }
 
-    /// Get a blob of bytes from an arbitrary URL.
-    fn fetch_url(&mut self, url: &str) -> Result<Vec<u8>, ExecutionError> {
-        let this = self.inner();
-        let url = url.to_string();
-        this.execution_state_sender
-            .send_request(|callback| ExecutionRequest::FetchUrl { url, callback })?
-            .recv_response()
+    fn schedule_operation(&mut self, operation: Vec<u8>) -> Result<(), ExecutionError> {
+        let mut this = self.inner();
+        let application_id = this.current_application().id;
+
+        this.scheduled_operations.push(Operation::User {
+            application_id,
+            bytes: operation,
+        });
+
+        Ok(())
+    }
+
+    fn check_execution_time(&mut self) -> Result<(), ExecutionError> {
+        if let Some(deadline) = self.inner().deadline {
+            if Instant::now() >= deadline {
+                return Err(ExecutionError::MaximumServiceOracleExecutionTimeExceeded);
+            }
+        }
+        Ok(())
     }
 }
 
 /// A request to the service runtime actor.
 pub enum ServiceRuntimeRequest {
     Query {
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         context: QueryContext,
         query: Vec<u8>,
-        callback: oneshot::Sender<Result<Vec<u8>, ExecutionError>>,
+        callback: oneshot::Sender<Result<QueryOutcome<Vec<u8>>, ExecutionError>>,
     },
 }
 

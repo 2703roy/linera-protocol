@@ -23,7 +23,6 @@ use std::{
     vec::IntoIter,
 };
 
-use async_trait::async_trait;
 use bcs::serialized_size;
 use linera_witty::{WitLoad, WitStore, WitType};
 use serde::{Deserialize, Serialize};
@@ -165,11 +164,11 @@ impl UnorderedBatch {
 
 /// Checks if `key` is matched by any prefix in `key_prefix_set`.
 /// The set `key_prefix_set` must be minimal for the function to work correctly.
-/// That is, there should not be any two prefixes p1 and p2 such that p1 < p2 for
+/// That is, there should not be any two prefixes `p1` and `p2` such that `p1 < p2` for
 /// the lexicographic ordering on `Vec<u8>` entries.
 /// Under this condition we have equivalence between the following two statements:
-/// * There is an key_prefix in `key_prefiw_set` that matches `key`.
-/// * The highest key_prefix in `key_prefix_set` is actually matching.
+/// * There is a key prefix in `key_prefix_set` that matches `key`.
+/// * The highest key prefix in `key_prefix_set` is actually matching.
 fn is_prefix_matched(key_prefix_set: &BTreeSet<Vec<u8>>, key: &[u8]) -> bool {
     let range = (Bound::Unbounded, Bound::Included(key.to_vec()));
     let range = key_prefix_set.range(range);
@@ -363,21 +362,22 @@ impl Batch {
     }
 }
 
-/// A trait to expand delete_prefix operations.
+/// A trait to expand `DeletePrefix` operations.
+///
 /// Certain databases (e.g. DynamoDB) do not support the deletion by prefix.
 /// Thus we need to access the databases in order to replace a `DeletePrefix`
 /// by a vector of the keys to be removed.
-#[trait_variant::make(DeletePrefixExpander: Send)]
-pub trait LocalDeletePrefixExpander {
-    /// The error type that can happen when expanding the key_prefix.
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait DeletePrefixExpander {
+    /// The error type that can happen when expanding the key prefix.
     type Error: Debug;
 
     /// Returns the list of keys to be appended to the list.
     async fn expand_delete_prefix(&self, key_prefix: &[u8]) -> Result<Vec<Vec<u8>>, Self::Error>;
 }
 
+#[cfg_attr(not(web), trait_variant::make(Send))]
 /// A notion of batch useful for certain computations (notably journaling).
-#[async_trait]
 pub trait SimplifiedBatch: Sized + Send + Sync {
     /// The iterator type used to process values from the batch.
     type Iter: BatchValueWriter<Self>;
@@ -436,13 +436,12 @@ pub trait BatchValueWriter<Batch>: Send + Sync {
     ) -> Result<Option<usize>, bcs::Error>;
 }
 
-/// The iterator that corresponds to a SimpleUnorderedBatch
+/// The iterator that corresponds to a `SimpleUnorderedBatch`
 pub struct SimpleUnorderedBatchIter {
     delete_iter: Peekable<IntoIter<Vec<u8>>>,
     insert_iter: Peekable<IntoIter<(Vec<u8>, Vec<u8>)>>,
 }
 
-#[async_trait]
 impl SimplifiedBatch for SimpleUnorderedBatch {
     type Iter = SimpleUnorderedBatchIter;
 
@@ -541,13 +540,12 @@ impl BatchValueWriter<SimpleUnorderedBatch> for SimpleUnorderedBatchIter {
     }
 }
 
-/// The iterator that corresponds to a SimpleUnorderedBatch
+/// The iterator that corresponds to a `SimpleUnorderedBatch`
 pub struct UnorderedBatchIter {
     delete_prefix_iter: Peekable<IntoIter<Vec<u8>>>,
     insert_deletion_iter: SimpleUnorderedBatchIter,
 }
 
-#[async_trait]
 impl SimplifiedBatch for UnorderedBatch {
     type Iter = UnorderedBatchIter;
 
@@ -642,7 +640,8 @@ impl BatchValueWriter<UnorderedBatch> for UnorderedBatchIter {
 mod tests {
     use linera_views::{
         batch::{Batch, SimpleUnorderedBatch, UnorderedBatch},
-        context::{create_test_memory_context, Context},
+        context::{Context, MemoryContext},
+        store::WritableKeyValueStore as _,
     };
 
     #[test]
@@ -699,13 +698,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_simplify_batch5() {
-        let context = create_test_memory_context();
+        let context = MemoryContext::new_for_testing(());
         let mut batch = Batch::new();
         batch.put_key_value_bytes(vec![1, 2, 3], vec![]);
         batch.put_key_value_bytes(vec![1, 2, 4], vec![]);
         batch.put_key_value_bytes(vec![1, 2, 5], vec![]);
         batch.put_key_value_bytes(vec![1, 3, 3], vec![]);
-        context.write_batch(batch).await.unwrap();
+        context.store().write_batch(batch).await.unwrap();
         let mut batch = Batch::new();
         batch.delete_key_prefix(vec![1, 2]);
         let unordered_batch = batch.simplify();
@@ -722,7 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simplify_batch6() {
-        let context = create_test_memory_context();
+        let context = MemoryContext::new_for_testing(());
         let insertions = vec![(vec![1, 2, 3], vec![])];
         let simple_unordered_batch = SimpleUnorderedBatch {
             insertions: insertions.clone(),

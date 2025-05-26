@@ -5,9 +5,10 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use linera_base::time::{Duration, Instant};
 use linera_views::{
     batch::Batch,
-    context::{create_test_memory_context, Context, MemoryContext},
+    context::{Context, MemoryContext},
     reentrant_collection_view::ReentrantCollectionView,
     register_view::RegisterView,
+    store::WritableKeyValueStore as _,
     views::View,
 };
 use serde::{Deserialize, Serialize};
@@ -149,7 +150,7 @@ enum ComplexIndex {
 async fn create_populated_reentrant_collection_view(
 ) -> ReentrantCollectionView<MemoryContext<()>, ComplexIndex, RegisterView<MemoryContext<()>, String>>
 {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     let mut view: ReentrantCollectionView<_, ComplexIndex, RegisterView<_, String>> =
         ReentrantCollectionView::load(context)
             .await
@@ -194,7 +195,7 @@ async fn create_populated_reentrant_collection_view(
     view
 }
 
-/// Creates a populated [`ReentrantCollectionView`] with its contents completed flushed to
+/// Creates a populated [`ReentrantCollectionView`] with its contents completely flushed to
 /// the storage.
 async fn create_and_store_populated_reentrant_collection_view(
 ) -> ReentrantCollectionView<MemoryContext<()>, ComplexIndex, RegisterView<MemoryContext<()>, String>>
@@ -203,11 +204,12 @@ async fn create_and_store_populated_reentrant_collection_view(
     let context = view.context().clone();
     let mut batch = Batch::new();
     view.flush(&mut batch)
-        .expect("Failed to flush popluated `ReentrantCollectionView`'s contents");
+        .expect("Failed to flush populated `ReentrantCollectionView`'s contents");
     context
+        .store()
         .write_batch(batch)
         .await
-        .expect("Failed to store popluated `ReentrantCollectionView`'s contents");
+        .expect("Failed to store populated `ReentrantCollectionView`'s contents");
 
     ReentrantCollectionView::load(context)
         .await

@@ -19,14 +19,18 @@ use assert_matches::assert_matches;
 use async_graphql::Request;
 use counter::CounterAbi;
 use linera_base::{
-    data_types::{Amount, Bytecode, OracleResponse, UserApplicationDescription},
-    identifiers::{AccountOwner, ApplicationId, Destination, Owner, StreamId, StreamName},
+    crypto::InMemorySigner,
+    data_types::{Amount, Bytecode, Event, OracleResponse},
+    identifiers::{ApplicationId, BlobId, BlobType, StreamId, StreamName},
     ownership::{ChainOwnership, TimeoutConfig},
+    vm::VmRuntime,
 };
-use linera_chain::data_types::{EventRecord, MessageAction, OutgoingMessage};
+use linera_chain::{data_types::MessageAction, ChainError, ChainExecutionContext};
 use linera_execution::{
-    Message, MessageKind, Operation, ResourceControlPolicy, SystemMessage, WasmRuntime,
+    ExecutionError, Message, MessageKind, Operation, QueryOutcome, ResourceControlPolicy,
+    SystemMessage, SystemOperation, WasmRuntime,
 };
+use linera_storage::Storage as _;
 use serde_json::json;
 use test_case::test_case;
 
@@ -38,9 +42,13 @@ use crate::client::client_tests::RocksDbStorageBuilder;
 use crate::client::client_tests::ScyllaDbStorageBuilder;
 #[cfg(feature = "storage-service")]
 use crate::client::client_tests::ServiceStorageBuilder;
-use crate::client::{
-    client_tests::{MemoryStorageBuilder, StorageBuilder, TestBuilder},
-    ChainClientError,
+use crate::{
+    client::{
+        client_tests::{MemoryStorageBuilder, StorageBuilder, TestBuilder},
+        ChainClientError,
+    },
+    local_node::LocalNodeError,
+    worker::WorkerError,
 };
 
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer ; "wasmer"))]
@@ -90,6 +98,8 @@ async fn run_test_create_application<B>(storage_builder: B) -> anyhow::Result<()
 where
     B: StorageBuilder,
 {
+    let mut keys = InMemorySigner::new(None);
+    let vm_runtime = VmRuntime::Wasm;
     let (contract_path, service_path) =
         linera_execution::wasm_test::get_example_bytecode_paths("counter")?;
     let contract_bytecode = Bytecode::load_from_file(contract_path).await?;
@@ -103,18 +113,18 @@ where
         .len()
         .max(service_bytecode.bytes.len()) as u64;
     policy.maximum_blob_size = contract_compressed_len.max(service_compressed_len) as u64;
-    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
         .await?
         .with_policy(policy.clone());
     let publisher = builder.add_root_chain(0, Amount::from_tokens(3)).await?;
     let creator = builder.add_root_chain(1, Amount::ONE).await?;
 
-    let (bytecode_id, _cert) = publisher
-        .publish_bytecode(contract_bytecode, service_bytecode)
+    let (module_id, _cert) = publisher
+        .publish_module(contract_bytecode, service_bytecode, vm_runtime)
         .await
         .unwrap()
         .unwrap();
-    let bytecode_id = bytecode_id.with_abi::<counter::CounterAbi, (), u64>();
+    let module_id = module_id.with_abi::<counter::CounterAbi, (), u64>();
 
     creator.synchronize_from_validators().await.unwrap();
     creator.process_inbox().await.unwrap();
@@ -125,7 +135,7 @@ where
 
     let initial_value = 10_u64;
     let (application_id, _) = creator
-        .create_application(bytecode_id, &(), &initial_value, vec![])
+        .create_application(module_id, &(), &initial_value, vec![])
         .await
         .unwrap()
         .unwrap();
@@ -137,16 +147,19 @@ where
         .unwrap();
 
     let query = Request::new("{ value }");
-    let response = creator
+    let outcome = creator
         .query_user_application(application_id, &query)
         .await
         .unwrap();
 
-    let expected = async_graphql::Response::new(
-        async_graphql::Value::from_json(json!({"value": 15})).unwrap(),
-    );
+    let expected = QueryOutcome {
+        response: async_graphql::Response::new(
+            async_graphql::Value::from_json(json!({"value": 15})).unwrap(),
+        ),
+        operations: vec![],
+    };
 
-    assert_eq!(expected, response);
+    assert_eq!(outcome, expected);
     // Creating the application used fuel because of the `instantiate` call.
     let balance_after_init = creator.local_balance().await?;
     assert!(balance_after_init < balance_after_messaging);
@@ -155,13 +168,27 @@ where
     let small_bytecode = Bytecode::new(vec![]);
     // Publishing bytecode that exceeds the limit fails.
     let result = publisher
-        .publish_bytecode(large_bytecode.clone(), small_bytecode.clone())
+        .publish_module(large_bytecode.clone(), small_bytecode.clone(), vm_runtime)
         .await;
-    assert_matches!(result, Err(ChainClientError::LocalNodeError(_)));
+    assert_matches!(
+        result,
+        Err(ChainClientError::LocalNodeError(
+            LocalNodeError::WorkerError(WorkerError::ChainError(chain_error))
+        )) if matches!(&*chain_error, ChainError::ExecutionError(
+            error, ChainExecutionContext::Block
+        ) if matches!(**error, ExecutionError::BytecodeTooLarge))
+    );
     let result = publisher
-        .publish_bytecode(small_bytecode, large_bytecode)
+        .publish_module(small_bytecode, large_bytecode, vm_runtime)
         .await;
-    assert_matches!(result, Err(ChainClientError::LocalNodeError(_)));
+    assert_matches!(
+        result,
+        Err(ChainClientError::LocalNodeError(
+            LocalNodeError::WorkerError(WorkerError::ChainError(chain_error))
+        )) if matches!(&*chain_error, ChainError::ExecutionError(
+            error, ChainExecutionContext::Block
+        ) if matches!(**error, ExecutionError::BytecodeTooLarge))
+    );
 
     Ok(())
 }
@@ -236,10 +263,12 @@ async fn run_test_run_application_with_dependency<B>(storage_builder: B) -> anyh
 where
     B: StorageBuilder,
 {
-    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+    let mut keys = InMemorySigner::new(None);
+    let vm_runtime = VmRuntime::Wasm;
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
         .await?
         .with_policy(ResourceControlPolicy::all_categories());
-    // Will publish the bytecodes.
+    // Will publish the module.
     let publisher = builder.add_root_chain(0, Amount::from_tokens(3)).await?;
     // Will create the apps and use them to send a message.
     let creator = builder.add_root_chain(1, Amount::ONE).await?;
@@ -250,63 +279,67 @@ where
     // Handling the message causes an oracle request to the counter service, so no fast blocks
     // are allowed.
     let receiver_key = receiver.public_key().await.unwrap();
+
     receiver
         .change_ownership(ChainOwnership::multiple(
-            [(receiver_key, 100)],
+            [(receiver_key.into(), 100)],
             100,
             TimeoutConfig::default(),
         ))
         .await
         .unwrap();
+
     let creator_key = creator.public_key().await.unwrap();
     creator
         .change_ownership(ChainOwnership::multiple(
-            [(creator_key, 100)],
+            [(creator_key.into(), 100)],
             100,
             TimeoutConfig::default(),
         ))
         .await
         .unwrap();
 
-    let (bytecode_id1, _cert1) = {
+    let (module_id1, _cert1) = {
         let (contract_path, service_path) =
             linera_execution::wasm_test::get_example_bytecode_paths("counter")?;
         publisher
-            .publish_bytecode(
+            .publish_module(
                 Bytecode::load_from_file(contract_path).await?,
                 Bytecode::load_from_file(service_path).await?,
+                vm_runtime,
             )
             .await
             .unwrap()
             .unwrap()
     };
-    let bytecode_id1 = bytecode_id1.with_abi::<counter::CounterAbi, (), u64>();
-    let (bytecode_id2, _cert2) = {
+    let module_id1 = module_id1.with_abi::<counter::CounterAbi, (), u64>();
+    let (module_id2, _cert2) = {
         let (contract_path, service_path) =
             linera_execution::wasm_test::get_example_bytecode_paths("meta_counter")?;
         publisher
-            .publish_bytecode(
+            .publish_module(
                 Bytecode::load_from_file(contract_path).await?,
                 Bytecode::load_from_file(service_path).await?,
+                vm_runtime,
             )
             .await
             .unwrap()
             .unwrap()
     };
-    let bytecode_id2 =
-        bytecode_id2.with_abi::<meta_counter::MetaCounterAbi, ApplicationId<CounterAbi>, ()>();
+    let module_id2 =
+        module_id2.with_abi::<meta_counter::MetaCounterAbi, ApplicationId<CounterAbi>, ()>();
 
-    // Creator receives the bytecodes then creates the app.
+    // Creator receives the bytecode files then creates the app.
     creator.synchronize_from_validators().await.unwrap();
     let initial_value = 10_u64;
     let (application_id1, _) = creator
-        .create_application(bytecode_id1, &(), &initial_value, vec![])
+        .create_application(module_id1, &(), &initial_value, vec![])
         .await
         .unwrap()
         .unwrap();
     let (application_id2, certificate) = creator
         .create_application(
-            bytecode_id2,
+            module_id2,
             &application_id1,
             &(),
             vec![application_id1.forget_abi()],
@@ -315,43 +348,35 @@ where
         .unwrap()
         .unwrap();
     assert_eq!(
-        certificate.executed_block().outcome.events,
-        vec![
-            Vec::new(),
-            vec![EventRecord {
-                stream_id: StreamId {
-                    application_id: application_id2.forget_abi().into(),
-                    stream_name: StreamName(b"announcements".to_vec()),
-                },
-                key: b"updates".to_vec(),
-                value: b"instantiated".to_vec(),
-            }]
-        ]
+        certificate.block().body.events,
+        vec![vec![Event {
+            stream_id: StreamId {
+                application_id: application_id2.forget_abi().into(),
+                stream_name: StreamName(b"announcements".to_vec()),
+            },
+            index: 0,
+            value: bcs::to_bytes(&"instantiated".to_string()).unwrap(),
+        }]]
     );
 
-    let query_service = cfg!(feature = "unstable-oracles");
-    let mut operation = meta_counter::Operation::increment(receiver_id, 5, query_service);
+    let mut operation = meta_counter::Operation::increment(receiver_id, 5, true);
     operation.fuel_grant = 1000000;
     let cert = creator
         .execute_operation(Operation::user(application_id2, &operation)?)
         .await
         .unwrap()
         .unwrap();
-    let executed_block = cert.executed_block();
-    let responses = &executed_block.outcome.oracle_responses;
+    let block = cert.block();
+    let responses = &block.body.oracle_responses;
     let [_, responses] = &responses[..] else {
         panic!("Unexpected oracle responses: {:?}", responses);
     };
-    if cfg!(feature = "unstable-oracles") {
-        let [OracleResponse::Service(json)] = &responses[..] else {
-            assert_eq!(&responses[..], &[]);
-            panic!("Unexpected oracle responses: {:?}", responses);
-        };
-        let response_json = serde_json::from_slice::<serde_json::Value>(json).unwrap();
-        assert_eq!(response_json["data"], json!({"value": 10}));
-    } else {
-        assert!(responses.is_empty());
-    }
+    let [OracleResponse::Service(json)] = &responses[..] else {
+        assert_eq!(&responses[..], &[]);
+        panic!("Unexpected oracle responses: {:?}", responses);
+    };
+    let response_json = serde_json::from_slice::<serde_json::Value>(json).unwrap();
+    assert_eq!(response_json["data"], json!({"value": 10}));
 
     receiver.synchronize_from_validators().await.unwrap();
     receiver
@@ -361,15 +386,19 @@ where
     receiver.process_inbox().await.unwrap();
 
     let query = Request::new("{ value }");
-    let response = receiver
+    let outcome = receiver
         .query_user_application(application_id2, &query)
         .await
         .unwrap();
 
-    let expected =
-        async_graphql::Response::new(async_graphql::Value::from_json(json!({"value": 5})).unwrap());
+    let expected = QueryOutcome {
+        response: async_graphql::Response::new(
+            async_graphql::Value::from_json(json!({"value": 5})).unwrap(),
+        ),
+        operations: vec![],
+    };
 
-    assert_eq!(expected, response);
+    assert_eq!(outcome, expected);
 
     // Try again with a value that will make the (untracked) message fail.
     let operation = meta_counter::Operation::fail(receiver_id);
@@ -386,14 +415,14 @@ where
     let mut certs = receiver.process_inbox().await.unwrap().0;
     assert_eq!(certs.len(), 1);
     let cert = certs.pop().unwrap();
-    let incoming_bundles = &cert.executed_block().block.incoming_bundles;
+    let incoming_bundles = &cert.block().body.incoming_bundles;
     assert_eq!(incoming_bundles.len(), 1);
     assert_eq!(incoming_bundles[0].action, MessageAction::Reject);
     assert_eq!(
         incoming_bundles[0].bundle.messages[0].kind,
         MessageKind::Simple
     );
-    let messages = cert.executed_block().messages();
+    let messages = cert.block().messages();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].len(), 0);
 
@@ -413,18 +442,14 @@ where
     let mut certs = receiver.process_inbox().await.unwrap().0;
     assert_eq!(certs.len(), 1);
     let cert = certs.pop().unwrap();
-    let incoming_bundles = &cert.executed_block().block.incoming_bundles;
+    let incoming_bundles = &cert.block().body.incoming_bundles;
     assert_eq!(incoming_bundles.len(), 1);
     assert_eq!(incoming_bundles[0].action, MessageAction::Reject);
     assert_eq!(
         incoming_bundles[0].bundle.messages[0].kind,
-        MessageKind::Simple
-    );
-    assert_eq!(
-        incoming_bundles[0].bundle.messages[1].kind,
         MessageKind::Tracked
     );
-    let messages = cert.executed_block().messages();
+    let messages = cert.block().messages();
     assert_eq!(messages.len(), 1);
 
     // The bounced message is marked as "bouncing" in the Wasm context and succeeds.
@@ -435,7 +460,7 @@ where
     let mut certs = creator.process_inbox().await.unwrap().0;
     assert_eq!(certs.len(), 1);
     let cert = certs.pop().unwrap();
-    let incoming_bundles = &cert.executed_block().block.incoming_bundles;
+    let incoming_bundles = &cert.block().body.incoming_bundles;
     assert_eq!(incoming_bundles.len(), 2);
     // First message is the grant refund for the successful message sent before.
     assert_eq!(incoming_bundles[0].action, MessageAction::Accept);
@@ -450,11 +475,11 @@ where
     // Second message is the bounced message.
     assert_eq!(incoming_bundles[1].action, MessageAction::Accept);
     assert_eq!(
-        incoming_bundles[1].bundle.messages[1].kind,
+        incoming_bundles[1].bundle.messages[0].kind,
         MessageKind::Bouncing
     );
     assert_matches!(
-        incoming_bundles[1].bundle.messages[1].message,
+        incoming_bundles[1].bundle.messages[0].message,
         Message::User { .. }
     );
 
@@ -508,7 +533,9 @@ async fn run_test_cross_chain_message<B>(storage_builder: B) -> anyhow::Result<(
 where
     B: StorageBuilder,
 {
-    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+    let mut keys = InMemorySigner::new(None);
+    let vm_runtime = VmRuntime::Wasm;
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
         .await?
         .with_policy(ResourceControlPolicy::all_categories());
     let _admin = builder.add_root_chain(0, Amount::ONE).await?;
@@ -516,31 +543,32 @@ where
     let receiver = builder.add_root_chain(2, Amount::ONE).await?;
     let receiver2 = builder.add_root_chain(3, Amount::ONE).await?;
 
-    let (bytecode_id, _pub_cert) = {
+    let (module_id, _pub_cert) = {
         let bytecode_name = "fungible";
         let (contract_path, service_path) =
             linera_execution::wasm_test::get_example_bytecode_paths(bytecode_name)?;
         sender
-            .publish_bytecode(
+            .publish_module(
                 Bytecode::load_from_file(contract_path).await?,
                 Bytecode::load_from_file(service_path).await?,
+                vm_runtime,
             )
             .await
             .unwrap()
             .unwrap()
     };
-    let bytecode_id = bytecode_id
+    let module_id = module_id
         .with_abi::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>();
 
-    let sender_owner = AccountOwner::User(Owner::from(sender.key_pair().await?.public()));
-    let receiver_owner = AccountOwner::User(Owner::from(receiver.key_pair().await?.public()));
-    let receiver2_owner = AccountOwner::User(Owner::from(receiver2.key_pair().await?.public()));
+    let sender_owner = sender.preferred_owner.unwrap();
+    let receiver_owner = receiver.preferred_owner.unwrap();
+    let receiver2_owner = receiver2.preferred_owner.unwrap();
 
     let accounts = BTreeMap::from_iter([(sender_owner, Amount::from_tokens(1_000_000))]);
     let state = fungible::InitialState { accounts };
     let params = fungible::Parameters::new("FUN");
     let (application_id, _cert) = sender
-        .create_application(bytecode_id, &params, &state, vec![])
+        .create_application(module_id, &params, &state, vec![])
         .await
         .unwrap()
         .unwrap();
@@ -560,36 +588,14 @@ where
         .unwrap()
         .unwrap();
 
-    let messages = cert.executed_block().messages();
-    {
-        let OutgoingMessage {
-            destination,
-            message,
-            ..
-        } = &messages[1][0];
-        assert_matches!(
-            message, Message::System(SystemMessage::RegisterApplications { applications })
-            if applications.len() == 1 && matches!(
-                applications[0], UserApplicationDescription{ bytecode_id: b_id, .. }
-                if b_id == bytecode_id.forget_abi()
-            ),
-            "Unexpected message"
-        );
-        assert_eq!(*destination, Destination::Recipient(receiver.chain_id()));
-    }
     receiver.synchronize_from_validators().await.unwrap();
     receiver
-        .receive_certificate_and_update_validators(cert)
+        .receive_certificate_and_update_validators(cert.clone())
         .await
         .unwrap();
     let certs = receiver.process_inbox().await.unwrap().0;
     assert_eq!(certs.len(), 1);
-    let messages = &certs[0].executed_block().block.incoming_bundles;
-    assert!(messages.iter().any(|msg| matches!(
-        &msg.bundle.messages[0].message,
-        Message::System(SystemMessage::RegisterApplications { applications })
-        if applications.iter().any(|app| app.bytecode_id == bytecode_id.forget_abi())
-    )));
+    let messages = &certs[0].block().body.incoming_bundles;
     assert!(messages
         .iter()
         .flat_map(|msg| &msg.bundle.messages)
@@ -616,7 +622,7 @@ where
         .unwrap();
     let certs = receiver.process_inbox().await.unwrap().0;
     assert_eq!(certs.len(), 1);
-    let messages = &certs[0].executed_block().block.incoming_bundles;
+    let messages = &certs[0].block().body.incoming_bundles;
     assert!(messages
         .iter()
         .flat_map(|msg| &msg.bundle.messages)
@@ -635,7 +641,7 @@ where
         .execute_operation(Operation::user(application_id, &transfer)?)
         .await
         .is_err());
-    receiver.clear_pending_block();
+    receiver.clear_pending_proposal();
 
     // Try another transfer with the correct amount.
     let transfer = fungible::Operation::Transfer {
@@ -663,8 +669,8 @@ where
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_memory_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(MemoryStorageBuilder::with_wasm_runtime(wasm_runtime)).await
+async fn test_memory_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(MemoryStorageBuilder::with_wasm_runtime(wasm_runtime)).await
 }
 
 #[ignore]
@@ -672,9 +678,8 @@ async fn test_memory_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow:
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_service_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(ServiceStorageBuilder::with_wasm_runtime(wasm_runtime).await)
-        .await
+async fn test_service_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(ServiceStorageBuilder::with_wasm_runtime(wasm_runtime).await).await
 }
 
 #[ignore]
@@ -682,9 +687,8 @@ async fn test_service_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_rocks_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(RocksDbStorageBuilder::with_wasm_runtime(wasm_runtime).await)
-        .await
+async fn test_rocks_db_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(RocksDbStorageBuilder::with_wasm_runtime(wasm_runtime).await).await
 }
 
 #[ignore]
@@ -692,8 +696,8 @@ async fn test_rocks_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyho
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_dynamo_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(DynamoDbStorageBuilder::with_wasm_runtime(wasm_runtime)).await
+async fn test_dynamo_db_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(DynamoDbStorageBuilder::with_wasm_runtime(wasm_runtime)).await
 }
 
 #[ignore]
@@ -701,36 +705,39 @@ async fn test_dynamo_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyh
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_scylla_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(ScyllaDbStorageBuilder::with_wasm_runtime(wasm_runtime)).await
+async fn test_scylla_db_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(ScyllaDbStorageBuilder::with_wasm_runtime(wasm_runtime)).await
 }
 
-async fn run_test_user_pub_sub_channels<B>(storage_builder: B) -> anyhow::Result<()>
+async fn run_test_event_streams<B>(storage_builder: B) -> anyhow::Result<()>
 where
     B: StorageBuilder,
 {
-    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+    let mut keys = InMemorySigner::new(None);
+    let vm_runtime = VmRuntime::Wasm;
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
         .await?
         .with_policy(ResourceControlPolicy::all_categories());
     let sender = builder.add_root_chain(0, Amount::ONE).await?;
     let receiver = builder.add_root_chain(1, Amount::ONE).await?;
 
-    let (bytecode_id, _pub_cert) = {
+    let (module_id, _pub_cert) = {
         let (contract_path, service_path) =
             linera_execution::wasm_test::get_example_bytecode_paths("social")?;
         receiver
-            .publish_bytecode(
+            .publish_module(
                 Bytecode::load_from_file(contract_path).await?,
                 Bytecode::load_from_file(service_path).await?,
+                vm_runtime,
             )
             .await
             .unwrap()
             .unwrap()
     };
-    let bytecode_id = bytecode_id.with_abi::<social::SocialAbi, (), ()>();
+    let module_id = module_id.with_abi::<social::SocialAbi, (), ()>();
 
     let (application_id, _cert) = receiver
-        .create_application(bytecode_id, &(), &(), vec![])
+        .create_application(module_id, &(), &(), vec![])
         .await
         .unwrap()
         .unwrap();
@@ -754,7 +761,7 @@ where
     let _certs = sender.process_inbox().await.unwrap();
 
     // Make a post.
-    let text = "Please like and comment!.".to_string();
+    let text = "Please like and comment!".to_string();
     let post = social::Operation::Post {
         text: text.clone(),
         image_url: None,
@@ -772,27 +779,40 @@ where
     let certs = receiver.process_inbox().await.unwrap().0;
     assert_eq!(certs.len(), 1);
 
-    // There should be a message receiving the new post.
-    let messages = &certs[0].executed_block().block.incoming_bundles;
-    assert!(messages
-        .iter()
-        .any(|msg| matches!(&msg.bundle.messages[0].message, Message::User { .. })));
+    // There should be an UpdateStreams operation due to the new post.
+    let [Operation::System(operation)] = &*certs[0].block().body.operations else {
+        panic!(
+            "Expected one operation, got {:?}",
+            certs[0].block().body.operations
+        );
+    };
+    let stream_id = StreamId {
+        application_id: application_id.forget_abi().into(),
+        stream_name: b"posts".into(),
+    };
+    assert_eq!(
+        **operation,
+        SystemOperation::UpdateStreams(vec![(sender.chain_id(), stream_id, 1)])
+    );
 
     let query = async_graphql::Request::new("{ receivedPosts { keys { author, index } } }");
-    let posts = receiver
+    let outcome = receiver
         .query_user_application(application_id, &query)
         .await?;
-    let expected = async_graphql::Response::new(
-        async_graphql::Value::from_json(json!({
-            "receivedPosts": {
-                "keys": [
-                    { "author": sender.chain_id, "index": 0 }
-                ]
-            }
-        }))
-        .unwrap(),
-    );
-    assert_eq!(posts, expected);
+    let expected = QueryOutcome {
+        response: async_graphql::Response::new(
+            async_graphql::Value::from_json(json!({
+                "receivedPosts": {
+                    "keys": [
+                        { "author": sender.chain_id, "index": 0 }
+                    ]
+                }
+            }))
+            .unwrap(),
+        ),
+        operations: vec![],
+    };
+    assert_eq!(outcome, expected);
 
     // Request to unsubscribe from the sender.
     let request_unsubscribe = social::Operation::Unsubscribe {
@@ -833,19 +853,22 @@ where
 
     // There is still only one post it can see.
     let query = async_graphql::Request::new("{ receivedPosts { keys { author, index } } }");
-    let posts = receiver
+    let outcome = receiver
         .query_user_application(application_id, &query)
         .await
         .unwrap();
-    let expected = async_graphql::Response::new(
-        async_graphql::Value::from_json(json!({
-            "receivedPosts": {
-                "keys": [ { "author": sender.chain_id, "index": 0 } ]
-            }
-        }))
-        .unwrap(),
-    );
-    assert_eq!(posts, expected);
+    let expected = QueryOutcome {
+        response: async_graphql::Response::new(
+            async_graphql::Value::from_json(json!({
+                "receivedPosts": {
+                    "keys": [ { "author": sender.chain_id, "index": 0 } ]
+                }
+            }))
+            .unwrap(),
+        ),
+        operations: vec![],
+    };
+    assert_eq!(outcome, expected);
 
     Ok(())
 }
@@ -854,34 +877,57 @@ where
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime ; "wasmtime"))]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_memory_fuel_limit(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    let vm_runtime = VmRuntime::Wasm;
     let storage_builder = MemoryStorageBuilder::with_wasm_runtime(wasm_runtime);
     // Set a fuel limit that is enough to instantiate the application and do one increment
-    // operation, but not ten.
-    let mut builder =
-        TestBuilder::new(storage_builder, 4, 1)
-            .await?
-            .with_policy(ResourceControlPolicy {
-                maximum_fuel_per_block: 30_000,
-                ..ResourceControlPolicy::default()
-            });
+    // operation, but not ten. We also verify blob fees for the bytecode.
+    let policy = ResourceControlPolicy {
+        maximum_wasm_fuel_per_block: 30_000,
+        blob_read: Amount::from_tokens(10), // Should not be charged.
+        blob_published: Amount::from_attos(100),
+        blob_byte_read: Amount::from_tokens(10), // Should not be charged.
+        blob_byte_published: Amount::from_attos(1),
+        ..ResourceControlPolicy::default()
+    };
+    let mut keys = InMemorySigner::new(None);
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
+        .await?
+        .with_policy(policy.clone());
     let publisher = builder.add_root_chain(0, Amount::from_tokens(3)).await?;
 
     let (contract_path, service_path) =
         linera_execution::wasm_test::get_example_bytecode_paths("counter")?;
 
-    let (bytecode_id, _cert) = publisher
-        .publish_bytecode(
+    let mut expected_balance = publisher.local_balance().await?;
+    let (module_id, _cert) = publisher
+        .publish_module(
             Bytecode::load_from_file(contract_path).await?,
             Bytecode::load_from_file(service_path).await?,
+            vm_runtime,
         )
         .await
         .unwrap()
         .unwrap();
-    let bytecode_id = bytecode_id.with_abi::<counter::CounterAbi, (), u64>();
+    let module_id = module_id.with_abi::<counter::CounterAbi, (), u64>();
+    let mut blobs = publisher
+        .storage_client()
+        .read_blobs(&[
+            BlobId::new(module_id.contract_blob_hash, BlobType::ContractBytecode),
+            BlobId::new(module_id.service_blob_hash, BlobType::ServiceBytecode),
+        ])
+        .await?
+        .into_iter()
+        .flatten();
+    expected_balance = expected_balance
+        - policy.blob_published * 2
+        - policy.blob_byte_published
+            * (blobs.next().unwrap().bytes().len() as u128
+                + blobs.next().unwrap().bytes().len() as u128);
+    assert_eq!(publisher.local_balance().await?, expected_balance);
 
     let initial_value = 10_u64;
     let (application_id, _) = publisher
-        .create_application(bytecode_id, &(), &initial_value, vec![])
+        .create_application(module_id, &(), &initial_value, vec![])
         .await
         .unwrap()
         .unwrap();
@@ -894,7 +940,10 @@ async fn test_memory_fuel_limit(wasm_runtime: WasmRuntime) -> anyhow::Result<()>
         .unwrap();
 
     assert!(publisher
-        .execute_operations(vec![Operation::user(application_id, &increment)?; 10])
+        .execute_operations(
+            vec![Operation::user(application_id, &increment)?; 10],
+            vec![]
+        )
         .await
         .is_err());
 

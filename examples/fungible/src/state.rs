@@ -3,13 +3,13 @@
 
 use fungible::InitialState;
 use linera_sdk::{
-    base::{AccountOwner, Amount},
+    linera_base_types::{AccountOwner, Amount},
     views::{linera_views, MapView, RootView, ViewStorageContext},
 };
 
 /// The application state.
 #[derive(RootView)]
-#[view(context = "ViewStorageContext")]
+#[view(context = ViewStorageContext)]
 pub struct FungibleTokenState {
     pub accounts: MapView<AccountOwner, Amount>,
 }
@@ -58,9 +58,9 @@ impl FungibleTokenState {
             return;
         }
         let mut balance = self.balance_or_default(&account).await;
-        balance
-            .try_sub_assign(amount)
-            .expect("Source account does not have sufficient balance for transfer");
+        balance.try_sub_assign(amount).unwrap_or_else(|_| {
+            panic!("Source account {account} does not have sufficient balance for transfer")
+        });
         if balance == Amount::ZERO {
             self.accounts
                 .remove(&account)

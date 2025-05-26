@@ -3,10 +3,7 @@
 
 // `tracing::instrument` is not compatible with this nightly Clippy lint
 #![allow(unknown_lints)]
-#![allow(clippy::blocks_in_conditions)]
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -20,7 +17,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::{future::BoxFuture, FutureExt as _};
 use linera_base::identifiers::ChainId;
-use linera_client::config::GenesisConfig;
 use linera_core::{notifier::ChannelNotifier, JoinSetExt as _};
 use linera_rpc::{
     config::{
@@ -34,15 +30,15 @@ use linera_rpc::{
             validator_worker_client::ValidatorWorkerClient,
             BlobContent, BlobId, BlobIds, BlockProposal, Certificate, CertificatesBatchRequest,
             CertificatesBatchResponse, ChainInfoQuery, ChainInfoResult, CryptoHash,
-            LiteCertificate, Notification, PendingBlobRequest, PendingBlobResult,
-            SubscriptionRequest, VersionInfo,
+            HandlePendingBlobRequest, LiteCertificate, NetworkDescription, Notification,
+            PendingBlobRequest, PendingBlobResult, SubscriptionRequest, VersionInfo,
         },
         pool::GrpcConnectionPool,
         GrpcProtoConversionError, GrpcProxyable, GRPC_CHUNKED_MESSAGE_FILL_LIMIT,
         GRPC_MAX_MESSAGE_SIZE,
     },
 };
-use linera_sdk::{base::Blob, views::ViewError};
+use linera_sdk::{linera_base_types::Blob, views::ViewError};
 use linera_storage::Storage;
 use prost::Message;
 use tokio::{select, task::JoinSet};
@@ -54,48 +50,47 @@ use tonic::{
 };
 use tower::{builder::ServiceBuilder, Layer, Service};
 use tracing::{debug, info, instrument, Instrument as _, Level};
-#[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{
-        bucket_latencies, register_histogram_vec, register_int_counter_vec,
-    },
-    prometheus::{HistogramVec, IntCounterVec},
-};
 
 #[cfg(with_metrics)]
 use crate::prometheus_server;
 
 #[cfg(with_metrics)]
-static PROXY_REQUEST_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "proxy_request_latency",
-        "Proxy request latency",
-        &[],
-        bucket_latencies(500.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
 
-#[cfg(with_metrics)]
-static PROXY_REQUEST_COUNT: LazyLock<IntCounterVec> =
-    LazyLock::new(|| register_int_counter_vec("proxy_request_count", "Proxy request count", &[]));
+    use linera_base::prometheus_util::{
+        linear_bucket_interval, register_histogram_vec, register_int_counter_vec,
+    };
+    use prometheus::{HistogramVec, IntCounterVec};
 
-#[cfg(with_metrics)]
-static PROXY_REQUEST_SUCCESS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec(
-        "proxy_request_success",
-        "Proxy request success",
-        &["method_name"],
-    )
-});
+    pub static PROXY_REQUEST_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "proxy_request_latency",
+            "Proxy request latency",
+            &[],
+            linear_bucket_interval(1.0, 50.0, 2000.0),
+        )
+    });
+    pub static PROXY_REQUEST_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec("proxy_request_count", "Proxy request count", &[])
+    });
 
-#[cfg(with_metrics)]
-static PROXY_REQUEST_ERROR: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec(
-        "proxy_request_error",
-        "Proxy request error",
-        &["method_name"],
-    )
-});
+    pub static PROXY_REQUEST_SUCCESS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec(
+            "proxy_request_success",
+            "Proxy request success",
+            &["method_name"],
+        )
+    });
+
+    pub static PROXY_REQUEST_ERROR: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec(
+            "proxy_request_error",
+            "Proxy request error",
+            &["method_name"],
+        )
+    });
+}
 
 #[derive(Clone)]
 pub struct PrometheusMetricsMiddlewareLayer;
@@ -134,10 +129,10 @@ where
             let response = future.await?;
             #[cfg(with_metrics)]
             {
-                PROXY_REQUEST_LATENCY
+                metrics::PROXY_REQUEST_LATENCY
                     .with_label_values(&[])
                     .observe(start.elapsed().as_secs_f64() * 1000.0);
-                PROXY_REQUEST_COUNT.with_label_values(&[]).inc();
+                metrics::PROXY_REQUEST_COUNT.with_label_values(&[]).inc();
             }
             Ok(response)
         }
@@ -151,7 +146,6 @@ pub struct GrpcProxy<S>(Arc<GrpcProxyInner<S>>);
 struct GrpcProxyInner<S> {
     public_config: ValidatorPublicNetworkConfig,
     internal_config: ValidatorInternalNetworkConfig,
-    genesis_config: GenesisConfig,
     worker_connection_pool: GrpcConnectionPool,
     notifier: ChannelNotifier<Result<Notification, Status>>,
     tls: TlsConfig,
@@ -165,7 +159,6 @@ where
     pub fn new(
         public_config: ValidatorPublicNetworkConfig,
         internal_config: ValidatorInternalNetworkConfig,
-        genesis_config: GenesisConfig,
         connect_timeout: Duration,
         timeout: Duration,
         tls: TlsConfig,
@@ -174,7 +167,6 @@ where
         Self(Arc::new(GrpcProxyInner {
             public_config,
             internal_config,
-            genesis_config,
             worker_connection_pool: GrpcConnectionPool::default()
                 .with_connect_timeout(connect_timeout)
                 .with_timeout(timeout),
@@ -241,7 +233,7 @@ where
         err,
     )]
     pub async fn run(self, shutdown_signal: CancellationToken) -> Result<()> {
-        info!("Starting gRPC server");
+        info!("Starting proxy");
         let mut join_set = JoinSet::new();
 
         #[cfg(with_metrics)]
@@ -314,6 +306,7 @@ where
         Ok((client, inner))
     }
 
+    #[allow(clippy::result_large_err)]
     fn log_and_return_proxy_request_outcome(
         result: Result<Response<ChainInfoResult>, Status>,
         method_name: &str,
@@ -322,14 +315,16 @@ where
         match result {
             Ok(chain_info_result) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_SUCCESS
+                metrics::PROXY_REQUEST_SUCCESS
                     .with_label_values(&[method_name])
                     .inc();
                 Ok(chain_info_result)
             }
             Err(status) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_ERROR.with_label_values(&[method_name]).inc();
+                metrics::PROXY_REQUEST_ERROR
+                    .with_label_values(&[method_name])
+                    .inc();
                 Err(status)
             }
         }
@@ -352,6 +347,7 @@ where
             }
             ViewError::NotFound(_)
             | ViewError::BlobsNotFound(_)
+            | ViewError::EventsNotFound(_)
             | ViewError::CannotAcquireCollectionEntry
             | ViewError::MissingEntries => Status::not_found(err.to_string()),
         };
@@ -469,16 +465,26 @@ where
     }
 
     #[instrument(skip_all, err(Display))]
-    async fn get_genesis_config_hash(
+    async fn get_network_description(
         &self,
         _request: Request<()>,
-    ) -> Result<Response<CryptoHash>, Status> {
-        Ok(Response::new(self.0.genesis_config.hash().into()))
+    ) -> Result<Response<NetworkDescription>, Status> {
+        let description = self
+            .0
+            .storage
+            .read_network_description()
+            .await
+            .map_err(Self::error_to_status)?
+            .ok_or(Status::not_found(
+                "Cannot find network description in the database",
+            ))?;
+        Ok(Response::new(description.into()))
     }
 
     #[instrument(skip_all, err(Display))]
     async fn upload_blob(&self, request: Request<BlobContent>) -> Result<Response<BlobId>, Status> {
-        let content: linera_sdk::base::BlobContent = request.into_inner().try_into()?;
+        let content: linera_sdk::linera_base_types::BlobContent =
+            request.into_inner().try_into()?;
         let blob = Blob::new(content);
         let id = blob.id();
         let result = self.0.storage.maybe_write_blobs(&[blob]).await;
@@ -513,15 +519,40 @@ where
         match client.download_pending_blob(inner).await {
             Ok(blob_result) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_SUCCESS
+                metrics::PROXY_REQUEST_SUCCESS
                     .with_label_values(&["download_pending_blob"])
                     .inc();
                 Ok(blob_result)
             }
             Err(status) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_ERROR
+                metrics::PROXY_REQUEST_ERROR
                     .with_label_values(&["download_pending_blob"])
+                    .inc();
+                Err(status)
+            }
+        }
+    }
+
+    #[instrument(skip_all, err(Display))]
+    async fn handle_pending_blob(
+        &self,
+        request: Request<HandlePendingBlobRequest>,
+    ) -> Result<Response<ChainInfoResult>, Status> {
+        let (mut client, inner) = self.worker_client(request).await?;
+        #[cfg_attr(not(with_metrics), expect(clippy::needless_match))]
+        match client.handle_pending_blob(inner).await {
+            Ok(blob_result) => {
+                #[cfg(with_metrics)]
+                metrics::PROXY_REQUEST_SUCCESS
+                    .with_label_values(&["handle_pending_blob"])
+                    .inc();
+                Ok(blob_result)
+            }
+            Err(status) => {
+                #[cfg(with_metrics)]
+                metrics::PROXY_REQUEST_ERROR
+                    .with_label_values(&["handle_pending_blob"])
                     .inc();
                 Err(status)
             }
@@ -668,30 +699,28 @@ impl<T> GrpcMessageLimiter<T> {
 
 #[cfg(test)]
 mod proto_message_cap {
-    use linera_base::{
-        crypto::{KeyPair, Signature},
-        hashed::Hashed,
-    };
+    use linera_base::crypto::CryptoHash;
     use linera_chain::{
-        data_types::{BlockExecutionOutcome, ExecutedBlock},
-        types::{Certificate, ConfirmedBlock, ConfirmedBlockCertificate},
+        data_types::BlockExecutionOutcome,
+        types::{Block, Certificate, ConfirmedBlock, ConfirmedBlockCertificate},
     };
-    use linera_execution::committee::ValidatorName;
-    use linera_sdk::base::{ChainId, TestString};
+    use linera_sdk::linera_base_types::{
+        ChainId, TestString, ValidatorKeypair, ValidatorSignature,
+    };
 
     use super::{CertificatesBatchResponse, GrpcMessageLimiter};
 
     fn test_certificate() -> Certificate {
-        let keypair = KeyPair::generate();
-        let validator = ValidatorName(keypair.public());
-        let signature = Signature::new(&TestString::new("Test"), &keypair);
-        let executed_block = ExecutedBlock {
-            block: linera_chain::test::make_first_block(ChainId::root(0)),
-            outcome: BlockExecutionOutcome::default(),
-        };
+        let keypair = ValidatorKeypair::generate();
+        let validator = keypair.public_key;
+        let signature = ValidatorSignature::new(&TestString::new("Test"), &keypair.secret_key);
+        let block = Block::new(
+            linera_chain::test::make_first_block(ChainId(CryptoHash::test_hash("root_chain"))),
+            BlockExecutionOutcome::default(),
+        );
         let signatures = vec![(validator, signature)];
         Certificate::Confirmed(ConfirmedBlockCertificate::new(
-            Hashed::new(ConfirmedBlock::new(executed_block)),
+            ConfirmedBlock::new(block),
             Default::default(),
             signatures,
         ))

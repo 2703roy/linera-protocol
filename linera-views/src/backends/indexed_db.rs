@@ -7,35 +7,42 @@ use std::rc::Rc;
 
 use futures::future;
 use indexed_db_futures::{js_sys, prelude::*, web_sys};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
     batch::{Batch, WriteOperation},
     common::get_upper_bound_option,
+    lru_caching::DEFAULT_STORAGE_CACHE_CONFIG,
     store::{
-        CommonStoreConfig, KeyValueStoreError, LocalAdminKeyValueStore, LocalReadableKeyValueStore,
-        LocalWritableKeyValueStore, WithError,
+        AdminKeyValueStore, CommonStoreConfig, KeyValueStoreError, ReadableKeyValueStore,
+        WithError, WritableKeyValueStore,
     },
 };
 
 /// The initial configuration of the system
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexedDbStoreConfig {
     /// The common configuration of the key value store
     pub common_config: CommonStoreConfig,
 }
 
 impl IndexedDbStoreConfig {
-    /// Creates a `IndexedDbStoreConfig`. `max_concurrent_queries` and `cache_size` are not used.
+    /// Creates a `IndexedDbStoreConfig`. `max_concurrent_queries` and `storage_cache_config` are not used.
     pub fn new(max_stream_queries: usize) -> Self {
         let common_config = CommonStoreConfig {
             max_concurrent_queries: None,
             max_stream_queries,
-            cache_size: 1000,
+            storage_cache_config: DEFAULT_STORAGE_CACHE_CONFIG,
+            replication_factor: 1,
         };
         Self { common_config }
     }
 }
+
+/// The prefixes being used in the system
+static ROOT_KEY_DOMAIN: [u8; 1] = [0];
+static STORED_ROOT_KEYS_PREFIX: [u8; 1] = [1];
 
 /// The number of streams for the test
 pub const TEST_INDEX_DB_MAX_STREAM_QUERIES: usize = 10;
@@ -51,8 +58,8 @@ pub struct IndexedDbStore {
     pub object_store_name: String,
     /// The maximum number of queries used for the stream.
     pub max_stream_queries: usize,
-    /// The used root key
-    root_key: Vec<u8>,
+    /// The key being used at the start of the writing
+    start_key: Vec<u8>,
 }
 
 impl IndexedDbStore {
@@ -66,9 +73,37 @@ impl IndexedDbStore {
     }
 
     fn full_key(&self, key: &[u8]) -> Vec<u8> {
-        let mut full_key = self.root_key.clone();
+        let mut full_key = self.start_key.clone();
         full_key.extend(key);
         full_key
+    }
+
+    async fn connect_internal(
+        config: &IndexedDbStoreConfig,
+        namespace: &str,
+        start_key: Vec<u8>,
+    ) -> Result<Self, IndexedDbStoreError> {
+        let namespace = namespace.to_string();
+        let object_store_name = namespace.clone();
+        let mut database = IdbDatabase::open(DATABASE_NAME)?.await?;
+
+        if !database.object_store_names().any(|n| n == namespace) {
+            let version = database.version();
+            database.close();
+            let mut db_req = IdbDatabase::open_f64(DATABASE_NAME, version + 1.0)?;
+            db_req.set_on_upgrade_needed(Some(move |event: &IdbVersionChangeEvent| {
+                event.db().create_object_store(&namespace)?;
+                Ok(())
+            }));
+            database = db_req.await?;
+        }
+        let database = Rc::new(database);
+        Ok(IndexedDbStore {
+            database,
+            object_store_name,
+            max_stream_queries: config.common_config.max_stream_queries,
+            start_key,
+        })
     }
 }
 
@@ -91,7 +126,7 @@ impl WithError for IndexedDbStore {
     type Error = IndexedDbStoreError;
 }
 
-impl LocalReadableKeyValueStore for IndexedDbStore {
+impl ReadableKeyValueStore for IndexedDbStore {
     const MAX_KEY_SIZE: usize = usize::MAX;
     type Keys = Vec<Vec<u8>>;
     type KeyValues = Vec<(Vec<u8>, Vec<u8>)>;
@@ -182,7 +217,7 @@ impl LocalReadableKeyValueStore for IndexedDbStore {
     }
 }
 
-impl LocalWritableKeyValueStore for IndexedDbStore {
+impl WritableKeyValueStore for IndexedDbStore {
     const MAX_VALUE_SIZE: usize = usize::MAX;
 
     async fn write_batch(&self, batch: Batch) -> Result<(), IndexedDbStoreError> {
@@ -216,7 +251,14 @@ impl LocalWritableKeyValueStore for IndexedDbStore {
                 }
             }
         }
-
+        let mut key = self.start_key.clone();
+        key[0] = STORED_ROOT_KEYS_PREFIX[0];
+        object_store
+            .put_key_val_owned(
+                js_sys::Uint8Array::from(&key[..]),
+                &js_sys::Uint8Array::default(),
+            )?
+            .await?;
         Ok(())
     }
 
@@ -225,67 +267,51 @@ impl LocalWritableKeyValueStore for IndexedDbStore {
     }
 }
 
-impl LocalAdminKeyValueStore for IndexedDbStore {
+impl AdminKeyValueStore for IndexedDbStore {
     type Config = IndexedDbStoreConfig;
 
     fn get_name() -> String {
         "indexed db".to_string()
     }
 
-    async fn connect(
-        config: &Self::Config,
-        namespace: &str,
-        root_key: &[u8],
-    ) -> Result<Self, IndexedDbStoreError> {
-        let namespace = namespace.to_string();
-        let object_store_name = namespace.clone();
-        let mut database = IdbDatabase::open(DATABASE_NAME)?.await?;
-
-        if !database.object_store_names().any(|n| n == namespace) {
-            let version = database.version();
-            database.close();
-            let mut db_req = IdbDatabase::open_f64(DATABASE_NAME, version + 1.0)?;
-            db_req.set_on_upgrade_needed(Some(move |event: &IdbVersionChangeEvent| {
-                event.db().create_object_store(&namespace)?;
-                Ok(())
-            }));
-            database = db_req.await?;
-        }
-        let database = Rc::new(database);
-        let root_key = root_key.to_vec();
-        Ok(IndexedDbStore {
-            database,
-            object_store_name,
-            max_stream_queries: config.common_config.max_stream_queries,
-            root_key,
-        })
+    async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, IndexedDbStoreError> {
+        let start_key = ROOT_KEY_DOMAIN.to_vec();
+        Self::connect_internal(config, namespace, start_key).await
     }
 
     fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, IndexedDbStoreError> {
         let database = self.database.clone();
         let object_store_name = self.object_store_name.clone();
         let max_stream_queries = self.max_stream_queries;
-        let root_key = root_key.to_vec();
+        let mut start_key = ROOT_KEY_DOMAIN.to_vec();
+        start_key.extend(root_key);
         Ok(Self {
             database,
             object_store_name,
             max_stream_queries,
-            root_key,
+            start_key,
         })
     }
 
     async fn list_all(config: &Self::Config) -> Result<Vec<String>, IndexedDbStoreError> {
-        let root_key = &[];
-        Ok(Self::connect(config, "", root_key)
+        Ok(Self::connect(config, "")
             .await?
             .database
             .object_store_names()
             .collect())
     }
 
+    async fn list_root_keys(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<Vec<Vec<u8>>, IndexedDbStoreError> {
+        let start_key = STORED_ROOT_KEYS_PREFIX.to_vec();
+        let store = Self::connect_internal(config, namespace, start_key).await?;
+        store.find_keys_by_prefix(&[]).await
+    }
+
     async fn exists(config: &Self::Config, namespace: &str) -> Result<bool, IndexedDbStoreError> {
-        let root_key = &[];
-        Ok(Self::connect(config, "", root_key)
+        Ok(Self::connect(config, "")
             .await?
             .database
             .object_store_names()
@@ -293,8 +319,7 @@ impl LocalAdminKeyValueStore for IndexedDbStore {
     }
 
     async fn create(config: &Self::Config, namespace: &str) -> Result<(), IndexedDbStoreError> {
-        let root_key = &[];
-        Self::connect(config, "", root_key)
+        Self::connect(config, "")
             .await?
             .database
             .create_object_store(namespace)?;
@@ -302,8 +327,7 @@ impl LocalAdminKeyValueStore for IndexedDbStore {
     }
 
     async fn delete(config: &Self::Config, namespace: &str) -> Result<(), IndexedDbStoreError> {
-        let root_key = &[];
-        Ok(Self::connect(config, "", root_key)
+        Ok(Self::connect(config, "")
             .await?
             .database
             .delete_object_store(namespace)?)
@@ -321,10 +345,7 @@ mod testing {
     ) -> IndexedDbStore {
         let config = IndexedDbStoreConfig::new(max_stream_queries);
         let namespace = generate_test_namespace();
-        let root_key = &[];
-        IndexedDbStore::connect(&config, &namespace, root_key)
-            .await
-            .unwrap()
+        IndexedDbStore::connect(&config, &namespace).await.unwrap()
     }
 
     /// Creates a test IndexedDB store for working.
@@ -344,7 +365,7 @@ pub enum IndexedDbStoreError {
     #[error(transparent)]
     BcsError(#[from] bcs::Error),
 
-    /// The value is too large for the IndexedDbStore
+    /// The value is too large for the `IndexedDbStore`
     #[error("The value is too large for the IndexedDbStore")]
     TooLargeValue,
 

@@ -3,54 +3,60 @@
 
 //! Handle requests from the synchronous execution thread of user applications.
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
+#[cfg(not(web))]
+use std::time::Duration;
 
 use custom_debug_derive::Debug;
-use futures::channel::mpsc;
+use futures::{channel::mpsc, StreamExt as _};
 #[cfg(with_metrics)]
-use linera_base::prometheus_util::{bucket_latencies, register_histogram_vec, MeasureLatency as _};
+use linera_base::prometheus_util::MeasureLatency as _;
 use linera_base::{
-    data_types::{Amount, ApplicationPermissions, BlobContent, Timestamp},
-    hex_debug, hex_vec_debug,
-    identifiers::{Account, AccountOwner, BlobId, MessageId, Owner},
+    data_types::{
+        Amount, ApplicationPermissions, ArithmeticError, BlobContent, BlockHeight, Timestamp,
+    },
+    ensure, hex_debug, hex_vec_debug, http,
+    identifiers::{Account, AccountOwner, BlobId, BlobType, ChainId, EventId, StreamId},
     ownership::ChainOwnership,
 };
 use linera_views::{batch::Batch, context::Context, views::View};
 use oneshot::Sender;
-#[cfg(with_metrics)]
-use prometheus::HistogramVec;
-use reqwest::{header::CONTENT_TYPE, Client};
+use reqwest::{header::HeaderMap, Client, Url};
 
 use crate::{
     system::{CreateApplicationResult, OpenChainConfig, Recipient},
     util::RespondExt,
-    BytecodeId, ExecutionError, ExecutionRuntimeContext, ExecutionStateView, RawExecutionOutcome,
-    RawOutgoingMessage, SystemExecutionError, SystemMessage, UserApplicationDescription,
-    UserApplicationId, UserContractCode, UserServiceCode,
+    ApplicationDescription, ApplicationId, ExecutionError, ExecutionRuntimeContext,
+    ExecutionStateView, ModuleId, OutgoingMessage, ResourceController, TransactionTracker,
+    UserContractCode, UserServiceCode,
 };
 
 #[cfg(with_metrics)]
-/// Histogram of the latency to load a contract bytecode.
-static LOAD_CONTRACT_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "load_contract_latency",
-        "Load contract latency",
-        &[],
-        bucket_latencies(250.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
 
-#[cfg(with_metrics)]
-/// Histogram of the latency to load a service bytecode.
-static LOAD_SERVICE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "load_service_latency",
-        "Load service latency",
-        &[],
-        bucket_latencies(250.0),
-    )
-});
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    /// Histogram of the latency to load a contract bytecode.
+    pub static LOAD_CONTRACT_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "load_contract_latency",
+            "Load contract latency",
+            &[],
+            exponential_bucket_latencies(250.0),
+        )
+    });
+
+    /// Histogram of the latency to load a service bytecode.
+    pub static LOAD_SERVICE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "load_service_latency",
+            "Load service latency",
+            &[],
+            exponential_bucket_latencies(250.0),
+        )
+    });
+}
 
 pub(crate) type ExecutionStateSender = mpsc::UnboundedSender<ExecutionRequest>;
 
@@ -61,11 +67,19 @@ where
 {
     pub(crate) async fn load_contract(
         &mut self,
-        id: UserApplicationId,
-    ) -> Result<(UserContractCode, UserApplicationDescription), ExecutionError> {
+        id: ApplicationId,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<(UserContractCode, ApplicationDescription), ExecutionError> {
         #[cfg(with_metrics)]
-        let _latency = LOAD_CONTRACT_LATENCY.measure_latency();
-        let description = self.system.registry.describe_application(id).await?;
+        let _latency = metrics::LOAD_CONTRACT_LATENCY.measure_latency();
+        let blob_id = id.description_blob_id();
+        let description = match txn_tracker.created_blobs().get(&blob_id) {
+            Some(description) => {
+                let blob = description.clone();
+                bcs::from_bytes(blob.bytes())?
+            }
+            None => self.system.describe_application(id, txn_tracker).await?,
+        };
         let code = self
             .context()
             .extra()
@@ -76,11 +90,19 @@ where
 
     pub(crate) async fn load_service(
         &mut self,
-        id: UserApplicationId,
-    ) -> Result<(UserServiceCode, UserApplicationDescription), ExecutionError> {
+        id: ApplicationId,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<(UserServiceCode, ApplicationDescription), ExecutionError> {
         #[cfg(with_metrics)]
-        let _latency = LOAD_SERVICE_LATENCY.measure_latency();
-        let description = self.system.registry.describe_application(id).await?;
+        let _latency = metrics::LOAD_SERVICE_LATENCY.measure_latency();
+        let blob_id = id.description_blob_id();
+        let description = match txn_tracker.created_blobs().get(&blob_id) {
+            Some(description) => {
+                let blob = description.clone();
+                bcs::from_bytes(blob.bytes())?
+            }
+            None => self.system.describe_application(id, txn_tracker).await?,
+        };
         let code = self
             .context()
             .extra()
@@ -93,13 +115,28 @@ where
     pub(crate) async fn handle_request(
         &mut self,
         request: ExecutionRequest,
+        resource_controller: &mut ResourceController<Option<AccountOwner>>,
     ) -> Result<(), ExecutionError> {
         use ExecutionRequest::*;
         match request {
             #[cfg(not(web))]
-            LoadContract { id, callback } => callback.respond(self.load_contract(id).await?),
+            LoadContract {
+                id,
+                callback,
+                mut txn_tracker,
+            } => {
+                let (code, description) = self.load_contract(id, &mut txn_tracker).await?;
+                callback.respond((code, description, txn_tracker))
+            }
             #[cfg(not(web))]
-            LoadService { id, callback } => callback.respond(self.load_service(id).await?),
+            LoadService {
+                id,
+                callback,
+                mut txn_tracker,
+            } => {
+                let (code, description) = self.load_service(id, &mut txn_tracker).await?;
+                callback.respond((code, description, txn_tracker))
+            }
 
             ChainBalance { callback } => {
                 let balance = *self.system.balance.get();
@@ -128,10 +165,8 @@ where
                 signer,
                 application_id,
                 callback,
-            } => {
-                let mut execution_outcome = RawExecutionOutcome::default();
-                let message = self
-                    .system
+            } => callback.respond(
+                self.system
                     .transfer(
                         signer,
                         Some(application_id),
@@ -139,13 +174,8 @@ where
                         Recipient::Account(destination),
                         amount,
                     )
-                    .await?;
-
-                if let Some(message) = message {
-                    execution_outcome.messages.push(message);
-                }
-                callback.respond(execution_outcome);
-            }
+                    .await?,
+            ),
 
             Claim {
                 source,
@@ -154,24 +184,18 @@ where
                 signer,
                 application_id,
                 callback,
-            } => {
-                let owner = source.owner.ok_or(ExecutionError::OwnerIsNone)?;
-                let mut execution_outcome = RawExecutionOutcome::default();
-                let message = self
-                    .system
+            } => callback.respond(
+                self.system
                     .claim(
                         signer,
                         Some(application_id),
-                        owner,
+                        source.owner,
                         source.chain_id,
                         Recipient::Account(destination),
                         amount,
                     )
-                    .await?;
-
-                execution_outcome.messages.push(message);
-                callback.respond(execution_outcome);
-            }
+                    .await?,
+            ),
 
             SystemTimestamp { callback } => {
                 let timestamp = *self.system.timestamp.get();
@@ -258,21 +282,23 @@ where
             OpenChain {
                 ownership,
                 balance,
-                next_message_id,
+                parent_id,
+                block_height,
                 application_permissions,
+                timestamp,
                 callback,
+                mut txn_tracker,
             } => {
-                let inactive_err = || SystemExecutionError::InactiveChain;
                 let config = OpenChainConfig {
                     ownership,
-                    admin_id: self.system.admin_id.get().ok_or_else(inactive_err)?,
-                    epoch: self.system.epoch.get().ok_or_else(inactive_err)?,
-                    committees: self.system.committees.get().clone(),
                     balance,
                     application_permissions,
                 };
-                let messages = self.system.open_chain(config, next_message_id).await?;
-                callback.respond(messages)
+                let chain_id = self
+                    .system
+                    .open_chain(config, parent_id, block_height, timestamp, &mut txn_tracker)
+                    .await?;
+                callback.respond((chain_id, txn_tracker));
             }
 
             CloseChain {
@@ -283,66 +309,263 @@ where
                 if !app_permissions.can_close_chain(&application_id) {
                     callback.respond(Err(ExecutionError::UnauthorizedApplication(application_id)));
                 } else {
-                    let chain_id = self.context().extra().chain_id();
-                    self.system.close_chain(chain_id).await?;
+                    self.system.close_chain().await?;
+                    callback.respond(Ok(()));
+                }
+            }
+
+            ChangeApplicationPermissions {
+                application_id,
+                application_permissions,
+                callback,
+            } => {
+                let app_permissions = self.system.application_permissions.get();
+                if !app_permissions.can_change_application_permissions(&application_id) {
+                    callback.respond(Err(ExecutionError::UnauthorizedApplication(application_id)));
+                } else {
+                    self.system
+                        .application_permissions
+                        .set(application_permissions);
                     callback.respond(Ok(()));
                 }
             }
 
             CreateApplication {
-                next_message_id,
-                bytecode_id,
+                chain_id,
+                block_height,
+                module_id,
                 parameters,
                 required_application_ids,
                 callback,
+                txn_tracker,
             } => {
                 let create_application_result = self
                     .system
                     .create_application(
-                        next_message_id,
-                        bytecode_id,
+                        chain_id,
+                        block_height,
+                        module_id,
                         parameters,
                         required_application_ids,
+                        txn_tracker,
                     )
                     .await?;
                 callback.respond(Ok(create_application_result));
             }
 
-            FetchUrl { url, callback } => {
-                let bytes = reqwest::get(url).await?.bytes().await?.to_vec();
-                callback.respond(bytes);
-            }
-
-            HttpPost {
-                url,
-                content_type,
-                payload,
+            PerformHttpRequest {
+                request,
+                http_responses_are_oracle_responses,
                 callback,
             } => {
-                let res = Client::new()
-                    .post(url)
-                    .body(payload)
-                    .header(CONTENT_TYPE, content_type)
-                    .send()
-                    .await?;
-                let body = res.bytes().await?;
-                let bytes = body.as_ref().to_vec();
-                callback.respond(bytes);
+                let headers = request
+                    .headers
+                    .into_iter()
+                    .map(|http::Header { name, value }| Ok((name.parse()?, value.try_into()?)))
+                    .collect::<Result<HeaderMap, ExecutionError>>()?;
+
+                let url = Url::parse(&request.url)?;
+                let host = url
+                    .host_str()
+                    .ok_or_else(|| ExecutionError::UnauthorizedHttpRequest(url.clone()))?;
+
+                let (_epoch, committee) = self
+                    .system
+                    .current_committee()
+                    .ok_or_else(|| ExecutionError::UnauthorizedHttpRequest(url.clone()))?;
+                let allowed_hosts = &committee.policy().http_request_allow_list;
+
+                ensure!(
+                    allowed_hosts.contains(host),
+                    ExecutionError::UnauthorizedHttpRequest(url)
+                );
+
+                #[cfg_attr(web, allow(unused_mut))]
+                let mut request = Client::new()
+                    .request(request.method.into(), url)
+                    .body(request.body)
+                    .headers(headers);
+                #[cfg(not(web))]
+                {
+                    request = request.timeout(Duration::from_millis(
+                        committee.policy().http_request_timeout_ms,
+                    ));
+                }
+
+                let response = request.send().await?;
+
+                let mut response_size_limit = committee.policy().maximum_http_response_bytes;
+
+                if http_responses_are_oracle_responses {
+                    response_size_limit =
+                        response_size_limit.min(committee.policy().maximum_oracle_response_bytes);
+                }
+
+                callback.respond(
+                    self.receive_http_response(response, response_size_limit)
+                        .await?,
+                );
             }
 
             ReadBlobContent { blob_id, callback } => {
                 let blob = self.system.read_blob_content(blob_id).await?;
-                let is_new = self.system.blob_used(None, blob_id).await?;
+                if blob_id.blob_type == BlobType::Data {
+                    resource_controller
+                        .with_state(&mut self.system)
+                        .await?
+                        .track_blob_read(blob.bytes().len() as u64)?;
+                }
+                let is_new = self
+                    .system
+                    .blob_used(&mut TransactionTracker::default(), blob_id)
+                    .await?;
                 callback.respond((blob, is_new))
             }
 
             AssertBlobExists { blob_id, callback } => {
                 self.system.assert_blob_exists(blob_id).await?;
-                callback.respond(self.system.blob_used(None, blob_id).await?)
+                // Treating this as reading a size-0 blob for fee purposes.
+                if blob_id.blob_type == BlobType::Data {
+                    resource_controller
+                        .with_state(&mut self.system)
+                        .await?
+                        .track_blob_read(0)?;
+                }
+                callback.respond(
+                    self.system
+                        .blob_used(&mut TransactionTracker::default(), blob_id)
+                        .await?,
+                )
+            }
+
+            NextEventIndex {
+                stream_id,
+                callback,
+            } => {
+                let count = self
+                    .stream_event_counts
+                    .get_mut_or_default(&stream_id)
+                    .await?;
+                let index = *count;
+                *count = count.checked_add(1).ok_or(ArithmeticError::Overflow)?;
+                callback.respond(index)
+            }
+
+            ReadEvent { event_id, callback } => {
+                let event_value = self.context().extra().get_event(event_id).await?;
+                callback.respond(event_value);
+            }
+
+            SubscribeToEvents {
+                chain_id,
+                stream_id,
+                subscriber_app_id,
+                callback,
+            } => {
+                let subscriptions = self
+                    .system
+                    .event_subscriptions
+                    .get_mut_or_default(&(chain_id, stream_id))
+                    .await?;
+                let next_index = if subscriptions.applications.insert(subscriber_app_id) {
+                    subscriptions.next_index
+                } else {
+                    0
+                };
+                callback.respond(next_index);
+            }
+
+            UnsubscribeFromEvents {
+                chain_id,
+                stream_id,
+                subscriber_app_id,
+                callback,
+            } => {
+                let key = (chain_id, stream_id);
+                let subscriptions = self
+                    .system
+                    .event_subscriptions
+                    .get_mut_or_default(&key)
+                    .await?;
+                subscriptions.applications.remove(&subscriber_app_id);
+                if subscriptions.applications.is_empty() {
+                    self.system.event_subscriptions.remove(&key)?;
+                }
+                callback.respond(());
+            }
+
+            GetApplicationPermissions { callback } => {
+                let app_permissions = self.system.application_permissions.get();
+                callback.respond(app_permissions.clone());
             }
         }
 
         Ok(())
+    }
+}
+
+impl<C> ExecutionStateView<C>
+where
+    C: Context + Clone + Send + Sync + 'static,
+    C::Extra: ExecutionRuntimeContext,
+{
+    /// Receives an HTTP response, returning the prepared [`http::Response`] instance.
+    ///
+    /// Ensures that the response does not exceed the provided `size_limit`.
+    async fn receive_http_response(
+        &mut self,
+        response: reqwest::Response,
+        size_limit: u64,
+    ) -> Result<http::Response, ExecutionError> {
+        let status = response.status().as_u16();
+        let maybe_content_length = response.content_length();
+
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| http::Header::new(name.to_string(), value.as_bytes()))
+            .collect::<Vec<_>>();
+
+        let total_header_size = headers
+            .iter()
+            .map(|header| (header.name.len() + header.value.len()) as u64)
+            .sum();
+
+        let mut remaining_bytes = size_limit.checked_sub(total_header_size).ok_or(
+            ExecutionError::HttpResponseSizeLimitExceeded {
+                limit: size_limit,
+                size: total_header_size,
+            },
+        )?;
+
+        if let Some(content_length) = maybe_content_length {
+            if content_length > remaining_bytes {
+                return Err(ExecutionError::HttpResponseSizeLimitExceeded {
+                    limit: size_limit,
+                    size: content_length + total_header_size,
+                });
+            }
+        }
+
+        let mut body = Vec::with_capacity(maybe_content_length.unwrap_or(0) as usize);
+        let mut body_stream = response.bytes_stream();
+
+        while let Some(bytes) = body_stream.next().await.transpose()? {
+            remaining_bytes = remaining_bytes.checked_sub(bytes.len() as u64).ok_or(
+                ExecutionError::HttpResponseSizeLimitExceeded {
+                    limit: size_limit,
+                    size: bytes.len() as u64 + (size_limit - remaining_bytes),
+                },
+            )?;
+
+            body.extend(&bytes);
+        }
+
+        Ok(http::Response {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
@@ -351,16 +574,20 @@ where
 pub enum ExecutionRequest {
     #[cfg(not(web))]
     LoadContract {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(skip)]
-        callback: Sender<(UserContractCode, UserApplicationDescription)>,
+        callback: Sender<(UserContractCode, ApplicationDescription, TransactionTracker)>,
+        #[debug(skip)]
+        txn_tracker: TransactionTracker,
     },
 
     #[cfg(not(web))]
     LoadService {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(skip)]
-        callback: Sender<(UserServiceCode, UserApplicationDescription)>,
+        callback: Sender<(UserServiceCode, ApplicationDescription, TransactionTracker)>,
+        #[debug(skip)]
+        txn_tracker: TransactionTracker,
     },
 
     ChainBalance {
@@ -385,15 +612,14 @@ pub enum ExecutionRequest {
     },
 
     Transfer {
-        #[debug(skip_if = Option::is_none)]
-        source: Option<AccountOwner>,
+        source: AccountOwner,
         destination: Account,
         amount: Amount,
         #[debug(skip_if = Option::is_none)]
-        signer: Option<Owner>,
-        application_id: UserApplicationId,
+        signer: Option<AccountOwner>,
+        application_id: ApplicationId,
         #[debug(skip)]
-        callback: Sender<RawExecutionOutcome<SystemMessage, Amount>>,
+        callback: Sender<Option<OutgoingMessage>>,
     },
 
     Claim {
@@ -401,10 +627,10 @@ pub enum ExecutionRequest {
         destination: Account,
         amount: Amount,
         #[debug(skip_if = Option::is_none)]
-        signer: Option<Owner>,
-        application_id: UserApplicationId,
+        signer: Option<AccountOwner>,
+        application_id: ApplicationId,
         #[debug(skip)]
-        callback: Sender<RawExecutionOutcome<SystemMessage, Amount>>,
+        callback: Sender<OutgoingMessage>,
     },
 
     SystemTimestamp {
@@ -418,7 +644,7 @@ pub enum ExecutionRequest {
     },
 
     ReadValueBytes {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_debug)]
         key: Vec<u8>,
         #[debug(skip)]
@@ -426,21 +652,21 @@ pub enum ExecutionRequest {
     },
 
     ContainsKey {
-        id: UserApplicationId,
+        id: ApplicationId,
         key: Vec<u8>,
         #[debug(skip)]
         callback: Sender<bool>,
     },
 
     ContainsKeys {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_vec_debug)]
         keys: Vec<Vec<u8>>,
         callback: Sender<Vec<bool>>,
     },
 
     ReadMultiValuesBytes {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_vec_debug)]
         keys: Vec<Vec<u8>>,
         #[debug(skip)]
@@ -448,7 +674,7 @@ pub enum ExecutionRequest {
     },
 
     FindKeysByPrefix {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_debug)]
         key_prefix: Vec<u8>,
         #[debug(skip)]
@@ -456,7 +682,7 @@ pub enum ExecutionRequest {
     },
 
     FindKeyValuesByPrefix {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_debug)]
         key_prefix: Vec<u8>,
         #[debug(skip)]
@@ -464,7 +690,7 @@ pub enum ExecutionRequest {
     },
 
     WriteBatch {
-        id: UserApplicationId,
+        id: ApplicationId,
         batch: Batch,
         #[debug(skip)]
         callback: Sender<()>,
@@ -474,40 +700,46 @@ pub enum ExecutionRequest {
         ownership: ChainOwnership,
         #[debug(skip_if = Amount::is_zero)]
         balance: Amount,
-        next_message_id: MessageId,
+        parent_id: ChainId,
+        block_height: BlockHeight,
         application_permissions: ApplicationPermissions,
+        timestamp: Timestamp,
         #[debug(skip)]
-        callback: Sender<[RawOutgoingMessage<SystemMessage, Amount>; 2]>,
+        txn_tracker: TransactionTracker,
+        #[debug(skip)]
+        callback: Sender<(ChainId, TransactionTracker)>,
     },
 
     CloseChain {
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         #[debug(skip)]
-        callback: oneshot::Sender<Result<(), ExecutionError>>,
+        callback: Sender<Result<(), ExecutionError>>,
+    },
+
+    ChangeApplicationPermissions {
+        application_id: ApplicationId,
+        application_permissions: ApplicationPermissions,
+        #[debug(skip)]
+        callback: Sender<Result<(), ExecutionError>>,
     },
 
     CreateApplication {
-        next_message_id: MessageId,
-        bytecode_id: BytecodeId,
+        chain_id: ChainId,
+        block_height: BlockHeight,
+        module_id: ModuleId,
         parameters: Vec<u8>,
-        required_application_ids: Vec<UserApplicationId>,
+        required_application_ids: Vec<ApplicationId>,
         #[debug(skip)]
-        callback: oneshot::Sender<Result<CreateApplicationResult, ExecutionError>>,
+        txn_tracker: TransactionTracker,
+        #[debug(skip)]
+        callback: Sender<Result<CreateApplicationResult, ExecutionError>>,
     },
 
-    FetchUrl {
-        url: String,
+    PerformHttpRequest {
+        request: http::Request,
+        http_responses_are_oracle_responses: bool,
         #[debug(skip)]
-        callback: Sender<Vec<u8>>,
-    },
-
-    HttpPost {
-        url: String,
-        content_type: String,
-        #[debug(with = hex_debug)]
-        payload: Vec<u8>,
-        #[debug(skip)]
-        callback: oneshot::Sender<Vec<u8>>,
+        callback: Sender<http::Response>,
     },
 
     ReadBlobContent {
@@ -520,5 +752,37 @@ pub enum ExecutionRequest {
         blob_id: BlobId,
         #[debug(skip)]
         callback: Sender<bool>,
+    },
+
+    NextEventIndex {
+        stream_id: StreamId,
+        #[debug(skip)]
+        callback: Sender<u32>,
+    },
+
+    ReadEvent {
+        event_id: EventId,
+        callback: oneshot::Sender<Vec<u8>>,
+    },
+
+    SubscribeToEvents {
+        chain_id: ChainId,
+        stream_id: StreamId,
+        subscriber_app_id: ApplicationId,
+        #[debug(skip)]
+        callback: Sender<u32>,
+    },
+
+    UnsubscribeFromEvents {
+        chain_id: ChainId,
+        stream_id: StreamId,
+        subscriber_app_id: ApplicationId,
+        #[debug(skip)]
+        callback: Sender<()>,
+    },
+
+    GetApplicationPermissions {
+        #[debug(skip)]
+        callback: Sender<ApplicationPermissions>,
     },
 }

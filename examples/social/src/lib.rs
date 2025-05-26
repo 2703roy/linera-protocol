@@ -5,8 +5,8 @@
 
 use async_graphql::{InputObject, Request, Response, SimpleObject};
 use linera_sdk::{
-    base::{ChainId, ContractAbi, ServiceAbi, Timestamp},
     graphql::GraphQLMutationRoot,
+    linera_base_types::{ChainId, ContractAbi, ServiceAbi, Timestamp},
     views::{CustomSerialize, ViewError},
 };
 use serde::{Deserialize, Serialize};
@@ -41,23 +41,12 @@ pub enum Operation {
     Comment { key: Key, comment: String },
 }
 
-/// A message of the application on one chain, to be handled on another chain.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
-    /// The origin chain wants to subscribe to the target chain.
-    Subscribe,
-    /// The origin chain wants to unsubscribe from the target chain.
-    Unsubscribe,
-    /// The origin chain made a post, and the target chain is subscribed.
-    Post { index: u64, post: OwnPost },
-    /// A Chain liked a post
+    /// Like a post, author of a post receives the message.
     Like { key: Key },
-    /// A Chain commented on a post
-    Comment {
-        key: Key,
-        chain_id: ChainId,
-        comment: String,
-    },
+    /// Comment on a post, author of a post receives the message.
+    Comment { key: Key, comment: String },
 }
 
 /// A post's text and timestamp, to use in contexts where author and index are known.
@@ -82,7 +71,7 @@ pub struct Post {
     pub image_url: Option<String>,
     /// The total number of likes
     pub likes: u32,
-    /// Comments with there ChainId
+    /// Comments with their ChainId
     pub comments: Vec<Comment>,
 }
 
@@ -104,7 +93,7 @@ pub struct Key {
     /// The owner of the chain on which the `Post` operation was included.
     pub author: ChainId,
     /// The number of posts by that author before this one.
-    pub index: u64,
+    pub index: u32,
 }
 
 // Serialize keys so that the lexicographic order of the serialized keys corresponds to reverse
@@ -124,7 +113,7 @@ impl CustomSerialize for Key {
         Ok(Self {
             timestamp: Timestamp::from(!u64::from_be_bytes(time_bytes)),
             author,
-            index: !u64::from_be_bytes(idx_bytes),
+            index: !u32::from_be_bytes(idx_bytes),
         })
     }
 }
@@ -132,7 +121,7 @@ impl CustomSerialize for Key {
 #[cfg(test)]
 mod tests {
     use linera_sdk::{
-        base::{ChainId, Timestamp},
+        linera_base_types::{ChainId, Timestamp},
         views::CustomSerialize,
     };
 
@@ -143,7 +132,7 @@ mod tests {
         let key = Key {
             timestamp: Timestamp::from(0x123456789ABCDEF),
             author: ChainId([0x12345, 0x6789A, 0xBCDEF, 0x0248A].into()),
-            index: 0xFEDCBA9876543210,
+            index: 0x76543210,
         };
         let ser_key = key
             .to_custom_bytes()

@@ -6,9 +6,8 @@
 
 #[cfg(with_testing)]
 use std::ops;
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 use std::{
+    collections::BTreeMap,
     fmt::{self, Display},
     fs,
     hash::Hash,
@@ -18,27 +17,24 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::Context as _;
-use async_graphql::InputObject;
-use base64::engine::{general_purpose::STANDARD_NO_PAD, Engine as _};
+use async_graphql::{InputObject, SimpleObject};
 use custom_debug_derive::Debug;
 use linera_witty::{WitLoad, WitStore, WitType};
-#[cfg(with_metrics)]
-use prometheus::HistogramVec;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 #[cfg(with_metrics)]
-use crate::prometheus_util::{bucket_latencies, register_histogram_vec, MeasureLatency};
+use crate::prometheus_util::MeasureLatency as _;
 use crate::{
-    crypto::{BcsHashable, CryptoHash},
-    doc_scalar, hex_debug,
+    crypto::{BcsHashable, CryptoError, CryptoHash},
+    doc_scalar, hex_debug, http,
     identifiers::{
-        ApplicationId, BlobId, BlobType, BytecodeId, Destination, GenericApplicationId, MessageId,
-        UserApplicationId,
+        ApplicationId, BlobId, BlobType, ChainId, EventId, GenericApplicationId, ModuleId, StreamId,
     },
     limited_writer::{LimitedWriter, LimitedWriterError},
+    ownership::ChainOwnership,
     time::{Duration, SystemTime},
+    vm::VmRuntime,
 };
 
 /// A non-negative amount of tokens.
@@ -140,17 +136,17 @@ pub struct TimeDelta(u64);
 
 impl TimeDelta {
     /// Returns the given number of microseconds as a [`TimeDelta`].
-    pub fn from_micros(micros: u64) -> Self {
+    pub const fn from_micros(micros: u64) -> Self {
         TimeDelta(micros)
     }
 
     /// Returns the given number of milliseconds as a [`TimeDelta`].
-    pub fn from_millis(millis: u64) -> Self {
+    pub const fn from_millis(millis: u64) -> Self {
         TimeDelta(millis.saturating_mul(1_000))
     }
 
     /// Returns the given number of seconds as a [`TimeDelta`].
-    pub fn from_secs(secs: u64) -> Self {
+    pub const fn from_secs(secs: u64) -> Self {
         TimeDelta(secs.saturating_mul(1_000_000))
     }
 
@@ -161,12 +157,12 @@ impl TimeDelta {
     }
 
     /// Returns this [`TimeDelta`] as a number of microseconds.
-    pub fn as_micros(&self) -> u64 {
+    pub const fn as_micros(&self) -> u64 {
         self.0
     }
 
     /// Returns this [`TimeDelta`] as a [`Duration`].
-    pub fn as_duration(&self) -> Duration {
+    pub const fn as_duration(&self) -> Duration {
         Duration::from_micros(self.as_micros())
     }
 }
@@ -204,41 +200,35 @@ impl Timestamp {
     }
 
     /// Returns the number of microseconds since the Unix epoch.
-    pub fn micros(&self) -> u64 {
+    pub const fn micros(&self) -> u64 {
         self.0
     }
 
     /// Returns the [`TimeDelta`] between `other` and `self`, or zero if `other` is not earlier
     /// than `self`.
-    pub fn delta_since(&self, other: Timestamp) -> TimeDelta {
+    pub const fn delta_since(&self, other: Timestamp) -> TimeDelta {
         TimeDelta::from_micros(self.0.saturating_sub(other.0))
     }
 
     /// Returns the [`Duration`] between `other` and `self`, or zero if `other` is not
     /// earlier than `self`.
-    pub fn duration_since(&self, other: Timestamp) -> Duration {
+    pub const fn duration_since(&self, other: Timestamp) -> Duration {
         Duration::from_micros(self.0.saturating_sub(other.0))
     }
 
     /// Returns the timestamp that is `duration` later than `self`.
-    pub fn saturating_add(&self, duration: TimeDelta) -> Timestamp {
+    pub const fn saturating_add(&self, duration: TimeDelta) -> Timestamp {
         Timestamp(self.0.saturating_add(duration.0))
     }
 
     /// Returns the timestamp that is `duration` earlier than `self`.
-    pub fn saturating_sub(&self, duration: TimeDelta) -> Timestamp {
+    pub const fn saturating_sub(&self, duration: TimeDelta) -> Timestamp {
         Timestamp(self.0.saturating_sub(duration.0))
-    }
-
-    /// Returns a timestamp `micros` microseconds later than `self`, or the highest possible value
-    /// if it would overflow.
-    pub fn saturating_add_micros(&self, micros: u64) -> Timestamp {
-        Timestamp(self.0.saturating_add(micros))
     }
 
     /// Returns a timestamp `micros` microseconds earlier than `self`, or the lowest possible value
     /// if it would underflow.
-    pub fn saturating_sub_micros(&self, micros: u64) -> Timestamp {
+    pub const fn saturating_sub_micros(&self, micros: u64) -> Timestamp {
         Timestamp(self.0.saturating_sub(micros))
     }
 }
@@ -267,8 +257,10 @@ impl Display for Timestamp {
     Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, WitLoad, WitStore, WitType,
 )]
 pub struct Resources {
-    /// An amount of execution fuel.
-    pub fuel: u64,
+    /// An amount of Wasm execution fuel.
+    pub wasm_fuel: u64,
+    /// An amount of EVM execution fuel.
+    pub evm_fuel: u64,
     /// A number of read operations to be executed.
     pub read_operations: u32,
     /// A number of write operations to be executed.
@@ -277,6 +269,14 @@ pub struct Resources {
     pub bytes_to_read: u32,
     /// A number of bytes to write.
     pub bytes_to_write: u32,
+    /// A number of blobs to read.
+    pub blobs_to_read: u32,
+    /// A number of blobs to publish.
+    pub blobs_to_publish: u32,
+    /// A number of blob bytes to read.
+    pub blob_bytes_to_read: u32,
+    /// A number of blob bytes to publish.
+    pub blob_bytes_to_publish: u32,
     /// A number of messages to be sent.
     pub messages: u32,
     /// The size of the messages to be sent.
@@ -284,6 +284,10 @@ pub struct Resources {
     pub message_size: u32,
     /// An increase in the amount of storage space.
     pub storage_size_delta: u32,
+    /// A number of service-as-oracle requests to be performed.
+    pub service_as_oracle_queries: u32,
+    /// A number of HTTP requests to be performed.
+    pub http_requests: u32,
     // TODO(#1532): Account for the system calls that we plan on calling.
     // TODO(#1533): Allow declaring calls to other applications instead of having to count them here.
 }
@@ -294,7 +298,7 @@ pub struct Resources {
 #[witty_specialize_with(Message = Vec<u8>)]
 pub struct SendMessageRequest<Message> {
     /// The destination of the message.
-    pub destination: Destination,
+    pub destination: ChainId,
     /// Whether the message is authenticated.
     pub authenticated: bool,
     /// Whether the message is tracked.
@@ -358,7 +362,7 @@ macro_rules! impl_wrapped_number {
             }
 
             /// Saturating addition.
-            pub fn saturating_add(self, other: Self) -> Self {
+            pub const fn saturating_add(self, other: Self) -> Self {
                 let val = self.0.saturating_add(other.0);
                 Self(val)
             }
@@ -379,7 +383,7 @@ macro_rules! impl_wrapped_number {
             }
 
             /// Saturating subtraction.
-            pub fn saturating_sub(self, other: Self) -> Self {
+            pub const fn saturating_sub(self, other: Self) -> Self {
                 let val = self.0.saturating_sub(other.0);
                 Self(val)
             }
@@ -400,7 +404,7 @@ macro_rules! impl_wrapped_number {
             }
 
             /// Saturating in-place addition.
-            pub fn saturating_add_assign(&mut self, other: Self) {
+            pub const fn saturating_add_assign(&mut self, other: Self) {
                 self.0 = self.0.saturating_add(other.0);
             }
 
@@ -414,7 +418,7 @@ macro_rules! impl_wrapped_number {
             }
 
             /// Saturating multiplication.
-            pub fn saturating_mul(&self, other: $wrapped) -> Self {
+            pub const fn saturating_mul(&self, other: $wrapped) -> Self {
                 Self(self.0.saturating_mul(other))
             }
 
@@ -603,6 +607,14 @@ impl Round {
         matches!(self, Round::MultiLeader(_))
     }
 
+    /// Returns the round number if this is a multi-leader round, `None` otherwise.
+    pub fn multi_leader(&self) -> Option<u32> {
+        match self {
+            Round::MultiLeader(number) => Some(*number),
+            _ => None,
+        }
+    }
+
     /// Whether the round is the fast round.
     pub fn is_fast(&self) -> bool {
         matches!(self, Round::Fast)
@@ -641,37 +653,37 @@ impl Amount {
     pub const ONE: Amount = Amount(10u128.pow(Amount::DECIMAL_PLACES as u32));
 
     /// Returns an `Amount` corresponding to that many tokens, or `Amount::MAX` if saturated.
-    pub fn from_tokens(tokens: u128) -> Amount {
+    pub const fn from_tokens(tokens: u128) -> Amount {
         Self::ONE.saturating_mul(tokens)
     }
 
     /// Returns an `Amount` corresponding to that many millitokens, or `Amount::MAX` if saturated.
-    pub fn from_millis(millitokens: u128) -> Amount {
+    pub const fn from_millis(millitokens: u128) -> Amount {
         Amount(10u128.pow(Amount::DECIMAL_PLACES as u32 - 3)).saturating_mul(millitokens)
     }
 
     /// Returns an `Amount` corresponding to that many microtokens, or `Amount::MAX` if saturated.
-    pub fn from_micros(microtokens: u128) -> Amount {
+    pub const fn from_micros(microtokens: u128) -> Amount {
         Amount(10u128.pow(Amount::DECIMAL_PLACES as u32 - 6)).saturating_mul(microtokens)
     }
 
     /// Returns an `Amount` corresponding to that many nanotokens, or `Amount::MAX` if saturated.
-    pub fn from_nanos(nanotokens: u128) -> Amount {
+    pub const fn from_nanos(nanotokens: u128) -> Amount {
         Amount(10u128.pow(Amount::DECIMAL_PLACES as u32 - 9)).saturating_mul(nanotokens)
     }
 
     /// Returns an `Amount` corresponding to that many attotokens.
-    pub fn from_attos(attotokens: u128) -> Amount {
+    pub const fn from_attos(attotokens: u128) -> Amount {
         Amount(attotokens)
     }
 
     /// Helper function to obtain the 64 most significant bits of the balance.
-    pub fn upper_half(self) -> u64 {
+    pub const fn upper_half(self) -> u64 {
         (self.0 >> 64) as u64
     }
 
     /// Helper function to obtain the 64 least significant bits of the balance.
-    pub fn lower_half(self) -> u64 {
+    pub const fn lower_half(self) -> u64 {
         self.0 as u64
     }
 
@@ -686,12 +698,190 @@ impl Amount {
     }
 }
 
+/// What created a chain.
+#[derive(Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Hash, Debug, Serialize, Deserialize)]
+pub enum ChainOrigin {
+    /// The chain was created by the genesis configuration.
+    Root(u32),
+    /// The chain was created by a call from another chain.
+    Child {
+        /// The parent of this chain.
+        parent: ChainId,
+        /// The block height in the parent at which this chain was created.
+        block_height: BlockHeight,
+        /// The index of this chain among chains created at the same block height in the parent
+        /// chain.
+        chain_index: u32,
+    },
+}
+
+impl ChainOrigin {
+    /// Whether the chain was created by another chain.
+    pub fn is_child(&self) -> bool {
+        matches!(self, ChainOrigin::Child { .. })
+    }
+}
+
+/// A number identifying the configuration of the chain (aka the committee).
+#[derive(Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Hash, Default, Debug)]
+pub struct Epoch(pub u32);
+
+impl Epoch {
+    /// The zero epoch.
+    pub const ZERO: Epoch = Epoch(0);
+}
+
+impl Serialize for Epoch {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.0.to_string())
+        } else {
+            serializer.serialize_newtype_struct("Epoch", &self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Epoch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            Ok(Epoch(u32::from_str(&s).map_err(serde::de::Error::custom)?))
+        } else {
+            #[derive(Deserialize)]
+            #[serde(rename = "Epoch")]
+            struct EpochDerived(u32);
+
+            let value = EpochDerived::deserialize(deserializer)?;
+            Ok(Self(value.0))
+        }
+    }
+}
+
+impl std::fmt::Display for Epoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for Epoch {
+    type Err = CryptoError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Epoch(s.parse()?))
+    }
+}
+
+impl From<u32> for Epoch {
+    fn from(value: u32) -> Self {
+        Epoch(value)
+    }
+}
+
+impl Epoch {
+    /// Tries to return an epoch with a number increased by one. Returns an error if an overflow
+    /// happens.
+    #[inline]
+    pub fn try_add_one(self) -> Result<Self, ArithmeticError> {
+        let val = self.0.checked_add(1).ok_or(ArithmeticError::Overflow)?;
+        Ok(Self(val))
+    }
+
+    /// Tries to add one to this epoch's number. Returns an error if an overflow happens.
+    #[inline]
+    pub fn try_add_assign_one(&mut self) -> Result<(), ArithmeticError> {
+        self.0 = self.0.checked_add(1).ok_or(ArithmeticError::Overflow)?;
+        Ok(())
+    }
+}
+
+/// The initial configuration for a new chain.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+pub struct InitialChainConfig {
+    /// The ownership configuration of the new chain.
+    pub ownership: ChainOwnership,
+    /// The epoch in which the chain is created.
+    pub epoch: Epoch,
+    /// Serialized committees corresponding to epochs.
+    pub committees: BTreeMap<Epoch, Vec<u8>>,
+    /// The initial chain balance.
+    pub balance: Amount,
+    /// The initial application permissions.
+    pub application_permissions: ApplicationPermissions,
+}
+
+/// Initial chain configuration and chain origin.
+#[derive(Eq, PartialEq, Clone, Hash, Debug, Serialize, Deserialize)]
+pub struct ChainDescription {
+    origin: ChainOrigin,
+    timestamp: Timestamp,
+    config: InitialChainConfig,
+}
+
+impl ChainDescription {
+    /// Creates a new [`ChainDescription`].
+    pub fn new(origin: ChainOrigin, config: InitialChainConfig, timestamp: Timestamp) -> Self {
+        Self {
+            origin,
+            config,
+            timestamp,
+        }
+    }
+
+    /// Returns the [`ChainId`] based on this [`ChainDescription`].
+    pub fn id(&self) -> ChainId {
+        ChainId::from(self)
+    }
+
+    /// Returns the [`ChainOrigin`] describing who created this chain.
+    pub fn origin(&self) -> ChainOrigin {
+        self.origin
+    }
+
+    /// Returns a reference to the [`InitialChainConfig`] of the chain.
+    pub fn config(&self) -> &InitialChainConfig {
+        &self.config
+    }
+
+    /// Returns the timestamp of when the chain was created.
+    pub fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    /// Whether the chain was created by another chain.
+    pub fn is_child(&self) -> bool {
+        self.origin.is_child()
+    }
+}
+
+impl BcsHashable<'_> for ChainDescription {}
+
+/// A description of the current Linera network to be stored in every node's database.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NetworkDescription {
+    /// The name of the network.
+    pub name: String,
+    /// Hash of the network's genesis config.
+    pub genesis_config_hash: CryptoHash,
+    /// Genesis timestamp.
+    pub genesis_timestamp: Timestamp,
+    /// The chain ID of the admin chain.
+    pub admin_chain_id: ChainId,
+}
+
 /// Permissions for applications on a chain.
 #[derive(
     Default,
     Debug,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Hash,
     Clone,
     Serialize,
@@ -716,6 +906,18 @@ pub struct ApplicationPermissions {
     #[graphql(default)]
     #[debug(skip_if = Vec::is_empty)]
     pub close_chain: Vec<ApplicationId>,
+    /// These applications are allowed to change the application permissions using the system API.
+    #[graphql(default)]
+    #[debug(skip_if = Vec::is_empty)]
+    pub change_application_permissions: Vec<ApplicationId>,
+    /// These applications are allowed to perform calls to services as oracles.
+    #[graphql(default)]
+    #[debug(skip_if = Option::is_none)]
+    pub call_service_as_oracle: Option<Vec<ApplicationId>>,
+    /// These applications are allowed to perform HTTP requests.
+    #[graphql(default)]
+    #[debug(skip_if = Option::is_none)]
+    pub make_http_requests: Option<Vec<ApplicationId>>,
 }
 
 impl ApplicationPermissions {
@@ -726,6 +928,22 @@ impl ApplicationPermissions {
             execute_operations: Some(vec![app_id]),
             mandatory_applications: vec![app_id],
             close_chain: vec![app_id],
+            change_application_permissions: vec![app_id],
+            call_service_as_oracle: Some(vec![app_id]),
+            make_http_requests: Some(vec![app_id]),
+        }
+    }
+
+    /// Creates new `ApplicationPermissions` where the given applications are the only ones
+    /// whose operations are allowed and mandatory, and they can also close the chain.
+    pub fn new_multiple(app_ids: Vec<ApplicationId>) -> Self {
+        Self {
+            execute_operations: Some(app_ids.clone()),
+            mandatory_applications: app_ids.clone(),
+            close_chain: app_ids.clone(),
+            change_application_permissions: app_ids.clone(),
+            call_service_as_oracle: Some(app_ids.clone()),
+            make_http_requests: Some(app_ids),
         }
     }
 
@@ -742,6 +960,28 @@ impl ApplicationPermissions {
     pub fn can_close_chain(&self, app_id: &ApplicationId) -> bool {
         self.close_chain.contains(app_id)
     }
+
+    /// Returns whether the given application is allowed to change the application
+    /// permissions for this chain.
+    pub fn can_change_application_permissions(&self, app_id: &ApplicationId) -> bool {
+        self.change_application_permissions.contains(app_id)
+    }
+
+    /// Returns whether the given application can call services.
+    pub fn can_call_services(&self, app_id: &ApplicationId) -> bool {
+        self.call_service_as_oracle
+            .as_ref()
+            .map(|app_ids| app_ids.contains(app_id))
+            .unwrap_or(true)
+    }
+
+    /// Returns whether the given application can make HTTP requests.
+    pub fn can_make_http_requests(&self, app_id: &ApplicationId) -> bool {
+        self.make_http_requests
+            .as_ref()
+            .map(|app_ids| app_ids.contains(app_id))
+            .unwrap_or(true)
+    }
 }
 
 /// A record of a single oracle response.
@@ -753,77 +993,65 @@ pub enum OracleResponse {
         #[serde(with = "serde_bytes")]
         Vec<u8>,
     ),
-    /// The response from an HTTP POST request.
-    Post(
-        #[debug(with = "hex_debug")]
-        #[serde(with = "serde_bytes")]
-        Vec<u8>,
-    ),
+    /// The response from an HTTP request.
+    Http(http::Response),
     /// A successful read or write of a blob.
     Blob(BlobId),
     /// An assertion oracle that passed.
     Assert,
+    /// The block's validation round.
+    Round(Option<u32>),
+    /// An event was read.
+    Event(EventId, Vec<u8>),
 }
 
-impl Display for OracleResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            OracleResponse::Service(bytes) => {
-                write!(f, "Service:{}", STANDARD_NO_PAD.encode(bytes))?
-            }
-            OracleResponse::Post(bytes) => write!(f, "Post:{}", STANDARD_NO_PAD.encode(bytes))?,
-            OracleResponse::Blob(blob_id) => write!(f, "Blob:{}", blob_id)?,
-            OracleResponse::Assert => write!(f, "Assert")?,
-        };
+impl BcsHashable<'_> for OracleResponse {}
 
-        Ok(())
-    }
-}
-
-impl FromStr for OracleResponse {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(string) = s.strip_prefix("Service:") {
-            return Ok(OracleResponse::Service(
-                STANDARD_NO_PAD.decode(string).context("Invalid base64")?,
-            ));
-        }
-        if let Some(string) = s.strip_prefix("Post:") {
-            return Ok(OracleResponse::Post(
-                STANDARD_NO_PAD.decode(string).context("Invalid base64")?,
-            ));
-        }
-        if let Some(string) = s.strip_prefix("Blob:") {
-            return Ok(OracleResponse::Blob(
-                BlobId::from_str(string).context("Invalid BlobId")?,
-            ));
-        }
-        Err(anyhow::anyhow!("Invalid enum! Enum: {}", s))
-    }
-}
-
-/// Description of the necessary information to run a user application.
+/// Description of a user application.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
-pub struct UserApplicationDescription {
+pub struct ApplicationDescription {
     /// The unique ID of the bytecode to use for the application.
-    pub bytecode_id: BytecodeId,
-    /// The unique ID of the application's creation.
-    pub creation: MessageId,
+    pub module_id: ModuleId,
+    /// The chain ID that created the application.
+    pub creator_chain_id: ChainId,
+    /// Height of the block that created this application.
+    pub block_height: BlockHeight,
+    /// The index of the application among those created in the same block.
+    pub application_index: u32,
     /// The parameters of the application.
     #[serde(with = "serde_bytes")]
     #[debug(with = "hex_debug")]
     pub parameters: Vec<u8>,
     /// Required dependencies.
-    pub required_application_ids: Vec<UserApplicationId>,
+    pub required_application_ids: Vec<ApplicationId>,
 }
 
-impl From<&UserApplicationDescription> for UserApplicationId {
-    fn from(description: &UserApplicationDescription) -> Self {
-        UserApplicationId {
-            bytecode_id: description.bytecode_id,
-            creation: description.creation,
+impl From<&ApplicationDescription> for ApplicationId {
+    fn from(description: &ApplicationDescription) -> Self {
+        let mut hash = CryptoHash::new(&BlobContent::new_application_description(description));
+        if matches!(description.module_id.vm_runtime, VmRuntime::Evm) {
+            hash.make_evm_compatible();
         }
+        ApplicationId::new(hash)
+    }
+}
+
+impl BcsHashable<'_> for ApplicationDescription {}
+
+impl ApplicationDescription {
+    /// Gets the serialized bytes for this `ApplicationDescription`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bcs::to_bytes(self).expect("Serializing blob bytes should not fail!")
+    }
+
+    /// Gets the `BlobId` of the contract
+    pub fn contract_bytecode_blob_id(&self) -> BlobId {
+        self.module_id.contract_bytecode_blob_id()
+    }
+
+    /// Gets the `BlobId` of the service
+    pub fn service_bytecode_blob_id(&self) -> BlobId {
+        self.module_id.service_bytecode_blob_id()
     }
 }
 
@@ -852,7 +1080,7 @@ impl Bytecode {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn compress(&self) -> CompressedBytecode {
         #[cfg(with_metrics)]
-        let _compression_latency = BYTECODE_COMPRESSION_LATENCY.measure_latency();
+        let _compression_latency = metrics::BYTECODE_COMPRESSION_LATENCY.measure_latency();
         let compressed_bytes = zstd::stream::encode_all(&*self.bytes, 19)
             .expect("Compressing bytes in memory should not fail");
 
@@ -906,7 +1134,7 @@ impl CompressedBytecode {
     /// Decompresses a [`CompressedBytecode`] into a [`Bytecode`].
     pub fn decompress(&self) -> Result<Bytecode, DecompressionError> {
         #[cfg(with_metrics)]
-        let _decompression_latency = BYTECODE_DECOMPRESSION_LATENCY.measure_latency();
+        let _decompression_latency = metrics::BYTECODE_DECOMPRESSION_LATENCY.measure_latency();
         let bytes = zstd::stream::decode_all(&*self.compressed_bytes)?;
 
         Ok(Bytecode { bytes })
@@ -957,11 +1185,10 @@ impl CompressedBytecode {
     }
 }
 
-impl<'a> BcsHashable<'a> for BlobContent {}
+impl BcsHashable<'_> for BlobContent {}
 
 /// A blob of binary data.
-#[derive(Hash, Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(with_testing, derive(Eq, PartialEq))]
+#[derive(Hash, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobContent {
     /// The type of data represented by the bytes.
     blob_type: BlobType,
@@ -991,12 +1218,35 @@ impl BlobContent {
         )
     }
 
+    /// Creates a new contract bytecode [`BlobContent`] from the provided bytes.
+    pub fn new_evm_bytecode(compressed_bytecode: CompressedBytecode) -> Self {
+        BlobContent::new(BlobType::EvmBytecode, compressed_bytecode.compressed_bytes)
+    }
+
     /// Creates a new service bytecode [`BlobContent`] from the provided bytes.
     pub fn new_service_bytecode(compressed_bytecode: CompressedBytecode) -> Self {
         BlobContent::new(
             BlobType::ServiceBytecode,
             compressed_bytecode.compressed_bytes,
         )
+    }
+
+    /// Creates a new application description [`BlobContent`] from a [`ApplicationDescription`].
+    pub fn new_application_description(application_description: &ApplicationDescription) -> Self {
+        let bytes = application_description.to_bytes();
+        BlobContent::new(BlobType::ApplicationDescription, bytes)
+    }
+
+    /// Creates a new committee [`BlobContent`] from the provided serialized committee.
+    pub fn new_committee(committee: impl Into<Box<[u8]>>) -> Self {
+        BlobContent::new(BlobType::Committee, committee)
+    }
+
+    /// Creates a new chain description [`BlobContent`] from a [`ChainDescription`].
+    pub fn new_chain_description(chain_description: &ChainDescription) -> Self {
+        let bytes = bcs::to_bytes(&chain_description)
+            .expect("Serializing a ChainDescription should not fail!");
+        BlobContent::new(BlobType::ChainDescription, bytes)
     }
 
     /// Gets a reference to the blob's bytes.
@@ -1022,8 +1272,7 @@ impl From<Blob> for BlobContent {
 }
 
 /// A blob of binary data, with its hash.
-#[derive(Debug, Hash, Clone)]
-#[cfg_attr(with_testing, derive(Eq, PartialEq))]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct Blob {
     /// ID of the blob.
     hash: CryptoHash,
@@ -1034,7 +1283,14 @@ pub struct Blob {
 impl Blob {
     /// Computes the hash and returns the hashed blob for the given content.
     pub fn new(content: BlobContent) -> Self {
-        let hash = CryptoHash::new(&content);
+        let mut hash = CryptoHash::new(&content);
+        if matches!(content.blob_type, BlobType::ApplicationDescription) {
+            let application_description = bcs::from_bytes::<ApplicationDescription>(&content.bytes)
+                .expect("to obtain an application description");
+            if matches!(application_description.module_id.vm_runtime, VmRuntime::Evm) {
+                hash.make_evm_compatible();
+            }
+        }
         Blob { hash, content }
     }
 
@@ -1054,14 +1310,36 @@ impl Blob {
         Blob::new(BlobContent::new_data(bytes))
     }
 
-    /// Creates a new contract bytecode [`BlobContent`] from the provided bytes.
+    /// Creates a new contract bytecode [`Blob`] from the provided bytes.
     pub fn new_contract_bytecode(compressed_bytecode: CompressedBytecode) -> Self {
         Blob::new(BlobContent::new_contract_bytecode(compressed_bytecode))
     }
 
-    /// Creates a new service bytecode [`BlobContent`] from the provided bytes.
+    /// Creates a new contract bytecode [`BlobContent`] from the provided bytes.
+    pub fn new_evm_bytecode(compressed_bytecode: CompressedBytecode) -> Self {
+        Blob::new(BlobContent::new_evm_bytecode(compressed_bytecode))
+    }
+
+    /// Creates a new service bytecode [`Blob`] from the provided bytes.
     pub fn new_service_bytecode(compressed_bytecode: CompressedBytecode) -> Self {
         Blob::new(BlobContent::new_service_bytecode(compressed_bytecode))
+    }
+
+    /// Creates a new application description [`Blob`] from the provided description.
+    pub fn new_application_description(application_description: &ApplicationDescription) -> Self {
+        Blob::new(BlobContent::new_application_description(
+            application_description,
+        ))
+    }
+
+    /// Creates a new committee [`Blob`] from the provided bytes.
+    pub fn new_committee(committee: impl Into<Box<[u8]>>) -> Self {
+        Blob::new(BlobContent::new_committee(committee))
+    }
+
+    /// Creates a new chain description [`Blob`] from a [`ChainDescription`].
+    pub fn new_chain_description(chain_description: &ChainDescription) -> Self {
+        Blob::new(BlobContent::new_chain_description(chain_description))
     }
 
     /// A content-addressed blob ID i.e. the hash of the `Blob`.
@@ -1095,6 +1373,11 @@ impl Blob {
     /// Loads data blob from a file.
     pub async fn load_data_blob_from_file(path: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self::new_data(fs::read(path)?))
+    }
+
+    /// Returns whether the blob is of [`BlobType::Committee`] variant.
+    pub fn is_committee_blob(&self) -> bool {
+        self.content().blob_type().is_committee_blob()
     }
 }
 
@@ -1131,8 +1414,60 @@ impl<'a> Deserialize<'a> for Blob {
     }
 }
 
+impl BcsHashable<'_> for Blob {}
+
+/// An event recorded in a block.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
+pub struct Event {
+    /// The ID of the stream this event belongs to.
+    pub stream_id: StreamId,
+    /// The event index, i.e. the number of events in the stream before this one.
+    pub index: u32,
+    /// The payload data.
+    #[debug(with = "hex_debug")]
+    #[serde(with = "serde_bytes")]
+    pub value: Vec<u8>,
+}
+
+impl Event {
+    /// Returns the ID of this event record, given the publisher chain ID.
+    pub fn id(&self, chain_id: ChainId) -> EventId {
+        EventId {
+            chain_id,
+            stream_id: self.stream_id.clone(),
+            index: self.index,
+        }
+    }
+}
+
+/// An update for a stream with new events.
+#[derive(Clone, Debug, Serialize, Deserialize, WitType, WitLoad, WitStore)]
+pub struct StreamUpdate {
+    /// The publishing chain.
+    pub chain_id: ChainId,
+    /// The stream ID.
+    pub stream_id: StreamId,
+    /// The lowest index of a new event. See [`StreamUpdate::new_indices`].
+    pub previous_index: u32,
+    /// The index of the next event, i.e. the lowest for which no event is known yet.
+    pub next_index: u32,
+}
+
+impl StreamUpdate {
+    /// Returns the indices of all new events in the stream.
+    pub fn new_indices(&self) -> impl Iterator<Item = u32> {
+        self.previous_index..self.next_index
+    }
+}
+
+impl BcsHashable<'_> for Event {}
+
 doc_scalar!(Bytecode, "A WebAssembly module's bytecode");
 doc_scalar!(Amount, "A non-negative amount of tokens.");
+doc_scalar!(
+    Epoch,
+    "A number identifying the configuration of the chain (aka the committee)"
+);
 doc_scalar!(BlockHeight, "A block height to identify blocks in a chain");
 doc_scalar!(
     Timestamp,
@@ -1143,38 +1478,46 @@ doc_scalar!(
     Round,
     "A number to identify successive attempts to decide a value in a consensus protocol."
 );
+doc_scalar!(
+    ChainDescription,
+    "Initial chain configuration and chain origin."
+);
 doc_scalar!(OracleResponse, "A record of a single oracle response.");
 doc_scalar!(BlobContent, "A blob of binary data.");
 doc_scalar!(
     Blob,
     "A blob of binary data, with its content-addressed blob ID."
 );
-doc_scalar!(
-    UserApplicationDescription,
-    "Description of the necessary information to run a user application"
-);
+doc_scalar!(ApplicationDescription, "Description of a user application");
 
-/// The time it takes to compress a bytecode.
 #[cfg(with_metrics)]
-static BYTECODE_COMPRESSION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "bytecode_compression_latency",
-        "Bytecode compression latency",
-        &[],
-        bucket_latencies(10.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
 
-/// The time it takes to decompress a bytecode.
-#[cfg(with_metrics)]
-static BYTECODE_DECOMPRESSION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "bytecode_decompression_latency",
-        "Bytecode decompression latency",
-        &[],
-        bucket_latencies(10.0),
-    )
-});
+    use prometheus::HistogramVec;
+
+    use crate::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+
+    /// The time it takes to compress a bytecode.
+    pub static BYTECODE_COMPRESSION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "bytecode_compression_latency",
+            "Bytecode compression latency",
+            &[],
+            exponential_bucket_latencies(10.0),
+        )
+    });
+
+    /// The time it takes to decompress a bytecode.
+    pub static BYTECODE_DECOMPRESSION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "bytecode_decompression_latency",
+            "Bytecode decompression latency",
+            &[],
+            exponential_bucket_latencies(10.0),
+        )
+    });
+}
 
 #[cfg(test)]
 mod tests {

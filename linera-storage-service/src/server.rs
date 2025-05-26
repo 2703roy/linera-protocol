@@ -1,12 +1,10 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::blocks_in_conditions)]
-
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_lock::RwLock;
-use linera_storage_service::common::{KeyTag, MAX_PAYLOAD_SIZE};
+use linera_storage_service::common::{KeyPrefix, MAX_PAYLOAD_SIZE};
 use linera_views::{
     batch::Batch,
     memory::MemoryStore,
@@ -25,13 +23,12 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use crate::key_value_store::{
     statement::Operation,
     store_processor_server::{StoreProcessor, StoreProcessorServer},
-    KeyValue, OptValue, ReplyContainsKey, ReplyContainsKeys, ReplyCreateNamespace, ReplyDeleteAll,
-    ReplyDeleteNamespace, ReplyExistsNamespace, ReplyFindKeyValuesByPrefix, ReplyFindKeysByPrefix,
-    ReplyListAll, ReplyReadMultiValues, ReplyReadValue, ReplySpecificChunk,
-    ReplyWriteBatchExtended, RequestContainsKey, RequestContainsKeys, RequestCreateNamespace,
-    RequestDeleteAll, RequestDeleteNamespace, RequestExistsNamespace, RequestFindKeyValuesByPrefix,
-    RequestFindKeysByPrefix, RequestListAll, RequestReadMultiValues, RequestReadValue,
-    RequestSpecificChunk, RequestWriteBatchExtended,
+    KeyValue, OptValue, ReplyContainsKey, ReplyContainsKeys, ReplyExistsNamespace,
+    ReplyFindKeyValuesByPrefix, ReplyFindKeysByPrefix, ReplyListAll, ReplyListRootKeys,
+    ReplyReadMultiValues, ReplyReadValue, ReplySpecificChunk, RequestContainsKey,
+    RequestContainsKeys, RequestCreateNamespace, RequestDeleteNamespace, RequestExistsNamespace,
+    RequestFindKeyValuesByPrefix, RequestFindKeysByPrefix, RequestListRootKeys,
+    RequestReadMultiValues, RequestReadValue, RequestSpecificChunk, RequestWriteBatchExtended,
 };
 
 pub mod key_value_store {
@@ -40,15 +37,21 @@ pub mod key_value_store {
 
 enum ServiceStoreServerInternal {
     Memory(MemoryStore),
-    /// The RocksDb key value store
+    /// The RocksDB key value store
     #[cfg(with_rocksdb)]
     RocksDb(RocksDbStore),
 }
 
 #[derive(Default)]
+struct BigRead {
+    num_processed_chunks: usize,
+    chunks: Vec<Vec<u8>>,
+}
+
+#[derive(Default)]
 struct PendingBigReads {
     index: i64,
-    chunks_by_index: BTreeMap<i64, Vec<Vec<u8>>>,
+    big_reads: BTreeMap<i64, BigRead>,
 }
 
 struct ServiceStoreServer {
@@ -174,24 +177,32 @@ impl ServiceStoreServer {
     }
 
     pub async fn list_all(&self) -> Result<Vec<Vec<u8>>, Status> {
-        self.find_keys_by_prefix(&[KeyTag::Namespace as u8]).await
+        self.find_keys_by_prefix(&[KeyPrefix::Namespace as u8])
+            .await
+    }
+
+    pub async fn list_root_keys(&self, namespace: &[u8]) -> Result<Vec<Vec<u8>>, Status> {
+        let mut full_key = vec![KeyPrefix::RootKey as u8];
+        full_key.extend(namespace);
+        self.find_keys_by_prefix(&full_key).await
     }
 
     pub async fn delete_all(&self) -> Result<(), Status> {
         let mut batch = Batch::new();
-        batch.delete_key_prefix(vec![KeyTag::Key as u8]);
-        batch.delete_key_prefix(vec![KeyTag::Namespace as u8]);
+        batch.delete_key_prefix(vec![KeyPrefix::Key as u8]);
+        batch.delete_key_prefix(vec![KeyPrefix::Namespace as u8]);
+        batch.delete_key_prefix(vec![KeyPrefix::RootKey as u8]);
         self.write_batch(batch).await
     }
 
     pub async fn exists_namespace(&self, namespace: &[u8]) -> Result<bool, Status> {
-        let mut full_key = vec![KeyTag::Namespace as u8];
+        let mut full_key = vec![KeyPrefix::Namespace as u8];
         full_key.extend(namespace);
         self.contains_key(&full_key).await
     }
 
     pub async fn create_namespace(&self, namespace: &[u8]) -> Result<(), Status> {
-        let mut full_key = vec![KeyTag::Namespace as u8];
+        let mut full_key = vec![KeyPrefix::Namespace as u8];
         full_key.extend(namespace);
         let mut batch = Batch::new();
         batch.put_key_value_bytes(full_key, vec![]);
@@ -200,10 +211,13 @@ impl ServiceStoreServer {
 
     pub async fn delete_namespace(&self, namespace: &[u8]) -> Result<(), Status> {
         let mut batch = Batch::new();
-        let mut full_key = vec![KeyTag::Namespace as u8];
+        let mut full_key = vec![KeyPrefix::Namespace as u8];
         full_key.extend(namespace);
         batch.delete_key(full_key);
-        let mut key_prefix = vec![KeyTag::Key as u8];
+        let mut key_prefix = vec![KeyPrefix::Key as u8];
+        key_prefix.extend(namespace);
+        batch.delete_key_prefix(key_prefix);
+        let mut key_prefix = vec![KeyPrefix::RootKey as u8];
         key_prefix.extend(namespace);
         batch.delete_key_prefix(key_prefix);
         self.write_batch(batch).await
@@ -219,9 +233,11 @@ impl ServiceStoreServer {
         let mut pending_big_reads = self.pending_big_reads.write().await;
         let message_index = pending_big_reads.index;
         pending_big_reads.index += 1;
-        pending_big_reads
-            .chunks_by_index
-            .insert(message_index, chunks);
+        let big_read = BigRead {
+            num_processed_chunks: 0,
+            chunks,
+        };
+        pending_big_reads.big_reads.insert(message_index, big_read);
         (message_index, num_chunks)
     }
 }
@@ -406,7 +422,7 @@ impl StoreProcessor for ServiceStoreServer {
     async fn process_write_batch_extended(
         &self,
         request: Request<RequestWriteBatchExtended>,
-    ) -> Result<Response<ReplyWriteBatchExtended>, Status> {
+    ) -> Result<Response<()>, Status> {
         let request = request.into_inner();
         let RequestWriteBatchExtended { statements } = request;
         let mut batch = Batch::default();
@@ -442,8 +458,7 @@ impl StoreProcessor for ServiceStoreServer {
         if !batch.is_empty() {
             self.write_batch(batch).await?;
         }
-        let response = ReplyWriteBatchExtended {};
-        Ok(Response::new(response))
+        Ok(Response::new(()))
     }
 
     #[instrument(target = "store_server", skip_all, err, fields(message_index = ?request.get_ref().message_index, index = ?request.get_ref().index))]
@@ -457,13 +472,14 @@ impl StoreProcessor for ServiceStoreServer {
             index,
         } = request;
         let mut pending_big_reads = self.pending_big_reads.write().await;
-        let Some(entry) = pending_big_reads.chunks_by_index.get(&message_index) else {
+        let Some(entry) = pending_big_reads.big_reads.get_mut(&message_index) else {
             return Err(Status::not_found("process_specific_chunk"));
         };
         let index = index as usize;
-        let chunk = entry[index].clone();
-        if entry.len() == index + 1 {
-            pending_big_reads.chunks_by_index.remove(&message_index);
+        let chunk = entry.chunks[index].clone();
+        entry.num_processed_chunks += 1;
+        if entry.chunks.len() == entry.num_processed_chunks {
+            pending_big_reads.big_reads.remove(&message_index);
         }
         let response = ReplySpecificChunk { chunk };
         Ok(Response::new(response))
@@ -473,12 +489,11 @@ impl StoreProcessor for ServiceStoreServer {
     async fn process_create_namespace(
         &self,
         request: Request<RequestCreateNamespace>,
-    ) -> Result<Response<ReplyCreateNamespace>, Status> {
+    ) -> Result<Response<()>, Status> {
         let request = request.into_inner();
         let RequestCreateNamespace { namespace } = request;
         self.create_namespace(&namespace).await?;
-        let response = ReplyCreateNamespace {};
-        Ok(Response::new(response))
+        Ok(Response::new(()))
     }
 
     #[instrument(target = "store_server", skip_all, err, fields(namespace = ?request.get_ref().namespace))]
@@ -497,18 +512,17 @@ impl StoreProcessor for ServiceStoreServer {
     async fn process_delete_namespace(
         &self,
         request: Request<RequestDeleteNamespace>,
-    ) -> Result<Response<ReplyDeleteNamespace>, Status> {
+    ) -> Result<Response<()>, Status> {
         let request = request.into_inner();
         let RequestDeleteNamespace { namespace } = request;
         self.delete_namespace(&namespace).await?;
-        let response = ReplyDeleteNamespace {};
-        Ok(Response::new(response))
+        Ok(Response::new(()))
     }
 
     #[instrument(target = "store_server", skip_all, err, fields(list_all = "list_all"))]
     async fn process_list_all(
         &self,
-        _request: Request<RequestListAll>,
+        _request: Request<()>,
     ) -> Result<Response<ReplyListAll>, Status> {
         let namespaces = self.list_all().await?;
         let response = ReplyListAll { namespaces };
@@ -519,15 +533,28 @@ impl StoreProcessor for ServiceStoreServer {
         target = "store_server",
         skip_all,
         err,
+        fields(list_all = "list_root_keys")
+    )]
+    async fn process_list_root_keys(
+        &self,
+        request: Request<RequestListRootKeys>,
+    ) -> Result<Response<ReplyListRootKeys>, Status> {
+        let request = request.into_inner();
+        let RequestListRootKeys { namespace } = request;
+        let root_keys = self.list_root_keys(&namespace).await?;
+        let response = ReplyListRootKeys { root_keys };
+        Ok(Response::new(response))
+    }
+
+    #[instrument(
+        target = "store_server",
+        skip_all,
+        err,
         fields(delete_all = "delete_all")
     )]
-    async fn process_delete_all(
-        &self,
-        _request: Request<RequestDeleteAll>,
-    ) -> Result<Response<ReplyDeleteAll>, Status> {
+    async fn process_delete_all(&self, _request: Request<()>) -> Result<Response<()>, Status> {
         self.delete_all().await?;
-        let response = ReplyDeleteAll {};
-        Ok(Response::new(response))
+        Ok(Response::new(()))
     }
 }
 
@@ -571,11 +598,9 @@ async fn main() {
     let options = <ServiceStoreServerOptions as clap::Parser>::parse();
     let common_config = CommonStoreConfig::default();
     let namespace = "linera_storage_service";
-    let root_key = &[];
     let (store, endpoint) = match options {
         ServiceStoreServerOptions::Memory { endpoint } => {
-            let store =
-                MemoryStore::new(common_config.max_stream_queries, namespace, root_key).unwrap();
+            let store = MemoryStore::new(common_config.max_stream_queries, namespace).unwrap();
             let store = ServiceStoreServerInternal::Memory(store);
             (store, endpoint)
         }
@@ -586,7 +611,7 @@ async fn main() {
             // The server is run in multi-threaded mode so we can use the block_in_place.
             let spawn_mode = RocksDbSpawnMode::get_spawn_mode_from_runtime();
             let config = RocksDbStoreConfig::new(spawn_mode, path_with_guard, common_config);
-            let store = RocksDbStore::maybe_create_and_connect(&config, namespace, root_key)
+            let store = RocksDbStore::maybe_create_and_connect(&config, namespace)
                 .await
                 .expect("store");
             let store = ServiceStoreServerInternal::RocksDb(store);

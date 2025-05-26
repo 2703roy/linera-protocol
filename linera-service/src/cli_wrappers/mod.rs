@@ -5,7 +5,7 @@
 //! arguments.
 
 #[cfg(feature = "kubernetes")]
-/// How to run docker operations
+/// How to run Docker operations
 pub mod docker;
 
 #[cfg(feature = "kubernetes")]
@@ -15,7 +15,7 @@ mod helmfile;
 /// How to run kind operations
 mod kind;
 #[cfg(feature = "kubernetes")]
-/// How to run kubectl operations
+/// How to run `kubectl` operations
 mod kubectl;
 #[cfg(feature = "kubernetes")]
 /// How to run Linera validators locally as a Kubernetes deployment.
@@ -23,21 +23,18 @@ pub mod local_kubernetes_net;
 /// How to run Linera validators locally as native processes.
 pub mod local_net;
 #[cfg(all(with_testing, feature = "remote-net"))]
-/// How to connect to running GCP DevNet.
+/// How to connect to running GCP devnet.
 pub mod remote_net;
 #[cfg(feature = "kubernetes")]
-/// Util functions for the wrappers
+/// Utility functions for the wrappers
 mod util;
-/// How to run a linera wallet and its GraphQL service.
+/// How to run a Linera wallet and its GraphQL service.
 mod wallet;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use linera_execution::ResourceControlPolicy;
-pub use wallet::{
-    ApplicationWrapper, ClientWrapper, Faucet, FaucetOption, FaucetService, NodeService,
-    OnClientDrop,
-};
+pub use linera_faucet_client::Faucet;
+pub use wallet::{ApplicationWrapper, ClientWrapper, FaucetService, NodeService, OnClientDrop};
 
 /// The information needed to start a Linera net of a particular kind.
 #[async_trait]
@@ -45,8 +42,6 @@ pub trait LineraNetConfig {
     type Net: LineraNet + Sized + Send + Sync + 'static;
 
     async fn instantiate(self) -> Result<(Self::Net, ClientWrapper)>;
-
-    async fn policy(&self) -> ResourceControlPolicy;
 }
 
 /// A running Linera net.
@@ -109,6 +104,15 @@ impl Network {
         match self {
             Network::Grpc | Network::Grpcs => "localhost",
             Network::Tcp | Network::Udp => "127.0.0.1",
+        }
+    }
+
+    /// Returns the protocol schema to use in the node address tuple.
+    pub fn schema(&self) -> &'static str {
+        match self {
+            Network::Grpc | Network::Grpcs => "grpc",
+            Network::Tcp => "tcp",
+            Network::Udp => "udp",
         }
     }
 }

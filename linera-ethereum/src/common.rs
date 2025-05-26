@@ -5,10 +5,8 @@ use std::num::ParseIntError;
 
 #[cfg(not(target_arch = "wasm32"))]
 use alloy::rpc::json_rpc;
-use alloy::{
-    primitives::{Address, B256, U256},
-    rpc::types::eth::Log,
-};
+use alloy::rpc::types::eth::Log;
+use alloy_primitives::{Address, B256, U256};
 use num_bigint::{BigInt, BigUint};
 use num_traits::cast::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -16,12 +14,12 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum EthereumQueryError {
-    /// The id should be matching
-    #[error("the is should be matching")]
+    /// The ID should be matching
+    #[error("the ID should be matching")]
     IdIsNotMatching,
 
-    /// wrong jsonrpc version
-    #[error("wrong jsonrpc version")]
+    /// wrong JSON-RPC version
+    #[error("wrong JSON-RPC version")]
     WrongJsonRpcVersion,
 }
 
@@ -58,7 +56,7 @@ pub enum EthereumServiceError {
 
     /// Hex parsing error
     #[error(transparent)]
-    FromHexError(#[from] alloy::primitives::hex::FromHexError),
+    FromHexError(#[from] alloy_primitives::hex::FromHexError),
 
     /// `serde_json` error
     #[error(transparent)]
@@ -97,9 +95,9 @@ pub enum EthereumDataType {
     Bool(bool),
 }
 
-/// Convert an entry named
-/// "Event(type1 indexed,type2 indexed)" into "Event(type1,type2)"
-/// The event_name_expanded is needed for parsing the obtained log.
+/// Converts an entry named
+/// `Event(type1 indexed,type2 indexed)` into `Event(type1,type2)`.
+/// `event_name_expanded` is needed for parsing the obtained log.
 pub fn event_name_from_expanded(event_name_expanded: &str) -> String {
     event_name_expanded.replace(" indexed", "").to_string()
 }

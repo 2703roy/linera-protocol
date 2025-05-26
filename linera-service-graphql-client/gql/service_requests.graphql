@@ -5,7 +5,7 @@ query Chains {
   }
 }
 
-query ChainOutbox($chainId: ChainId!, $target: Target!) {
+query ChainOutbox($chainId: ChainId!, $target: ChainId!) {
   chain(chainId: $chainId) {
     outboxes {
       entry(key: $target) {
@@ -21,23 +21,7 @@ query ChainOutbox($chainId: ChainId!, $target: Target!) {
   }
 }
 
-query ChainChannel($chainId: ChainId!, $channelFullName: ChannelFullName!) {
-  chain(chainId: $chainId) {
-    channels {
-      entry(key: $channelFullName) {
-        key
-        value {
-          subscribers
-          blockHeights {
-            entries
-          }
-        }
-      }
-    }
-  }
-}
-
-query ChainInbox($chainId: ChainId!, $origin: Origin!) {
+query ChainInbox($chainId: ChainId!, $origin: ChainId!) {
   chain(chainId: $chainId) {
     inboxes {
       entry(key: $origin) {
@@ -91,9 +75,9 @@ query ChainInbox($chainId: ChainId!, $origin: Origin!) {
 
 query Chain(
   $chainId: ChainId!,
-  $inboxesInput: MapInput_Origin_742d451b,
-  $outboxesInput: MapInput_Target_7aac1e1c,
-  $channelsInput: MapInput_ChannelFullName_3b59bf69,
+  $inboxesInput: MapInput_ChainId_37f83aa9,
+  $outboxesInput: MapInput_ChainId_37f83aa9,
+  $previousMessageBlocksInput: MapInput_ChainId_37f83aa9,
 ) {
   chain(chainId: $chainId) {
     chainId
@@ -102,10 +86,6 @@ query Chain(
         description
         epoch
         adminId
-        subscriptions {
-          chainId
-          name
-        }
         ownership
         balance
         timestamp
@@ -119,7 +99,7 @@ query Chain(
     manager {
       ownership
       seed
-      lockedBlobs {
+      lockingBlobs {
         keys
       }
       roundTimeout
@@ -196,16 +176,11 @@ query Chain(
       }
     }
     outboxCounters
-    channels {
+    previousMessageBlocks {
       keys
-      entries(input: $channelsInput) {
+      entries(input: $previousMessageBlocksInput) {
         key
-        value {
-          subscribers
-          blockHeights {
-            entries
-          }
-        }
+        value
       }
     }
 
@@ -222,57 +197,66 @@ query Applications($chainId: ChainId!) {
 
 query Block($hash: CryptoHash, $chainId: ChainId!) {
   block(hash: $hash, chainId: $chainId) {
+    status
     hash
-    value {
-      status
-      executedBlock {
-        block {
-          chainId
-          epoch
-          height
-          timestamp
+    block {
+      header {
+        chainId
+        epoch
+        height
+        timestamp
+        stateHash
+        previousBlockHash
+        authenticatedSigner
+        bundlesHash
+        operationsHash
+        messagesHash
+        previousMessageBlocksHash
+        oracleResponsesHash
+        eventsHash
+        blobsHash
+        operationResultsHash
+      }
+      body {
+        incomingBundles {
+          origin
+          bundle {
+            height
+            timestamp
+            certificateHash
+            transactionIndex
+            messages {
+              authenticatedSigner
+              grant
+              refundGrantTo
+              kind
+              index
+              message
+            }
+          }
+          action
+        }
+        operations
+        messages {
+          destination
           authenticatedSigner
-          previousBlockHash
-          incomingBundles {
-            origin
-            bundle {
-              height
-              timestamp
-              certificateHash
-              transactionIndex
-              messages {
-                authenticatedSigner
-                grant
-                refundGrantTo
-                kind
-                index
-                message
-              }
-            }
-            action
-          }
-          operations
+          grant
+          refundGrantTo
+          kind
+          message
         }
-        outcome {
-          messages {
-            destination
-            authenticatedSigner
-            grant
-            refundGrantTo
-            kind
-            message
+        previousMessageBlocks
+        oracleResponses
+        events {
+          streamId {
+            applicationId
+            streamName
           }
-          stateHash
-          oracleResponses
-          events {
-            streamId {
-              applicationId
-              streamName
-            }
-            key
-            value
-          }
+          index
+          value
         }
+        blobs
+        operationResults
       }
     }
   }
@@ -280,57 +264,66 @@ query Block($hash: CryptoHash, $chainId: ChainId!) {
 
 query Blocks($from: CryptoHash, $chainId: ChainId!, $limit: Int) {
   blocks(from: $from, chainId: $chainId, limit: $limit) {
+    status
     hash
-    value {
-      status
-      executedBlock {
-        block {
-          chainId
-          epoch
-          height
-          timestamp
+    block {
+      header {
+        chainId
+        epoch
+        height
+        timestamp
+        stateHash
+        previousBlockHash
+        authenticatedSigner
+        bundlesHash
+        operationsHash
+        messagesHash
+        previousMessageBlocksHash
+        oracleResponsesHash
+        eventsHash
+        blobsHash
+        operationResultsHash
+      }
+      body {
+        incomingBundles {
+          origin
+          bundle {
+            height
+            timestamp
+            certificateHash
+            transactionIndex
+            messages {
+              authenticatedSigner
+              grant
+              refundGrantTo
+              kind
+              index
+              message
+            }
+          }
+          action
+        }
+        operations
+        messages {
+          destination
           authenticatedSigner
-          previousBlockHash
-          incomingBundles {
-            origin
-            bundle {
-              height
-              timestamp
-              certificateHash
-              transactionIndex
-              messages {
-                authenticatedSigner
-                grant
-                refundGrantTo
-                kind
-                index
-                message
-              }
-            }
-            action
-          }
-          operations
+          grant
+          refundGrantTo
+          kind
+          message
         }
-        outcome {
-          messages {
-            destination
-            authenticatedSigner
-            grant
-            refundGrantTo
-            kind
-            message
+        previousMessageBlocks
+        oracleResponses
+        events {
+          streamId {
+            applicationId
+            streamName
           }
-          stateHash
-          oracleResponses
-          events {
-            streamId {
-              applicationId
-              streamName
-            }
-            key
-            value
-          }
+          index
+          value
         }
+        blobs
+        operationResults
       }
     }
   }
@@ -340,6 +333,6 @@ subscription Notifications($chainId: ChainId!) {
   notifications(chainId: $chainId)
 }
 
-mutation Transfer($chainId: ChainId!, $recipient: ChainId!, $amount: Amount!) {
-  transfer(chainId: $chainId, recipient: { Account: { chain_id: $recipient } }, amount: $amount)
+mutation Transfer($chainId: ChainId!, $owner: AccountOwner!, $recipient_chain: ChainId!, $recipient_account: AccountOwner!, $amount: Amount!) {
+  transfer(chainId: $chainId, owner: $owner, recipient: { Account: { chain_id: $recipient_chain, owner: $recipient_account } }, amount: $amount)
 }

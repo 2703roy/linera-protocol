@@ -62,7 +62,7 @@ pub enum Operation {
 /// A fungible response
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub enum FungibleResponse {
-    /// Ok response
+    /// OK response
     #[default]
     Ok,
     /// Balance response
@@ -129,8 +129,8 @@ impl InitialStateBuilder {
         self
     }
 
-    /// Returns the serialized initial state of the application, ready to used as the
-    /// initilization argument.
+    /// Returns the serialized initial state of the application, ready to use as the
+    /// initialization argument.
     pub fn build(&self) -> InitialState {
         InitialState {
             accounts: self.account_balances.clone(),

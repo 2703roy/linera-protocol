@@ -7,14 +7,16 @@
 
 use hex_game::{HexAbi, Operation, Timeouts};
 use linera_sdk::{
-    base::{Amount, ChainDescription, KeyPair, TimeDelta},
-    test::{ActiveChain, TestValidator},
+    linera_base_types::{
+        AccountSecretKey, Amount, BlobType, ChainDescription, Secp256k1SecretKey, TimeDelta,
+    },
+    test::{ActiveChain, QueryOutcome, TestValidator},
 };
 
 #[test_log::test(tokio::test)]
 async fn hex_game() {
-    let key_pair1 = KeyPair::generate();
-    let key_pair2 = KeyPair::generate();
+    let key_pair1 = AccountSecretKey::generate();
+    let key_pair2 = AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate());
 
     let (validator, app_id, creation_chain) =
         TestValidator::with_current_application::<HexAbi, _, _>((), Timeouts::default()).await;
@@ -23,7 +25,7 @@ async fn hex_game() {
         .add_block(|block| {
             let operation = Operation::Start {
                 board_size: 2,
-                players: [key_pair1.public(), key_pair2.public()],
+                players: [key_pair1.public().into(), key_pair2.public().into()],
                 fee_budget: Amount::ZERO,
                 timeouts: None,
             };
@@ -31,9 +33,16 @@ async fn hex_game() {
         })
         .await;
 
-    let executed_block = certificate.inner().executed_block();
-    let message_id = executed_block.message_id_for_operation(0, 0).unwrap();
-    let description = ChainDescription::Child(message_id);
+    let block = certificate.inner().block();
+    let description = block
+        .created_blobs()
+        .into_iter()
+        .filter_map(|(blob_id, blob)| {
+            (blob_id.blob_type == BlobType::ChainDescription)
+                .then(|| bcs::from_bytes::<ChainDescription>(blob.content().bytes()).unwrap())
+        })
+        .next()
+        .unwrap();
     let mut chain = ActiveChain::new(key_pair1.copy(), description, validator);
 
     chain
@@ -57,7 +66,7 @@ async fn hex_game() {
         })
         .await;
 
-    let response = chain.graphql_query(app_id, "query { winner }").await;
+    let QueryOutcome { response, .. } = chain.graphql_query(app_id, "query { winner }").await;
     assert!(response["winner"].is_null());
 
     chain.set_key_pair(key_pair2.copy());
@@ -67,15 +76,15 @@ async fn hex_game() {
         })
         .await;
 
-    let response = chain.graphql_query(app_id, "query { winner }").await;
+    let QueryOutcome { response, .. } = chain.graphql_query(app_id, "query { winner }").await;
     assert_eq!(Some("TWO"), response["winner"].as_str());
     assert!(chain.is_closed().await);
 }
 
 #[tokio::test]
 async fn hex_game_clock() {
-    let key_pair1 = KeyPair::generate();
-    let key_pair2 = KeyPair::generate();
+    let key_pair1 = AccountSecretKey::generate();
+    let key_pair2 = AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate());
 
     let timeouts = Timeouts {
         start_time: TimeDelta::from_secs(60),
@@ -97,7 +106,7 @@ async fn hex_game_clock() {
         .add_block(|block| {
             let operation = Operation::Start {
                 board_size: 2,
-                players: [key_pair1.public(), key_pair2.public()],
+                players: [key_pair1.public().into(), key_pair2.public().into()],
                 fee_budget: Amount::ZERO,
                 timeouts: None,
             };
@@ -105,9 +114,16 @@ async fn hex_game_clock() {
         })
         .await;
 
-    let executed_block = certificate.inner().executed_block();
-    let message_id = executed_block.message_id_for_operation(0, 0).unwrap();
-    let description = ChainDescription::Child(message_id);
+    let block = certificate.inner().block();
+    let description = block
+        .created_blobs()
+        .into_iter()
+        .filter_map(|(blob_id, blob)| {
+            (blob_id.blob_type == BlobType::ChainDescription)
+                .then(|| bcs::from_bytes::<ChainDescription>(blob.content().bytes()).unwrap())
+        })
+        .next()
+        .unwrap();
     let mut chain = ActiveChain::new(key_pair1.copy(), description, validator.clone());
 
     chain
@@ -154,6 +170,6 @@ async fn hex_game_clock() {
         })
         .await;
 
-    let response = chain.graphql_query(app_id, "query { winner }").await;
+    let QueryOutcome { response, .. } = chain.graphql_query(app_id, "query { winner }").await;
     assert_eq!(Some("ONE"), response["winner"].as_str());
 }

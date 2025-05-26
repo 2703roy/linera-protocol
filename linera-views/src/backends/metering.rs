@@ -10,7 +10,7 @@ use std::{
 
 use convert_case::{Case, Casing};
 use linera_base::prometheus_util::{
-    register_histogram_vec, register_int_counter_vec, MeasureLatency,
+    register_histogram_vec, register_int_counter_vec, MeasureLatency as _,
 };
 use prometheus::{HistogramVec, IntCounterVec};
 
@@ -38,6 +38,7 @@ pub struct KeyValueStoreMetrics {
     connect_latency: HistogramVec,
     clone_with_root_key_latency: HistogramVec,
     list_all_latency: HistogramVec,
+    list_root_keys_latency: HistogramVec,
     delete_all_latency: HistogramVec,
     exists_latency: HistogramVec,
     create_latency: HistogramVec,
@@ -137,6 +138,10 @@ impl KeyValueStoreMetrics {
         let entry2 = format!("{} list all latency", title_name);
         let list_all_latency = register_histogram_vec(&entry1, &entry2, &[], None);
 
+        let entry1 = format!("{}_list_root_keys_latency", var_name);
+        let entry2 = format!("{} list root keys latency", title_name);
+        let list_root_keys_latency = register_histogram_vec(&entry1, &entry2, &[], None);
+
         let entry1 = format!("{}_delete_all_latency", var_name);
         let entry2 = format!("{} delete all latency", title_name);
         let delete_all_latency = register_histogram_vec(&entry1, &entry2, &[], None);
@@ -153,8 +158,8 @@ impl KeyValueStoreMetrics {
         let entry2 = format!("{} delete latency", title_name);
         let delete_latency = register_histogram_vec(&entry1, &entry2, &[], None);
 
-        let entry1 = format!("{}_read_value_number_none_cases", var_name);
-        let entry2 = format!("{} read value number none cases", title_name);
+        let entry1 = format!("{}_read_value_none_cases", var_name);
+        let entry2 = format!("{} read value none cases", title_name);
         let read_value_none_cases = register_int_counter_vec(&entry1, &entry2, &[]);
 
         let entry1 = format!("{}_read_value_key_size", var_name);
@@ -236,6 +241,7 @@ impl KeyValueStoreMetrics {
             connect_latency,
             clone_with_root_key_latency,
             list_all_latency,
+            list_root_keys_latency,
             delete_all_latency,
             exists_latency,
             create_latency,
@@ -440,15 +446,11 @@ where
         K::get_name()
     }
 
-    async fn connect(
-        config: &Self::Config,
-        namespace: &str,
-        root_key: &[u8],
-    ) -> Result<Self, Self::Error> {
+    async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, Self::Error> {
         let name = K::get_name();
         let counter = get_counter(&name);
         let _latency = counter.connect_latency.measure_latency();
-        let store = K::connect(config, namespace, root_key).await?;
+        let store = K::connect(config, namespace).await?;
         let counter = get_counter(&name);
         Ok(Self { counter, store })
     }
@@ -471,6 +473,16 @@ where
             .with_label_values(&[])
             .observe(namespaces.len() as f64);
         Ok(namespaces)
+    }
+
+    async fn list_root_keys(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<Vec<Vec<u8>>, Self::Error> {
+        let name = K::get_name();
+        let counter = get_counter(&name);
+        let _latency = counter.list_root_keys_latency.measure_latency();
+        K::list_root_keys(config, namespace).await
     }
 
     async fn delete_all(config: &Self::Config) -> Result<(), Self::Error> {

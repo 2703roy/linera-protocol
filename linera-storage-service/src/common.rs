@@ -7,8 +7,8 @@ use linera_base::command::resolve_binary;
 use linera_views::{
     lru_caching::LruCachingConfig,
     store::{CommonStoreInternalConfig, KeyValueStoreError},
-    views::MIN_VIEW_TAG,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tonic::Status;
 
@@ -23,15 +23,21 @@ pub const MAX_PAYLOAD_SIZE: usize = 4000000;
 
 /// Key tags to create the sub keys used for storing data on storage.
 #[repr(u8)]
-pub enum KeyTag {
-    /// Prefix for the storage of the keys of the map
-    Key = MIN_VIEW_TAG,
-    /// Prefix for the storage of existence or not of the namespaces.
+pub enum KeyPrefix {
+    /// Key prefix for the storage of the keys of the map
+    Key,
+    /// Key prefix for the storage of existence or not of the namespaces.
     Namespace,
+    /// Key prefix for the root key
+    RootKey,
 }
 
 #[derive(Debug, Error)]
 pub enum ServiceStoreError {
+    /// Store already exists during a create operation
+    #[error("Store already exists during a create operation")]
+    StoreAlreadyExists,
+
     /// Not matching entry
     #[error("Not matching entry")]
     NotMatchingEntry,
@@ -42,7 +48,7 @@ pub enum ServiceStoreError {
 
     /// gRPC error
     #[error(transparent)]
-    GrpcError(#[from] Status),
+    GrpcError(#[from] Box<Status>),
 
     /// The key size must be at most 1 MB
     #[error("The key size must be at most 1 MB")]
@@ -61,6 +67,12 @@ pub enum ServiceStoreError {
     BcsError(#[from] bcs::Error),
 }
 
+impl From<Status> for ServiceStoreError {
+    fn from(error: Status) -> Self {
+        Box::new(error).into()
+    }
+}
+
 impl KeyValueStoreError for ServiceStoreError {
     const BACKEND: &'static str = "service";
 }
@@ -69,7 +81,7 @@ pub fn storage_service_test_endpoint() -> Result<String, ServiceStoreError> {
     Ok(std::env::var("LINERA_STORAGE_SERVICE")?)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServiceStoreInternalConfig {
     /// The endpoint used by the shared store
     pub endpoint: String,

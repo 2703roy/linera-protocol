@@ -3,4 +3,5 @@
 
 //! Common ABIs that may have multiple implementations.
 
+pub mod evm;
 pub mod fungible;

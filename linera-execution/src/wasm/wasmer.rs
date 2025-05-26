@@ -5,23 +5,21 @@
 
 use std::{marker::Unpin, sync::LazyLock};
 
-use linera_base::data_types::Bytecode;
+use linera_base::data_types::{Bytecode, StreamUpdate};
 use linera_witty::{
     wasmer::{EntrypointInstance, InstanceBuilder},
     ExportTo,
 };
 use tokio::sync::Mutex;
-use wasm_instrument::{gas_metering, parity_wasm};
 
 use super::{
     module_cache::ModuleCache,
-    system_api::{ContractSystemApi, ServiceSystemApi, SystemApiData, ViewSystemApi, WriteBatch},
+    runtime_api::{BaseRuntimeApi, ContractRuntimeApi, RuntimeApiData, ServiceRuntimeApi},
     ContractEntrypoints, ServiceEntrypoints, WasmExecutionError,
 };
 use crate::{
     wasm::{WasmContractModule, WasmServiceModule},
-    ContractRuntime, ExecutionError, FinalizeContext, MessageContext, OperationContext,
-    QueryContext, ServiceRuntime,
+    ContractRuntime, ExecutionError, ServiceRuntime,
 };
 
 /// An [`Engine`] instance configured to run application services.
@@ -47,17 +45,17 @@ static SERVICE_CACHE: LazyLock<Mutex<ModuleCache<wasmer::Module>>> = LazyLock::n
 /// Type representing a running [Wasmer](https://wasmer.io/) contract.
 pub(crate) struct WasmerContractInstance<Runtime> {
     /// The Wasmer instance.
-    instance: EntrypointInstance<SystemApiData<Runtime>>,
+    instance: EntrypointInstance<RuntimeApiData<Runtime>>,
 }
 
 /// Type representing a running [Wasmer](https://wasmer.io/) service.
 pub struct WasmerServiceInstance<Runtime> {
     /// The Wasmer instance.
-    instance: EntrypointInstance<SystemApiData<Runtime>>,
+    instance: EntrypointInstance<RuntimeApiData<Runtime>>,
 }
 
 impl WasmContractModule {
-    /// Creates a new [`WasmContractModule`] using Wasmer with the provided bytecodes.
+    /// Creates a new [`WasmContractModule`] using Wasmer with the provided bytecode files.
     pub async fn from_wasmer(contract_bytecode: Bytecode) -> Result<Self, WasmExecutionError> {
         let mut contract_cache = CONTRACT_CACHE.lock().await;
         let (engine, module) = contract_cache
@@ -71,7 +69,7 @@ impl WasmContractModule {
 
 impl<Runtime> WasmerContractInstance<Runtime>
 where
-    Runtime: ContractRuntime + WriteBatch + Clone + Unpin + 'static,
+    Runtime: ContractRuntime + Clone + Unpin + 'static,
 {
     /// Prepares a runtime instance to call into the Wasm contract.
     pub fn prepare(
@@ -79,11 +77,11 @@ where
         contract_module: &wasmer::Module,
         runtime: Runtime,
     ) -> Result<Self, WasmExecutionError> {
-        let system_api_data = SystemApiData::new(runtime);
+        let system_api_data = RuntimeApiData::new(runtime);
         let mut instance_builder = InstanceBuilder::new(contract_engine, system_api_data);
 
-        ContractSystemApi::export_to(&mut instance_builder)?;
-        ViewSystemApi::export_to(&mut instance_builder)?;
+        BaseRuntimeApi::export_to(&mut instance_builder)?;
+        ContractRuntimeApi::export_to(&mut instance_builder)?;
 
         let instance = instance_builder.instantiate(contract_module)?;
 
@@ -92,7 +90,7 @@ where
 }
 
 impl WasmServiceModule {
-    /// Creates a new [`WasmServiceModule`] using Wasmer with the provided bytecodes.
+    /// Creates a new [`WasmServiceModule`] using Wasmer with the provided bytecode files.
     pub async fn from_wasmer(service_bytecode: Bytecode) -> Result<Self, WasmExecutionError> {
         let mut service_cache = SERVICE_CACHE.lock().await;
         let module = service_cache
@@ -106,18 +104,18 @@ impl WasmServiceModule {
 
 impl<Runtime> WasmerServiceInstance<Runtime>
 where
-    Runtime: ServiceRuntime + WriteBatch + Clone + Unpin + 'static,
+    Runtime: ServiceRuntime + Clone + Unpin + 'static,
 {
     /// Prepares a runtime instance to call into the Wasm service.
     pub fn prepare(
         service_module: &wasmer::Module,
         runtime: Runtime,
     ) -> Result<Self, WasmExecutionError> {
-        let system_api_data = SystemApiData::new(runtime);
+        let system_api_data = RuntimeApiData::new(runtime);
         let mut instance_builder = InstanceBuilder::new(SERVICE_ENGINE.clone(), system_api_data);
 
-        ServiceSystemApi::export_to(&mut instance_builder)?;
-        ViewSystemApi::export_to(&mut instance_builder)?;
+        BaseRuntimeApi::export_to(&mut instance_builder)?;
+        ServiceRuntimeApi::export_to(&mut instance_builder)?;
 
         let instance = instance_builder.instantiate(service_module)?;
 
@@ -129,39 +127,34 @@ impl<Runtime> crate::UserContract for WasmerContractInstance<Runtime>
 where
     Runtime: ContractRuntime + Unpin + 'static,
 {
-    fn instantiate(
-        &mut self,
-        _context: OperationContext,
-        argument: Vec<u8>,
-    ) -> Result<(), ExecutionError> {
+    fn instantiate(&mut self, argument: Vec<u8>) -> Result<(), ExecutionError> {
         ContractEntrypoints::new(&mut self.instance)
             .instantiate(argument)
             .map_err(WasmExecutionError::from)?;
         Ok(())
     }
 
-    fn execute_operation(
-        &mut self,
-        _context: OperationContext,
-        operation: Vec<u8>,
-    ) -> Result<Vec<u8>, ExecutionError> {
+    fn execute_operation(&mut self, operation: Vec<u8>) -> Result<Vec<u8>, ExecutionError> {
         Ok(ContractEntrypoints::new(&mut self.instance)
             .execute_operation(operation)
             .map_err(WasmExecutionError::from)?)
     }
 
-    fn execute_message(
-        &mut self,
-        _context: MessageContext,
-        message: Vec<u8>,
-    ) -> Result<(), ExecutionError> {
+    fn execute_message(&mut self, message: Vec<u8>) -> Result<(), ExecutionError> {
         ContractEntrypoints::new(&mut self.instance)
             .execute_message(message)
             .map_err(WasmExecutionError::from)?;
         Ok(())
     }
 
-    fn finalize(&mut self, _context: FinalizeContext) -> Result<(), ExecutionError> {
+    fn process_streams(&mut self, updates: Vec<StreamUpdate>) -> Result<(), ExecutionError> {
+        ContractEntrypoints::new(&mut self.instance)
+            .process_streams(updates)
+            .map_err(WasmExecutionError::from)?;
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<(), ExecutionError> {
         ContractEntrypoints::new(&mut self.instance)
             .finalize()
             .map_err(WasmExecutionError::from)?;
@@ -170,11 +163,7 @@ where
 }
 
 impl<Runtime: 'static> crate::UserService for WasmerServiceInstance<Runtime> {
-    fn handle_query(
-        &mut self,
-        _context: QueryContext,
-        argument: Vec<u8>,
-    ) -> Result<Vec<u8>, ExecutionError> {
+    fn handle_query(&mut self, argument: Vec<u8>) -> Result<Vec<u8>, ExecutionError> {
         Ok(ServiceEntrypoints::new(&mut self.instance)
             .handle_query(argument)
             .map_err(WasmExecutionError::from)?)
@@ -202,55 +191,10 @@ impl From<wasmer::RuntimeError> for ExecutionError {
 #[derive(Clone)]
 pub struct CachedContractModule(wasmer::Module);
 
-pub fn add_metering(bytecode: Bytecode) -> anyhow::Result<Bytecode> {
-    struct WasmtimeRules;
-
-    impl gas_metering::Rules for WasmtimeRules {
-        /// Calculates the fuel cost of a WebAssembly [`Operator`].
-        ///
-        /// The rules try to follow the hardcoded [rules in the Wasmtime runtime
-        /// engine](https://docs.rs/wasmtime/5.0.0/wasmtime/struct.Store.html#method.add_fuel).
-        fn instruction_cost(
-            &self,
-            instruction: &parity_wasm::elements::Instruction,
-        ) -> Option<u32> {
-            use parity_wasm::elements::Instruction::*;
-
-            Some(match instruction {
-                Nop | Drop | Block(_) | Loop(_) | Unreachable | Else | End => 0,
-                _ => 1,
-            })
-        }
-
-        fn memory_grow_cost(&self) -> gas_metering::MemoryGrowCost {
-            gas_metering::MemoryGrowCost::Free
-        }
-
-        fn call_per_local_cost(&self) -> u32 {
-            0
-        }
-    }
-
-    let instrumented_module = gas_metering::inject(
-        parity_wasm::deserialize_buffer(&bytecode.bytes)?,
-        gas_metering::host_function::Injector::new(
-            "linera:app/contract-system-api",
-            "consume-fuel",
-        ),
-        &WasmtimeRules,
-    )
-    .map_err(|_| anyhow::anyhow!("failed to instrument module"))?;
-
-    Ok(Bytecode::new(instrumented_module.into_bytes()?))
-}
-
 impl CachedContractModule {
     /// Creates a new [`CachedContractModule`] by compiling a `contract_bytecode`.
     pub fn new(contract_bytecode: Bytecode) -> Result<Self, anyhow::Error> {
-        let module = wasmer::Module::new(
-            &Self::create_compilation_engine(),
-            add_metering(contract_bytecode)?,
-        )?;
+        let module = wasmer::Module::new(&Self::create_compilation_engine(), contract_bytecode)?;
         Ok(CachedContractModule(module))
     }
 

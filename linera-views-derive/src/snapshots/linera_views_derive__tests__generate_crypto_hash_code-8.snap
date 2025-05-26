@@ -2,11 +2,20 @@
 source: linera-views-derive/src/lib.rs
 expression: pretty(generate_crypto_hash_code(input))
 ---
-#[linera_views::async_trait]
 impl<MyParam> linera_views::views::CryptoHashView<custom::GenericContext<T>>
 for TestView<MyParam>
 where
     MyParam: Send + Sync + 'static,
+    RegisterView<
+        custom::GenericContext<T>,
+        usize,
+    >: linera_views::views::HashableView<custom::GenericContext<T>>,
+    CollectionView<
+        custom::GenericContext<T>,
+        usize,
+        RegisterView<custom::GenericContext<T>, usize>,
+    >: linera_views::views::HashableView<custom::GenericContext<T>>,
+    Self: Send + Sync,
 {
     async fn crypto_hash(
         &self,

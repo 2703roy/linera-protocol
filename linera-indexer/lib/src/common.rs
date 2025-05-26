@@ -21,7 +21,7 @@ pub enum IndexerError {
     #[error(transparent)]
     GraphQLError(#[from] graphql_ws_client::Error),
     #[error(transparent)]
-    TungsteniteError(#[from] async_tungstenite::tungstenite::Error),
+    TungsteniteError(#[from] Box<async_tungstenite::tungstenite::Error>),
     #[error(transparent)]
     InvalidHeader(#[from] InvalidHeaderValue),
     #[error(transparent)]
@@ -38,8 +38,8 @@ pub enum IndexerError {
     UnknownPlugin(String),
     #[error("Plugin not loaded: {0}")]
     UnloadedPlugin(String),
-    #[error("Unknown certificate status: {0:?}")]
-    UnknownCertificateStatus(String),
+    #[error(transparent)]
+    ConversionError(linera_service_graphql_client::ConversionError),
     #[error("Different plugins in command line and memory")]
     WrongPlugins,
     #[error("Plugin is already registered")]
@@ -54,9 +54,31 @@ pub enum IndexerError {
     RocksDbError(#[from] linera_views::rocks_db::RocksDbStoreError),
     #[cfg(feature = "scylladb")]
     #[error(transparent)]
-    ScyllaDbError(#[from] linera_views::scylla_db::ScyllaDbStoreError),
+    ScyllaDbError(#[from] Box<linera_views::scylla_db::ScyllaDbStoreError>),
+}
+
+impl From<async_tungstenite::tungstenite::Error> for IndexerError {
+    fn from(error: async_tungstenite::tungstenite::Error) -> Self {
+        Box::new(error).into()
+    }
+}
+
+#[cfg(feature = "scylladb")]
+impl From<linera_views::scylla_db::ScyllaDbStoreError> for IndexerError {
+    fn from(error: linera_views::scylla_db::ScyllaDbStoreError) -> Self {
+        Box::new(error).into()
+    }
 }
 
 pub async fn graphiql(uri: Uri) -> impl IntoResponse {
-    response::Html(GraphiQLSource::build().endpoint(uri.path()).finish())
+    response::Html(
+        GraphiQLSource::build()
+            .endpoint(uri.path())
+            .finish()
+            .replace("@17", "@18")
+            .replace(
+                "ReactDOM.render(",
+                "ReactDOM.createRoot(document.getElementById(\"graphiql\")).render(",
+            ),
+    )
 }

@@ -3,7 +3,6 @@
 
 //! Types and macros useful for writing an application service.
 
-mod conversions_from_wit;
 mod conversions_to_wit;
 #[cfg(not(with_testing))]
 mod runtime;
@@ -50,7 +49,7 @@ macro_rules! service {
                     move |service| service.handle_query(request).blocking_wait(),
                 );
                 $crate::serde_json::to_vec(&response)
-                    .expect("Failed to deserialize query response")
+                    .expect("Failed to serialize query response")
             }
         }
 

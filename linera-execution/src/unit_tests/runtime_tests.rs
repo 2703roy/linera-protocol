@@ -11,18 +11,15 @@ use std::{
 };
 
 use futures::{channel::mpsc, StreamExt};
-use linera_base::{
-    crypto::CryptoHash,
-    data_types::{BlockHeight, Timestamp},
-    identifiers::{ApplicationId, BytecodeId, ChainDescription, MessageId},
-};
+use linera_base::{crypto::CryptoHash, data_types::BlockHeight, identifiers::ApplicationId};
 use linera_views::batch::Batch;
 
-use super::{ApplicationStatus, SyncRuntimeHandle, SyncRuntimeInternal};
+use super::{ApplicationStatus, SyncRuntimeHandle, SyncRuntimeInternal, WithContext};
 use crate::{
     execution_state_actor::ExecutionRequest,
     runtime::{LoadedApplication, ResourceController, SyncRuntime},
-    ContractRuntime, RawExecutionOutcome, TransactionTracker, UserContractInstance,
+    test_utils::{create_dummy_user_application_description, dummy_chain_description},
+    ContractRuntime, TransactionTracker, UserContractInstance,
 };
 
 /// Test if dropping [`SyncRuntime`] does not leak memory.
@@ -167,24 +164,29 @@ fn create_contract_runtime() -> (
 ///
 /// Returns the [`SyncRuntimeInternal`] instance and the receiver endpoint for the requests the
 /// runtime sends to the [`ExecutionStateView`] actor.
-fn create_runtime<Application>() -> (
+fn create_runtime<Application: WithContext>() -> (
     SyncRuntimeInternal<Application>,
     mpsc::UnboundedReceiver<ExecutionRequest>,
-) {
-    let chain_id = ChainDescription::Root(0).into();
+)
+where
+    Application::UserContext: Default,
+{
+    let chain_id = dummy_chain_description(0).id();
     let (execution_state_sender, execution_state_receiver) = mpsc::unbounded();
     let resource_controller = ResourceController::default();
 
     let runtime = SyncRuntimeInternal::new(
         chain_id,
         BlockHeight(0),
-        Timestamp::from(0),
+        Some(0),
         None,
         None,
         execution_state_sender,
         None,
+        None,
         resource_controller,
-        TransactionTracker::new(0, Some(Vec::new())),
+        TransactionTracker::new_replaying(Vec::new()),
+        Default::default(),
     );
 
     (runtime, execution_state_receiver)
@@ -192,30 +194,19 @@ fn create_runtime<Application>() -> (
 
 /// Creates an [`ApplicationStatus`] for a dummy application.
 fn create_dummy_application() -> ApplicationStatus {
+    let (description, _, _) = create_dummy_user_application_description(0);
+    let id = From::from(&description);
     ApplicationStatus {
         caller_id: None,
-        id: create_dummy_application_id(),
-        parameters: vec![],
+        id,
+        description,
         signer: None,
-        outcome: RawExecutionOutcome::default(),
     }
 }
 
 /// Creates a dummy [`ApplicationId`].
 fn create_dummy_application_id() -> ApplicationId {
-    let chain_id = ChainDescription::Root(1).into();
-
-    ApplicationId {
-        bytecode_id: BytecodeId::new(
-            CryptoHash::test_hash("contract"),
-            CryptoHash::test_hash("service"),
-        ),
-        creation: MessageId {
-            chain_id,
-            height: BlockHeight(1),
-            index: 1,
-        },
-    }
+    ApplicationId::new(CryptoHash::test_hash("application description"))
 }
 
 /// Creates a fake application instance that's just a reference to the `runtime`.
@@ -223,9 +214,10 @@ fn create_fake_application_with_runtime(
     runtime: &SyncRuntimeHandle<Arc<dyn Any + Send + Sync>>,
 ) -> LoadedApplication<Arc<dyn Any + Send + Sync>> {
     let fake_instance: Arc<dyn Any + Send + Sync> = runtime.0.clone();
+    let (description, _, _) = create_dummy_user_application_description(0);
 
     LoadedApplication {
         instance: Arc::new(Mutex::new(fake_instance)),
-        parameters: vec![],
+        description,
     }
 }

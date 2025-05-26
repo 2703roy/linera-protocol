@@ -35,15 +35,15 @@ impl<N> ChannelNotifier<N> {
         }
     }
 
-    /// Creates a subscription given a collection of ChainIds and a sender to the client.
+    /// Creates a subscription given a collection of chain IDs and a sender to the client.
     pub fn subscribe(&self, chain_ids: Vec<ChainId>) -> UnboundedReceiver<N> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.add_sender(chain_ids, &tx);
         rx
     }
 
-    /// Creates a subscription given a collection of ChainIds and a sender to the client.
-    /// Immediately posts a first notification as a ACK.
+    /// Creates a subscription given a collection of chain IDs and a sender to the client.
+    /// Immediately posts a first notification as an ACK.
     pub fn subscribe_with_ack(&self, chain_ids: Vec<ChainId>, ack: N) -> UnboundedReceiver<N> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.add_sender(chain_ids, &tx);
@@ -119,14 +119,16 @@ pub mod tests {
         time::Duration,
     };
 
+    use linera_execution::test_utils::dummy_chain_description;
+
     use super::*;
 
     #[test]
     fn test_concurrent() {
         let notifier = ChannelNotifier::default();
 
-        let chain_a = ChainId::root(0);
-        let chain_b = ChainId::root(1);
+        let chain_a = dummy_chain_description(0).id();
+        let chain_b = dummy_chain_description(1).id();
 
         let a_rec = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let b_rec = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -195,10 +197,10 @@ pub mod tests {
     fn test_eviction() {
         let notifier = ChannelNotifier::default();
 
-        let chain_a = ChainId::root(0);
-        let chain_b = ChainId::root(1);
-        let chain_c = ChainId::root(2);
-        let chain_d = ChainId::root(3);
+        let chain_a = dummy_chain_description(0).id();
+        let chain_b = dummy_chain_description(1).id();
+        let chain_c = dummy_chain_description(2).id();
+        let chain_d = dummy_chain_description(3).id();
 
         // Chain A -> Notify A, Notify B
         // Chain B -> Notify A, Notify B

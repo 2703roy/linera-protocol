@@ -1,6 +1,6 @@
 [package]
 name = "linera-sdk"
-description = "Library to support developping Linera applications in Rust."
+description = "Library to support developing Linera applications in Rust."
 readme = "README.md"
 documentation = "https://docs.rs/linera-sdk/latest/linera_sdk/"
 
@@ -15,8 +15,12 @@ version.workspace = true
 development = ["linera-sdk"]
 
 [package.metadata.docs.rs]
-features = ["test", "wasmer"]
+features = ["wasmer"]
 targets = ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
+
+[package.metadata.cargo-machete]
+# TODO(#3421): Remove the pinned version once the `linera-*` crates move to Rust Edition 2024
+ignored = ["base64ct"]
 
 [features]
 ethereum = ["async-trait", "linera-ethereum"]
@@ -24,13 +28,11 @@ wasmer = [
     "linera-core/wasmer",
     "linera-execution/wasmer",
     "linera-storage/wasmer",
-    "linera-witty/wasmer",
 ]
 wasmtime = [
     "linera-core/wasmtime",
     "linera-execution/wasmtime",
     "linera-storage/wasmtime",
-    "linera-witty/wasmtime",
 ]
 test = [
     "linera-base/test",
@@ -43,6 +45,9 @@ test = [
 [dependencies]
 async-graphql.workspace = true
 async-trait = { workspace = true, optional = true }
+
+# TODO(#3421): Remove the pinned version once the `linera-*` crates move to Rust Edition 2024
+base64ct = "=1.6.0"
 bcs.workspace = true
 futures.workspace = true
 linera-base.workspace = true
@@ -56,20 +61,15 @@ thiserror.workspace = true
 wit-bindgen.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-async-graphql.workspace = true
 anyhow.workspace = true
 cargo_toml.workspace = true
-clap.workspace = true
 dashmap.workspace = true
 linera-base = { workspace = true, features = ["metrics"] }
 linera-chain = { workspace = true, features = ["metrics"] }
 linera-core = { workspace = true, features = ["metrics", "wasmer"] }
 linera-execution = { workspace = true, features = ["fs", "metrics", "wasmer"] }
 linera-storage = { workspace = true, features = ["metrics", "wasmer"] }
-linera-witty.workspace = true
-serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-wasmtime.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 linera-sdk = { path = ".", default-features = false, features = ["test"] }
@@ -77,7 +77,3 @@ tokio-test.workspace = true
 
 [build-dependencies]
 cfg_aliases.workspace = true
-
-[[bin]]
-name = "wit-generator"
-path = "src/bin/wit_generator.rs"

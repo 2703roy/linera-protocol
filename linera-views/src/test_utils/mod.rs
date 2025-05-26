@@ -7,10 +7,7 @@ pub mod test_views;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod performance;
 
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    fmt::Debug,
-};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use rand::{seq::SliceRandom, Rng};
 
@@ -21,12 +18,11 @@ use crate::{
     },
     random::{generate_test_namespace, make_deterministic_rng, make_nondeterministic_rng},
     store::{
-        KeyIterable, KeyValueIterable, LocalKeyValueStore, LocalRestrictedKeyValueStore,
-        TestKeyValueStore,
+        KeyIterable, KeyValueIterable, KeyValueStore, RestrictedKeyValueStore, TestKeyValueStore,
     },
 };
 
-/// Returns a random key_prefix used for tests
+/// Returns a random key prefix used for tests
 pub fn get_random_key_prefix() -> Vec<u8> {
     let mut key_prefix = vec![0];
     let value: usize = make_nondeterministic_rng().rng_mut().gen();
@@ -34,7 +30,7 @@ pub fn get_random_key_prefix() -> Vec<u8> {
     key_prefix
 }
 
-/// Takes a random number generator, a key_prefix and extends it by n random bytes.
+/// Takes a random number generator, a `key_prefix` and extends it by n random bytes.
 pub fn get_random_byte_vector<R: Rng>(rng: &mut R, key_prefix: &[u8], n: usize) -> Vec<u8> {
     let mut v = key_prefix.to_vec();
     for _ in 0..n {
@@ -64,8 +60,8 @@ pub fn get_random_kset<R: Rng>(rng: &mut R, n: usize, k: usize) -> Vec<usize> {
     values[..k].to_vec()
 }
 
-/// Takes a random number generator, a key_prefix and generates
-/// pairs `(key, value)` with key obtained by appending 8 bytes at random to key_prefix
+/// Takes a random number generator, a `key_prefix` and generates
+/// pairs `(key, value)` with key obtained by appending 8 bytes at random to `key_prefix`
 /// and value obtained by appending 8 bytes to the trivial vector.
 /// We return n such `(key, value)` pairs which are all distinct
 pub fn get_random_key_values_prefix<R: Rng>(
@@ -91,7 +87,7 @@ pub fn get_random_key_values_prefix<R: Rng>(
     }
 }
 
-/// Takes a random number generator rng, a number n and returns n random `(key, value)`
+/// Takes a random number generator `rng`, a number n and returns n random `(key, value)`
 /// which are all distinct with key and value being of length 8.
 pub fn get_random_key_values<R: Rng>(rng: &mut R, num_entries: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     get_random_key_values_prefix(rng, Vec::new(), 8, 8, num_entries)
@@ -110,7 +106,7 @@ pub fn get_random_key_value_operations<R: Rng>(
 }
 
 /// A random reordering of the puts and deletes.
-/// For something like MapView it should get us the same result whatever way we are calling.
+/// For something like `MapView` it should get us the same result whatever way we are calling.
 pub fn span_random_reordering_put_delete<R: Rng>(
     rng: &mut R,
     info_op: VectorPutDelete,
@@ -154,10 +150,7 @@ pub fn span_random_reordering_put_delete<R: Rng>(
 /// * `read_multi_values_bytes`
 /// * `find_keys_by_prefix` / `find_key_values_by_prefix`
 /// * The ordering of keys returned by `find_keys_by_prefix` and `find_key_values_by_prefix`
-pub async fn run_reads<S: LocalRestrictedKeyValueStore>(
-    store: S,
-    key_values: Vec<(Vec<u8>, Vec<u8>)>,
-) {
+pub async fn run_reads<S: RestrictedKeyValueStore>(store: S, key_values: Vec<(Vec<u8>, Vec<u8>)>) {
     // We need a nontrivial key_prefix because dynamo requires a non-trivial prefix
     let mut batch = Batch::new();
     let mut keys = Vec::new();
@@ -367,7 +360,26 @@ fn realize_batch(batch: &Batch) -> BTreeMap<Vec<u8>, Vec<u8>> {
     kv_state
 }
 
-async fn read_key_values_prefix<C: LocalRestrictedKeyValueStore>(
+async fn read_keys_prefix<C: RestrictedKeyValueStore>(
+    key_value_store: &C,
+    key_prefix: &[u8],
+) -> BTreeSet<Vec<u8>> {
+    let mut keys = BTreeSet::new();
+    for key in key_value_store
+        .find_keys_by_prefix(key_prefix)
+        .await
+        .unwrap()
+        .iterator()
+    {
+        let key_suffix = key.unwrap();
+        let mut key = key_prefix.to_vec();
+        key.extend(key_suffix);
+        keys.insert(key);
+    }
+    keys
+}
+
+async fn read_key_values_prefix<C: RestrictedKeyValueStore>(
     key_value_store: &C,
     key_prefix: &[u8],
 ) -> BTreeMap<Vec<u8>, Vec<u8>> {
@@ -387,7 +399,7 @@ async fn read_key_values_prefix<C: LocalRestrictedKeyValueStore>(
 }
 
 /// Writes and then reads data under a prefix, and verifies the result.
-pub async fn run_test_batch_from_blank<C: LocalRestrictedKeyValueStore>(
+pub async fn run_test_batch_from_blank<C: RestrictedKeyValueStore>(
     key_value_store: &C,
     key_prefix: Vec<u8>,
     batch: Batch,
@@ -400,7 +412,7 @@ pub async fn run_test_batch_from_blank<C: LocalRestrictedKeyValueStore>(
 }
 
 /// Run many operations on batches always starting from a blank state.
-pub async fn run_writes_from_blank<C: LocalRestrictedKeyValueStore>(key_value_store: &C) {
+pub async fn run_writes_from_blank<C: RestrictedKeyValueStore>(key_value_store: &C) {
     let mut rng = make_deterministic_rng();
     let n_oper = 10;
     let batch_size = 500;
@@ -419,18 +431,15 @@ pub async fn run_writes_from_blank<C: LocalRestrictedKeyValueStore>(key_value_st
 }
 
 /// Reading many keys at a time could trigger an error. This needs to be tested.
-pub async fn big_read_multi_values<C: LocalKeyValueStore>(
+pub async fn big_read_multi_values<C: KeyValueStore>(
     config: C::Config,
     value_size: usize,
     n_entries: usize,
 ) {
     let mut rng = make_deterministic_rng();
     let namespace = generate_test_namespace();
-    let root_key = &[];
-    //
-    let store = C::recreate_and_connect(&config, &namespace, root_key)
-        .await
-        .unwrap();
+    let store = C::recreate_and_connect(&config, &namespace).await.unwrap();
+    let store = store.clone_with_root_key(&[]).unwrap();
     let key_prefix = vec![42, 54];
     let mut batch = Batch::new();
     let mut keys = Vec::new();
@@ -445,7 +454,8 @@ pub async fn big_read_multi_values<C: LocalKeyValueStore>(
     }
     store.write_batch(batch).await.unwrap();
     // We reconnect so that the read is not using the cache.
-    let store = C::connect(&config, &namespace, root_key).await.unwrap();
+    let store = C::connect(&config, &namespace).await.unwrap();
+    let store = store.clone_with_root_key(&[]).unwrap();
     let values_read = store.read_multi_values_bytes(keys).await.unwrap();
     assert_eq!(values, values_read);
 }
@@ -460,7 +470,9 @@ pub async fn big_read_multi_values<C: LocalKeyValueStore>(
 /// Then we select half of them at random and delete them. By the random
 /// selection, Scylla is forced to introduce around 100000 tombstones
 /// which triggers the crash with the default settings.
-pub async fn tombstone_triggering_test<C: LocalRestrictedKeyValueStore>(key_value_store: C) {
+pub async fn tombstone_triggering_test<C: RestrictedKeyValueStore>(key_value_store: C) {
+    use std::time::Instant;
+    let t1 = Instant::now();
     let mut rng = make_deterministic_rng();
     let value_size = 100;
     let n_entry = 200000;
@@ -469,6 +481,7 @@ pub async fn tombstone_triggering_test<C: LocalRestrictedKeyValueStore>(key_valu
     let key_prefix = vec![0];
     let mut batch_delete = Batch::new();
     let mut remaining_key_values = BTreeMap::new();
+    let mut remaining_keys = BTreeSet::new();
     for i in 0..n_entry {
         let mut key = key_prefix.clone();
         bcs::serialize_into(&mut key, &i).unwrap();
@@ -478,24 +491,50 @@ pub async fn tombstone_triggering_test<C: LocalRestrictedKeyValueStore>(key_valu
         if to_delete {
             batch_delete.delete_key(key);
         } else {
+            remaining_keys.insert(key.clone());
             remaining_key_values.insert(key, value);
         }
     }
+    tracing::info!("Set up in {} ms", t1.elapsed().as_millis());
+
+    let t1 = Instant::now();
     run_test_batch_from_blank(&key_value_store, key_prefix.clone(), batch_insert).await;
+    tracing::info!("run_test_batch in {} ms", t1.elapsed().as_millis());
+
     // Deleting them all
+    let t1 = Instant::now();
     key_value_store.write_batch(batch_delete).await.unwrap();
-    // Reading everything and seeing that it is now cleaned.
-    let key_values = read_key_values_prefix(&key_value_store, &key_prefix).await;
-    assert_eq!(key_values, remaining_key_values);
+    tracing::info!("batch_delete in {} ms", t1.elapsed().as_millis());
+
+    for iter in 0..5 {
+        // Reading everything and seeing that it is now cleaned.
+        let t1 = Instant::now();
+        let key_values = read_key_values_prefix(&key_value_store, &key_prefix).await;
+        assert_eq!(key_values, remaining_key_values);
+        tracing::info!(
+            "iter={} read_key_values_prefix in {} ms",
+            iter,
+            t1.elapsed().as_millis()
+        );
+
+        let t1 = Instant::now();
+        let keys = read_keys_prefix(&key_value_store, &key_prefix).await;
+        assert_eq!(keys, remaining_keys);
+        tracing::info!(
+            "iter={} read_keys_prefix after {} ms",
+            iter,
+            t1.elapsed().as_millis()
+        );
+    }
 }
 
-/// DynamoDb has limits at 1M (for pagination), 4M (for write)
-/// Let us go right past them at 20M of data with writing and then
-/// reading it. And 20M is not huge by any mean. All KeyValueStore
+/// DynamoDB has limits at 1 MB (for pagination), 4 MB (for write)
+/// Let us go right past them at 20 MB of data with writing and then
+/// reading it. And 20 MB is not huge by any mean. All `KeyValueStore`
 /// must handle that.
 ///
 /// The size of the value vary as each size has its own issues.
-pub async fn run_big_write_read<C: LocalRestrictedKeyValueStore>(
+pub async fn run_big_write_read<C: RestrictedKeyValueStore>(
     key_value_store: C,
     target_size: usize,
     value_sizes: Vec<usize>,
@@ -517,7 +556,7 @@ pub async fn run_big_write_read<C: LocalRestrictedKeyValueStore>(
 
 type StateBatch = (Vec<(Vec<u8>, Vec<u8>)>, Batch);
 
-async fn run_test_batch_from_state<C: LocalRestrictedKeyValueStore>(
+async fn run_test_batch_from_state<C: RestrictedKeyValueStore>(
     key_value_store: &C,
     key_prefix: Vec<u8>,
     state_and_batch: StateBatch,
@@ -530,6 +569,9 @@ async fn run_test_batch_from_state<C: LocalRestrictedKeyValueStore>(
         batch_insert.put_key_value_bytes(key, value);
     }
     key_value_store.write_batch(batch_insert).await.unwrap();
+    let key_values = read_key_values_prefix(key_value_store, &key_prefix).await;
+    assert_eq!(key_values, kv_state);
+
     update_state_from_batch(&mut kv_state, &batch);
     key_value_store.write_batch(batch).await.unwrap();
     let key_values = read_key_values_prefix(key_value_store, &key_prefix).await;
@@ -604,14 +646,21 @@ fn generate_specific_state_batch(key_prefix: &[u8], option: usize) -> StateBatch
         key_values.push((key1, vec![33]));
         batch.delete_key_prefix(key2);
     }
+    if option == 7 {
+        let key1 = get_key(key_prefix, vec![255, 255]);
+        let key2 = get_key(key_prefix, vec![255, 255, 1]);
+        key_values.push((key2.clone(), vec![]));
+        batch.delete_key_prefix(key1);
+        batch.put_key_value_bytes(key2, vec![]);
+    }
     (key_values, batch)
 }
 
 /// Run some deterministic and random batches operation and check their
 /// correctness
-pub async fn run_writes_from_state<C: LocalRestrictedKeyValueStore>(key_value_store: &C) {
-    for option in 0..7 {
-        let key_prefix = if option == 6 {
+pub async fn run_writes_from_state<C: RestrictedKeyValueStore>(key_value_store: &C) {
+    for option in 0..8 {
+        let key_prefix = if option >= 6 {
             vec![255, 255, 255]
         } else {
             get_random_key_prefix()
@@ -621,13 +670,10 @@ pub async fn run_writes_from_state<C: LocalRestrictedKeyValueStore>(key_value_st
     }
 }
 
-async fn namespaces_with_prefix<S: LocalKeyValueStore>(
+async fn namespaces_with_prefix<S: KeyValueStore>(
     config: &S::Config,
     prefix: &str,
-) -> BTreeSet<String>
-where
-    S::Error: Debug,
-{
+) -> BTreeSet<String> {
     let namespaces = S::list_all(config).await.expect("namespaces");
     namespaces
         .into_iter()
@@ -635,14 +681,19 @@ where
         .collect::<BTreeSet<_>>()
 }
 
-/// Exercises the functionalities of the `AdminKeyValueStore`.
+/// Exercises the namespace functionalities of the `AdminKeyValueStore`.
 /// This tests everything except the `delete_all` which would
 /// interact with other namespaces.
-pub async fn admin_test<S: TestKeyValueStore>()
-where
-    S::Error: Debug,
-{
+pub async fn namespace_admin_test<S: TestKeyValueStore>() {
     let config = S::new_test_config().await.expect("config");
+    {
+        let namespace = generate_test_namespace();
+        S::create(&config, &namespace)
+            .await
+            .expect("first creation of a namespace");
+        // Creating a namespace two times should returns an error
+        assert!(S::create(&config, &namespace).await.is_err());
+    }
     let prefix = generate_test_namespace();
     let namespaces = namespaces_with_prefix::<S>(&config, &prefix).await;
     assert_eq!(namespaces.len(), 0);
@@ -665,9 +716,8 @@ where
     // Connecting to all of them at once
     {
         let mut connections = Vec::new();
-        let root_key = &[];
         for namespace in &working_namespaces {
-            let connection = S::connect(&config, namespace, root_key)
+            let connection = S::connect(&config, namespace)
                 .await
                 .expect("a connection to the namespace");
             connections.push(connection);
@@ -699,4 +749,112 @@ where
             .await
             .expect("A successful deletion");
     }
+}
+
+/// Tests listing the root keys.
+pub async fn root_key_admin_test<S: TestKeyValueStore>() {
+    let config = S::new_test_config().await.expect("config");
+    let namespace = generate_test_namespace();
+    let mut root_keys = Vec::new();
+    let mut keys = BTreeSet::new();
+    S::create(&config, &namespace).await.expect("creation");
+    let prefix = vec![0];
+    {
+        let size = 3;
+        let mut rng = make_deterministic_rng();
+        let store = S::connect(&config, &namespace).await.expect("store");
+        root_keys.push(vec![]);
+        let mut batch = Batch::new();
+        for _ in 0..2 {
+            let key = get_random_byte_vector(&mut rng, &prefix, 4);
+            batch.put_key_value_bytes(key.clone(), vec![]);
+            keys.insert((vec![], key));
+        }
+        store.write_batch(batch).await.expect("write batch");
+
+        for _ in 0..20 {
+            let root_key = get_random_byte_vector(&mut rng, &[], 4);
+            let cloned_store = store.clone_with_root_key(&root_key).expect("cloned store");
+            root_keys.push(root_key.clone());
+            let size_select = rng.gen_range(0..size);
+            let mut batch = Batch::new();
+            for _ in 0..size_select {
+                let key = get_random_byte_vector(&mut rng, &prefix, 4);
+                batch.put_key_value_bytes(key.clone(), vec![]);
+                keys.insert((root_key.clone(), key));
+            }
+            cloned_store.write_batch(batch).await.expect("write batch");
+        }
+    }
+
+    let read_root_keys = S::list_root_keys(&config, &namespace)
+        .await
+        .expect("read_root_keys");
+    let set_root_keys = root_keys.iter().cloned().collect::<HashSet<_>>();
+    for read_root_key in &read_root_keys {
+        assert!(set_root_keys.contains(read_root_key));
+    }
+
+    let mut read_keys = BTreeSet::new();
+    for root_key in read_root_keys {
+        let store = S::connect(&config, &namespace)
+            .await
+            .expect("store")
+            .clone_with_root_key(&root_key)
+            .expect("clone_with_root_key");
+        let keys = store.find_keys_by_prefix(&prefix).await.expect("keys");
+        for key in keys.iterator() {
+            let key = key.expect("key");
+            let mut big_key = prefix.clone();
+            let key = key.to_vec();
+            big_key.extend(key);
+            read_keys.insert((root_key.clone(), big_key));
+        }
+    }
+    assert_eq!(keys, read_keys);
+}
+
+/// A store can be in exclusive access where it stores the absence of values
+/// or in shared access where only values are stored and (key, value) once
+/// written are never modified nor erased.
+///
+/// In case of no exclusive access the following scenario is checked
+/// * Store 1 deletes a key and does not mark it as missing in its cache.
+/// * Store 2 writes the key
+/// * Store 1 reads the key, but since it is not in the cache it can read
+///   it correctly.
+///
+/// In case of exclusive access. We have the following scenario:
+/// * Store 1 deletes a key and mark it as missing in its cache.
+/// * Store 2 writes the key (it should not be doing it)
+/// * Store 1 reads the key, see it as missing.
+pub async fn exclusive_access_admin_test<S: TestKeyValueStore>(exclusive_access: bool) {
+    let config = S::new_test_config().await.expect("config");
+    let namespace = generate_test_namespace();
+    S::create(&config, &namespace).await.expect("creation");
+    let key = vec![42];
+
+    let mut store1 = S::connect(&config, &namespace).await.expect("store");
+    if exclusive_access {
+        store1 = store1.clone_with_root_key(&[]).expect("store1");
+    }
+    let mut batch1 = Batch::new();
+    batch1.delete_key(key.clone());
+    store1.write_batch(batch1).await.expect("write batch1");
+
+    let mut store2 = S::connect(&config, &namespace).await.expect("store");
+    if exclusive_access {
+        store2 = store2.clone_with_root_key(&[]).expect("store2");
+    }
+    let mut batch2 = Batch::new();
+    batch2.put_key_value_bytes(key.clone(), vec![]);
+    store2.write_batch(batch2).await.expect("write batch2");
+
+    assert_eq!(store1.contains_key(&key).await.unwrap(), !exclusive_access);
+}
+
+/// Both checks together.
+pub async fn access_admin_test<S: TestKeyValueStore>() {
+    exclusive_access_admin_test::<S>(true).await;
+    exclusive_access_admin_test::<S>(false).await;
 }

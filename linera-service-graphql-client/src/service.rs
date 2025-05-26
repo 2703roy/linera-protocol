@@ -4,12 +4,10 @@
 use graphql_client::GraphQLQuery;
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{Amount, BlockHeight, OracleResponse, Round, Timestamp},
-    identifiers::{
-        Account, BlobId, ChainDescription, ChainId, ChannelName, Destination, GenericApplicationId,
-        Owner, StreamName,
-    },
+    data_types::{Amount, Blob, BlockHeight, ChainDescription, OracleResponse, Round, Timestamp},
+    identifiers::{Account, AccountOwner, BlobId, ChainId, GenericApplicationId, StreamName},
 };
+use thiserror::Error;
 
 pub type JSONObject = serde_json::Value;
 
@@ -23,7 +21,6 @@ mod types {
 
     pub type ChainManager = Value;
     pub type ChainOwnership = Value;
-    pub type ChannelFullName = Value;
     pub type Epoch = Value;
     pub type MessageBundle = Value;
     pub type MessageKind = Value;
@@ -31,8 +28,8 @@ mod types {
     pub type MessageAction = Value;
     pub type Operation = Value;
     pub type Origin = Value;
-    pub type Target = Value;
-    pub type UserApplicationDescription = Value;
+    pub type ApplicationDescription = Value;
+    pub type OperationResult = Value;
 
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
     pub struct Notification {
@@ -60,13 +57,16 @@ mod types {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod types {
-    pub use linera_base::{data_types::UserApplicationDescription, ownership::ChainOwnership};
+    pub use linera_base::{
+        data_types::{ApplicationDescription, Epoch},
+        ownership::ChainOwnership,
+    };
     pub use linera_chain::{
-        data_types::{ChannelFullName, MessageAction, MessageBundle, Origin, Target},
+        data_types::{MessageAction, MessageBundle, OperationResult},
         manager::ChainManager,
     };
     pub use linera_core::worker::{Notification, Reason};
-    pub use linera_execution::{committee::Epoch, Message, MessageKind, Operation};
+    pub use linera_execution::{Message, MessageKind, Operation};
 }
 
 pub use types::*;
@@ -128,22 +128,29 @@ pub struct Notifications;
 )]
 pub struct Transfer;
 
+#[derive(Error, Debug)]
+pub enum ConversionError {
+    #[error(transparent)]
+    Serde(#[from] serde_json::Error),
+    #[error("Unexpected certificate type: {0}")]
+    UnexpectedCertificateType(String),
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod from {
-    use linera_base::{hashed::Hashed, identifiers::StreamId};
+    use linera_base::{data_types::Event, identifiers::StreamId};
     use linera_chain::{
-        data_types::{
-            BlockExecutionOutcome, EventRecord, ExecutedBlock, IncomingBundle, MessageBundle,
-            OutgoingMessage, PostedMessage,
-        },
+        block::{Block, BlockBody, BlockHeader},
+        data_types::{IncomingBundle, MessageBundle, PostedMessage},
         types::ConfirmedBlock,
     };
+    use linera_execution::OutgoingMessage;
 
     use super::*;
 
-    impl From<block::BlockBlockValueExecutedBlockBlockIncomingBundles> for IncomingBundle {
-        fn from(val: block::BlockBlockValueExecutedBlockBlockIncomingBundles) -> Self {
-            let block::BlockBlockValueExecutedBlockBlockIncomingBundles {
+    impl From<block::BlockBlockBlockBodyIncomingBundles> for IncomingBundle {
+        fn from(val: block::BlockBlockBlockBodyIncomingBundles) -> Self {
+            let block::BlockBlockBlockBodyIncomingBundles {
                 origin,
                 bundle,
                 action,
@@ -156,9 +163,9 @@ mod from {
         }
     }
 
-    impl From<block::BlockBlockValueExecutedBlockBlockIncomingBundlesBundle> for MessageBundle {
-        fn from(val: block::BlockBlockValueExecutedBlockBlockIncomingBundlesBundle) -> Self {
-            let block::BlockBlockValueExecutedBlockBlockIncomingBundlesBundle {
+    impl From<block::BlockBlockBlockBodyIncomingBundlesBundle> for MessageBundle {
+        fn from(val: block::BlockBlockBlockBodyIncomingBundlesBundle) -> Self {
+            let block::BlockBlockBlockBodyIncomingBundlesBundle {
                 height,
                 timestamp,
                 certificate_hash,
@@ -176,11 +183,9 @@ mod from {
         }
     }
 
-    impl From<block::BlockBlockValueExecutedBlockBlockIncomingBundlesBundleMessages> for PostedMessage {
-        fn from(
-            val: block::BlockBlockValueExecutedBlockBlockIncomingBundlesBundleMessages,
-        ) -> Self {
-            let block::BlockBlockValueExecutedBlockBlockIncomingBundlesBundleMessages {
+    impl From<block::BlockBlockBlockBodyIncomingBundlesBundleMessages> for PostedMessage {
+        fn from(val: block::BlockBlockBlockBodyIncomingBundlesBundleMessages) -> Self {
+            let block::BlockBlockBlockBodyIncomingBundlesBundleMessages {
                 authenticated_signer,
                 grant,
                 refund_grant_to,
@@ -199,38 +204,9 @@ mod from {
         }
     }
 
-    impl From<block::BlockBlockValueExecutedBlockBlock> for linera_chain::data_types::Block {
-        fn from(val: block::BlockBlockValueExecutedBlockBlock) -> Self {
-            let block::BlockBlockValueExecutedBlockBlock {
-                chain_id,
-                epoch,
-                incoming_bundles,
-                operations,
-                height,
-                timestamp,
-                authenticated_signer,
-                previous_block_hash,
-            } = val;
-            let incoming_bundles = incoming_bundles
-                .into_iter()
-                .map(IncomingBundle::from)
-                .collect();
-            linera_chain::data_types::Block {
-                chain_id,
-                epoch,
-                incoming_bundles,
-                operations,
-                height,
-                timestamp,
-                authenticated_signer,
-                previous_block_hash,
-            }
-        }
-    }
-
-    impl From<block::BlockBlockValueExecutedBlockOutcomeMessages> for OutgoingMessage {
-        fn from(val: block::BlockBlockValueExecutedBlockOutcomeMessages) -> Self {
-            let block::BlockBlockValueExecutedBlockOutcomeMessages {
+    impl From<block::BlockBlockBlockBodyMessages> for OutgoingMessage {
+        fn from(val: block::BlockBlockBlockBodyMessages) -> Self {
+            let block::BlockBlockBlockBodyMessages {
                 destination,
                 authenticated_signer,
                 grant,
@@ -249,49 +225,98 @@ mod from {
         }
     }
 
-    impl From<block::BlockBlockValueExecutedBlock> for ExecutedBlock {
-        fn from(val: block::BlockBlockValueExecutedBlock) -> Self {
-            let block::BlockBlockValueExecutedBlock {
-                block,
-                outcome:
-                    block::BlockBlockValueExecutedBlockOutcome {
-                        messages,
-                        state_hash,
-                        oracle_responses,
-                        events,
-                    },
-            } = val;
-            let messages = messages
-                .into_iter()
-                .map(|messages| messages.into_iter().map(OutgoingMessage::from).collect())
-                .collect::<Vec<Vec<_>>>();
-            ExecutedBlock {
-                block: block.into(),
-                outcome: BlockExecutionOutcome {
-                    messages,
-                    state_hash,
-                    oracle_responses: oracle_responses.into_iter().map(Into::into).collect(),
-                    events: events
-                        .into_iter()
-                        .map(|events| events.into_iter().map(Into::into).collect())
-                        .collect(),
-                },
-            }
+    impl TryFrom<block::BlockBlockBlock> for Block {
+        type Error = serde_json::Error;
+
+        fn try_from(val: block::BlockBlockBlock) -> Result<Self, Self::Error> {
+            let block::BlockBlockBlock { header, body } = val;
+            let block::BlockBlockBlockHeader {
+                chain_id,
+                epoch,
+                height,
+                timestamp,
+                authenticated_signer,
+                previous_block_hash,
+                state_hash,
+                bundles_hash,
+                messages_hash,
+                previous_message_blocks_hash,
+                operations_hash,
+                oracle_responses_hash,
+                events_hash,
+                blobs_hash,
+                operation_results_hash,
+            } = header;
+            let block::BlockBlockBlockBody {
+                incoming_bundles,
+                messages,
+                previous_message_blocks,
+                operations,
+                oracle_responses,
+                events,
+                blobs,
+                operation_results,
+            } = body;
+
+            let block_header = BlockHeader {
+                chain_id,
+                epoch,
+                height,
+                timestamp,
+                authenticated_signer,
+                previous_block_hash,
+                state_hash,
+                bundles_hash,
+                messages_hash,
+                previous_message_blocks_hash,
+                operations_hash,
+                oracle_responses_hash,
+                events_hash,
+                blobs_hash,
+                operation_results_hash,
+            };
+            let block_body = BlockBody {
+                incoming_bundles: incoming_bundles
+                    .into_iter()
+                    .map(IncomingBundle::from)
+                    .collect(),
+                messages: messages
+                    .into_iter()
+                    .map(|messages| messages.into_iter().map(Into::into).collect())
+                    .collect::<Vec<Vec<_>>>(),
+                previous_message_blocks: serde_json::from_value(previous_message_blocks)?,
+                operations,
+                oracle_responses: oracle_responses.into_iter().collect(),
+                events: events
+                    .into_iter()
+                    .map(|events| events.into_iter().map(Into::into).collect())
+                    .collect(),
+                blobs: blobs
+                    .into_iter()
+                    .map(|blobs| blobs.into_iter().collect())
+                    .collect(),
+                operation_results,
+            };
+
+            Ok(Block {
+                header: block_header,
+                body: block_body,
+            })
         }
     }
 
-    impl From<block::BlockBlockValueExecutedBlockOutcomeEvents> for EventRecord {
-        fn from(event: block::BlockBlockValueExecutedBlockOutcomeEvents) -> Self {
-            EventRecord {
+    impl From<block::BlockBlockBlockBodyEvents> for Event {
+        fn from(event: block::BlockBlockBlockBodyEvents) -> Self {
+            Event {
                 stream_id: event.stream_id.into(),
-                key: event.key.into_iter().map(|byte| byte as u8).collect(),
+                index: event.index as u32,
                 value: event.value.into_iter().map(|byte| byte as u8).collect(),
             }
         }
     }
 
-    impl From<block::BlockBlockValueExecutedBlockOutcomeEventsStreamId> for StreamId {
-        fn from(stream_id: block::BlockBlockValueExecutedBlockOutcomeEventsStreamId) -> Self {
+    impl From<block::BlockBlockBlockBodyEventsStreamId> for StreamId {
+        fn from(stream_id: block::BlockBlockBlockBodyEventsStreamId) -> Self {
             StreamId {
                 application_id: stream_id.application_id,
                 stream_name: stream_id.stream_name,
@@ -299,14 +324,13 @@ mod from {
         }
     }
 
-    impl TryFrom<block::BlockBlock> for Hashed<ConfirmedBlock> {
-        type Error = String;
+    impl TryFrom<block::BlockBlock> for ConfirmedBlock {
+        type Error = ConversionError;
+
         fn try_from(val: block::BlockBlock) -> Result<Self, Self::Error> {
-            match (val.value.status.as_str(), val.value.executed_block) {
-                ("confirmed", executed_block) => {
-                    Ok(Hashed::new(ConfirmedBlock::new(executed_block.into())))
-                }
-                _ => Err(val.value.status),
+            match (val.status.as_str(), val.block) {
+                ("confirmed", block) => Ok(ConfirmedBlock::new(block.try_into()?)),
+                _ => Err(ConversionError::UnexpectedCertificateType(val.status)),
             }
         }
     }

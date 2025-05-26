@@ -12,14 +12,11 @@ use linera_base::{
     command::{resolve_binary, CommandExt},
     data_types::Amount,
 };
-use linera_execution::ResourceControlPolicy;
+use linera_client::client_options::ResourceControlPolicyConfig;
 use tempfile::{tempdir, TempDir};
 use tokio::process::Command;
 #[cfg(with_testing)]
-use {
-    crate::cli_wrappers::wallet::FaucetOption, linera_base::command::current_binary_parent,
-    tokio::sync::OnceCell,
-};
+use {linera_base::command::current_binary_parent, tokio::sync::OnceCell};
 
 use crate::cli_wrappers::{
     docker::{BuildArg, DockerImage},
@@ -37,6 +34,27 @@ static SHARED_LOCAL_KUBERNETES_TESTING_NET: OnceCell<(
     ClientWrapper,
 )> = OnceCell::const_new();
 
+#[derive(Clone, clap::Parser, clap::ValueEnum, Debug, Default)]
+pub enum BuildMode {
+    Debug,
+    #[default]
+    Release,
+}
+
+impl std::str::FromStr for BuildMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        clap::ValueEnum::from_str(s, true)
+    }
+}
+
+impl std::fmt::Display for BuildMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 /// The information needed to start a [`LocalKubernetesNet`].
 pub struct LocalKubernetesNetConfig {
     pub network: Network,
@@ -48,7 +66,9 @@ pub struct LocalKubernetesNetConfig {
     pub binaries: BuildArg,
     pub no_build: bool,
     pub docker_image_name: String,
-    pub policy: ResourceControlPolicy,
+    pub build_mode: BuildMode,
+    pub policy_config: ResourceControlPolicyConfig,
+    pub dual_store: bool,
 }
 
 /// A wrapper of [`LocalKubernetesNetConfig`] to create a shared local Kubernetes network
@@ -66,10 +86,12 @@ pub struct LocalKubernetesNet {
     binaries: BuildArg,
     no_build: bool,
     docker_image_name: String,
+    build_mode: BuildMode,
     kubectl_instance: Arc<Mutex<KubectlInstance>>,
     kind_clusters: Vec<KindCluster>,
     num_initial_validators: usize,
     num_shards: usize,
+    dual_store: bool,
 }
 
 #[cfg(with_testing)]
@@ -102,7 +124,9 @@ impl SharedLocalKubernetesNetTestingConfig {
             binaries,
             no_build: false,
             docker_image_name: String::from("linera:latest"),
-            policy: ResourceControlPolicy::devnet(),
+            build_mode: BuildMode::Release,
+            policy_config: ResourceControlPolicyConfig::Testnet,
+            dual_store: false,
         })
     }
 }
@@ -130,10 +154,12 @@ impl LineraNetConfig for LocalKubernetesNetConfig {
             self.binaries,
             self.no_build,
             self.docker_image_name,
+            self.build_mode,
             KubectlInstance::new(Vec::new()),
             clusters,
             self.num_initial_validators,
             self.num_shards,
+            self.dual_store,
         )?;
 
         let client = net.make_client().await;
@@ -142,17 +168,14 @@ impl LineraNetConfig for LocalKubernetesNetConfig {
             .create_genesis_config(
                 self.num_other_initial_chains,
                 self.initial_amount,
-                self.policy,
+                self.policy_config,
+                Some(vec!["localhost".to_owned()]),
             )
             .await
             .unwrap();
         net.run().await.unwrap();
 
         Ok((net, client))
-    }
-
-    async fn policy(&self) -> ResourceControlPolicy {
-        self.policy.clone()
     }
 }
 
@@ -177,7 +200,7 @@ impl LineraNetConfig for SharedLocalKubernetesNetTestingConfig {
         let client = net.make_client().await;
         // The tests assume we've created a genesis config with 2
         // chains with 10 tokens each.
-        client.wallet_init(&[], FaucetOption::None).await.unwrap();
+        client.wallet_init(None).await.unwrap();
         for _ in 0..2 {
             initial_client
                 .open_and_assign(&client, Amount::from_tokens(10))
@@ -186,10 +209,6 @@ impl LineraNetConfig for SharedLocalKubernetesNetTestingConfig {
         }
 
         Ok((net, client))
-    }
-
-    async fn policy(&self) -> ResourceControlPolicy {
-        self.0.policy().await
     }
 }
 
@@ -308,17 +327,19 @@ impl LineraNet for LocalKubernetesNet {
 }
 
 impl LocalKubernetesNet {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         network: Network,
         testing_prng_seed: Option<u64>,
         binaries: BuildArg,
         no_build: bool,
         docker_image_name: String,
+        build_mode: BuildMode,
         kubectl_instance: KubectlInstance,
         kind_clusters: Vec<KindCluster>,
         num_initial_validators: usize,
         num_shards: usize,
+        dual_store: bool,
     ) -> Result<Self> {
         Ok(Self {
             network,
@@ -328,10 +349,12 @@ impl LocalKubernetesNet {
             binaries,
             no_build,
             docker_image_name,
+            build_mode,
             kubectl_instance: Arc::new(Mutex::new(kubectl_instance)),
             kind_clusters,
             num_initial_validators,
             num_shards,
+            dual_store,
         })
     }
 
@@ -355,7 +378,6 @@ impl LocalKubernetesNet {
                 port = {port}
                 internal_host = "proxy-internal.default.svc.cluster.local"
                 internal_port = {internal_port}
-                metrics_host = "proxy-internal.default.svc.cluster.local"
                 metrics_port = {metrics_port}
                 [external_protocol]
                 Grpc = "ClearText"
@@ -372,7 +394,6 @@ impl LocalKubernetesNet {
                 [[shards]]
                 host = "shards-{k}.shards.default.svc.cluster.local"
                 port = {shard_port}
-                metrics_host = "shards-{k}.shards.default.svc.cluster.local"
                 metrics_port = {shard_metrics_port}
                 "#
             ));
@@ -410,7 +431,14 @@ impl LocalKubernetesNet {
         let docker_image_name = if self.no_build {
             self.docker_image_name.clone()
         } else {
-            DockerImage::build(&self.docker_image_name, &self.binaries, &github_root).await?;
+            DockerImage::build(
+                &self.docker_image_name,
+                &self.binaries,
+                &github_root,
+                &self.build_mode,
+                self.dual_store,
+            )
+            .await?;
             self.docker_image_name.clone()
         };
 
@@ -436,6 +464,7 @@ impl LocalKubernetesNet {
             let tmp_dir_path = tmp_dir_path_clone.clone();
 
             let docker_image_name = docker_image_name.clone();
+            let dual_store = self.dual_store;
             let future = async move {
                 let cluster_id = kind_cluster.id();
                 kind_cluster.load_docker_image(&docker_image_name).await?;
@@ -446,7 +475,15 @@ impl LocalKubernetesNet {
                     base_dir.join(&server_config_filename),
                 )?;
 
-                HelmFile::sync(i, &github_root, num_shards, cluster_id).await?;
+                HelmFile::sync(
+                    i,
+                    &github_root,
+                    num_shards,
+                    cluster_id,
+                    docker_image_name,
+                    dual_store,
+                )
+                .await?;
 
                 let mut kubectl_instance = kubectl_instance.lock().await;
                 let output = kubectl_instance.get_pods(cluster_id).await?;
